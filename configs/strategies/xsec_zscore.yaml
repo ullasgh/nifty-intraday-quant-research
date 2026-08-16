@@ -1,0 +1,13 @@
+strategy: xsec_zscore
+params:
+  entry_time: "09:16"
+  decision_time: "11:00"
+  exit_time: "15:20"
+  long_threshold: 1.5
+  short_threshold: -1.5
+  mode: momentum
+  min_names: 20
+  robust: false
+  neutral: dollar
+  max_weight: 0.10
+  gross: 1.0

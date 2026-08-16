@@ -1,0 +1,53 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "nifty_quant"
+version = "0.1.0"
+description = "Nifty intraday quant research toolkit"
+requires-python = ">=3.11,<3.13"
+dependencies = [
+    "numpy>=2",
+    "pandas>=2.2,<4",
+    "pyarrow>=15",
+    "scipy",
+    "pydantic>=2",
+    "typer",
+    "pyyaml",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest",
+    "pytest-cov",
+    "hypothesis",
+    "ruff",
+    "mypy",
+]
+
+[project.scripts]
+nq = "nifty_quant.cli:app"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+markers = [
+    "slow: marks tests as slow (deselect with '-m \"not slow\"')",
+]
+
+[tool.ruff]
+line-length = 100
+target-version = "py312"
+
+[tool.ruff.lint]
+select = ["E", "F", "I"]
+
+[tool.mypy]
+python_version = "3.12"
+warn_return_any = true
+warn_unused_ignores = true
+disallow_untyped_defs = true
+check_untyped_defs = true
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/nifty_quant"]
