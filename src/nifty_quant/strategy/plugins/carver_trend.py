@@ -125,7 +125,13 @@ def _ema_by_session(x: np.ndarray, span: int, day_offsets: np.ndarray) -> np.nda
     starts = day_offsets[:-1].tolist()
     ends = day_offsets[1:].tolist()
     for start, end in zip(starts, ends):
-        if end <= start:
+        # Unreachable: `check_day_offsets` runs as the FIRST statement of this function and
+        # raises ContractViolation unless every consecutive pair in `day_offsets` is strictly
+        # increasing. `starts`/`ends` are built from those exact consecutive pairs
+        # (`day_offsets[:-1]` / `day_offsets[1:]`), so `end > start` always holds once that
+        # guard has passed. Kept rather than deleted because it would fire — rather than
+        # silently producing an empty slice — if the guard were ever moved or weakened.
+        if end <= start:  # pragma: no cover - check_day_offsets invariant, see above
             continue
         ema = (
             pd.DataFrame(x[start:end])

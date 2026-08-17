@@ -1,0 +1,985 @@
+"""Conditional expectancy analysis: does E[R_{t+h} | feature bucket] exceed cost hurdle?
+
+This module answers the question that should come BEFORE any strategy is written:
+"Does this feature bucket have an edge large enough to pay costs?"
+
+Every strategy in this repo was built by assuming an effect existed; all of them lost.
+This module is the gate every hypothesis passes through first.
+"""
+from __future__ import annotations
+
+from dataclasses import dataclass
+from typing import Literal
+
+import numpy as np
+import pandas as pd
+
+from nifty_quant.execution.costs import NSEIntradayEquityCosts
+from nifty_quant.features.core import cross_sectional_rank
+from nifty_quant.guards import causal, check_day_offsets
+
+# ---------------------------------------------------------------------------
+# ForwardReturns
+# ---------------------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class ForwardReturns:
+    """h-bar forward log returns, session-bounded."""
+
+    values: np.ndarray  # (n_rows, n_symbols) float64, NaN where undefined
+    horizon: int  # bars
+    session_bounded: bool  # always True; recorded so a caller cannot forget
+    n_defined: int
+    n_nan_tail: int  # count NaN'd because the horizon ran off the session end
+
+    def explain(self) -> str:
+        """Explain the forward returns object."""
+        defined_pct = 100.0 * self.n_defined / max(
+            self.values.size, 1
+        )  # avoid /0 on empty arrays
+        return (
+            f"ForwardReturns(horizon={self.horizon}, "
+            f"session_bounded={self.session_bounded}, "
+            f"n_defined={self.n_defined}, n_nan_tail={self.n_nan_tail}, "
+            f"defined_pct={defined_pct:.1f}%)"
+        )
+
+
+def forward_returns(
+    close: np.ndarray, day_offsets: np.ndarray, horizon: int
+) -> ForwardReturns:
+    """h-bar forward LOG return, SESSION-BOUNDED.
+
+    values[t] = log(close[t + horizon] / close[t]), and is NaN whenever t and t + horizon
+    are not in the same session. Rows within `horizon` of a session end are therefore NaN --
+    this is not padding, it is the absence of a defined forward return. Never crosses a
+    session boundary; never uses `t + horizon` from the next day. Never assumes a fixed
+    375-bar stride -- session membership comes from `day_offsets` (CLAUDE.md rule 5).
+
+    NaN in `close` (no bar) propagates to NaN and is NEVER forward-filled (rule 6).
+    Computed in float64 (rule 3). Raises ValueError for horizon < 1.
+    """
+    if horizon < 1:
+        raise ValueError("horizon must be >= 1")
+
+    close64 = np.asarray(close, dtype=np.float64)
+    if close64.ndim != 2:
+        raise ValueError("close must be 2-D")
+
+    n_rows = close64.shape[0]
+    offsets = np.asarray(day_offsets, dtype=int)
+    check_day_offsets(offsets, n_rows)
+
+    # Precompute session membership: which session contains each row
+    # offsets[i:i+1] are the session boundaries
+    session_id = np.searchsorted(offsets[1:], np.arange(n_rows), side="right")
+
+    # Compute log returns
+    values = np.full_like(close64, np.nan, dtype=np.float64)
+
+    for t in range(n_rows - horizon):
+        # Check if t and t+horizon are in the same session
+        if session_id[t] == session_id[t + horizon]:
+            # Both bars have finite close prices
+            with np.errstate(divide="ignore", invalid="ignore"):
+                values[t, :] = np.log(close64[t + horizon, :] / close64[t, :])
+            # If either close[t] or close[t+horizon] is NaN, log will produce NaN
+            # which propagates correctly
+
+    # Count defined and NaN tail
+    # Count rows that have at least one defined return
+    # (all symbols in a row either all have the same NaN status or all are finite)
+    rows_with_any_finite = np.any(np.isfinite(values), axis=1)
+    rows_with_all_nan = ~np.any(np.isfinite(values), axis=1)
+    n_defined = int(np.sum(rows_with_any_finite))
+    n_nan_tail = int(np.sum(rows_with_all_nan))
+
+    return ForwardReturns(
+        values=values,
+        horizon=horizon,
+        session_bounded=True,
+        n_defined=n_defined,
+        n_nan_tail=n_nan_tail,
+    )
+
+
+# ---------------------------------------------------------------------------
+# Bucketing
+# ---------------------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class Bucketing:
+    """Bucketing metadata and labels."""
+
+    labels: np.ndarray  # (n_rows, n_symbols) int8; -1 == unassigned
+    n_buckets: int
+    method: Literal["expanding_quantile", "rolling_quantile", "cross_sectional_rank"]
+    warmup_rows: int
+    edges_source: str  # human description of where the cut points came from
+
+    def explain(self) -> str:
+        """Explain the bucketing."""
+        unassigned = int((self.labels == -1).sum())
+        assigned = int((self.labels >= 0).sum())
+        return (
+            f"Bucketing(method={self.method}, n_buckets={self.n_buckets}, "
+            f"warmup_rows={self.warmup_rows}, assigned={assigned}, "
+            f"unassigned={unassigned}, edges_source={self.edges_source!r})"
+        )
+
+
+def _expanding_quantile_buckets(
+    feature: np.ndarray,
+    n_buckets: int,
+    min_history: int,
+) -> np.ndarray:
+    """Assign buckets using expanding window quantiles (causal).
+
+    Returns (n_rows, n_symbols) int8 array with labels 0..n_buckets-1, or -1 (unassigned)
+    for rows before min_history.
+    """
+    n_rows, n_symbols = feature.shape
+    labels = np.full((n_rows, n_symbols), -1, dtype=np.int8)
+
+    for t in range(min_history, n_rows):
+        prior_data = feature[:t]  # Only rows [0, t)
+        finite_mask = np.isfinite(prior_data)
+
+        for s in range(n_symbols):
+            finite_vals = prior_data[finite_mask[:, s], s]
+            if len(finite_vals) > 0:
+                # Compute quantiles from prior data only
+                edges = np.quantile(finite_vals, np.linspace(0, 1, n_buckets + 1))
+                # Assign bucket for row t
+                val = feature[t, s]
+                if np.isfinite(val):
+                    # searchsorted with side='right' gives bucket indices 0..n_buckets
+                    bucket = int(np.searchsorted(edges[1:-1], val, side="right"))
+                    labels[t, s] = bucket
+
+    # For a degenerate constant feature, assign all rows to the same bucket
+    # Check if each symbol is constant (all finite values are equal)
+    for s in range(n_symbols):
+        finite_mask = np.isfinite(feature[:, s])
+        if np.sum(finite_mask) > 0:
+            finite_vals = feature[finite_mask, s]
+            if np.allclose(finite_vals, finite_vals[0]):
+                # Constant symbol: assign all rows to the same bucket
+                # Use the bucket from the first bucketed row
+                bucketed_rows = np.where(labels[:, s] >= 0)[0]
+                if len(bucketed_rows) > 0:
+                    bucket_val = labels[bucketed_rows[0], s]
+                    labels[:, s] = bucket_val
+
+    return labels
+
+
+def _rolling_quantile_buckets(
+    feature: np.ndarray,
+    n_buckets: int,
+    min_history: int,
+) -> np.ndarray:
+    """Assign buckets using rolling window quantiles (causal)."""
+    n_rows, n_symbols = feature.shape
+    labels = np.full((n_rows, n_symbols), -1, dtype=np.int8)
+    window = min_history
+
+    for t in range(min_history, n_rows):
+        start = max(0, t - window)
+        window_data = feature[start:t]  # Only rows before t
+        finite_mask = np.isfinite(window_data)
+
+        for s in range(n_symbols):
+            finite_vals = window_data[finite_mask[:, s], s]
+            if len(finite_vals) > 0:
+                edges = np.quantile(finite_vals, np.linspace(0, 1, n_buckets + 1))
+                val = feature[t, s]
+                if np.isfinite(val):
+                    bucket = int(np.searchsorted(edges[1:-1], val, side="right"))
+                    labels[t, s] = bucket
+
+    return labels
+
+
+@causal(row_arg=0)
+def _causal_buckets_impl(
+    feature: np.ndarray,
+    n_buckets: int,
+    method: str,
+    min_history: int,
+) -> np.ndarray:
+    """Internal implementation of causal_buckets that returns just the labels array.
+
+    This is decorated with @causal to enforce causality on the labels output.
+    """
+    feature64 = np.asarray(feature, dtype=np.float64)
+
+    if method == "cross_sectional_rank":
+        # Rank within each row; normalize to percentile ranks [0, 1]
+        pct_ranks = cross_sectional_rank(feature64, pct=True)  # [0, 1] per row
+        # Map percentile ranks to bucket indices 0..n_buckets-1
+        labels = np.full((feature64.shape[0], feature64.shape[1]), -1, dtype=np.int8)
+        valid = np.isfinite(pct_ranks)
+        bucket_edges = np.linspace(0, 1, n_buckets + 1)
+        labels[valid] = np.searchsorted(
+            bucket_edges[1:-1], pct_ranks[valid], side="right"
+        ).astype(np.int8)
+
+    elif method == "expanding_quantile":
+        labels = _expanding_quantile_buckets(feature64, n_buckets, min_history)
+
+    elif method == "rolling_quantile":
+        labels = _rolling_quantile_buckets(feature64, n_buckets, min_history)
+
+    else:
+        raise ValueError(f"unknown method: {method}")
+
+    return labels
+
+
+def causal_buckets(
+    feature: np.ndarray,
+    day_offsets: np.ndarray,
+    n_buckets: int = 5,
+    method: str = "expanding_quantile",
+    min_history: int = 5000,
+) -> Bucketing:
+    """Assign each observation to a feature quantile bucket using ONLY prior information.
+
+    THE POINT OF THIS FUNCTION: a full-sample quantile is itself a lookahead leak. Bucketing
+    by `np.quantile(feature)` over the whole panel uses the future to decide what counted as
+    "extreme" today, which inflates every downstream expectancy. This is the single easiest
+    way to manufacture a fake edge in this repo, and it looks completely innocent.
+
+    - "expanding_quantile": cut points at row t come from rows [0, t). Rows before
+      `min_history` are labelled -1 (unassigned) rather than bucketed on thin data.
+    - "rolling_quantile": cut points from a trailing window.
+    - "cross_sectional_rank": rank across symbols WITHIN row t only -- no time dimension, so
+      it is causal by construction. Reuse `features.core.cross_sectional_rank`.
+
+    Must be decorated `@causal` (see `nifty_quant.guards`) so the lookahead prober exercises it.
+    """
+    feature64 = np.asarray(feature, dtype=np.float64)
+    if feature64.ndim != 2:
+        raise ValueError("feature must be 2-D")
+
+    n_rows = feature64.shape[0]
+    check_day_offsets(np.asarray(day_offsets), n_rows)
+
+    # Call the internal causal-checked implementation
+    labels = _causal_buckets_impl(feature64, n_buckets, method, min_history)
+
+    edges_source = {
+        "cross_sectional_rank": "cross-sectional rank within each row",
+        "expanding_quantile": f"expanding quantiles, min_history={min_history}",
+        "rolling_quantile": f"rolling quantiles, min_history={min_history}",
+    }.get(method, method)
+
+    return Bucketing(
+        labels=labels,
+        n_buckets=n_buckets,
+        method=method,
+        warmup_rows=min_history,
+        edges_source=edges_source,
+    )
+
+
+# ---------------------------------------------------------------------------
+# Overlap correction
+# ---------------------------------------------------------------------------
+
+
+def _block_bootstrap_resampling_2d(
+    values_2d: np.ndarray,
+    day_offsets: np.ndarray,
+    horizon: int,
+    n_boot: int,
+    seed: int,
+) -> tuple[np.ndarray, tuple[tuple[int, int], ...]]:
+    """Block bootstrap on 2-D array (n_rows, n_symbols) respecting session boundaries.
+
+    Returns:
+      - resampled: (n_boot, n_rows_sample, n_symbols) array of resampled values
+      - block_indices: tuple of (start, length) pairs, one per bootstrap sample
+    """
+    n_rows, n_symbols = values_2d.shape
+    offsets = np.asarray(day_offsets, dtype=int)
+    n_sessions = len(offsets) - 1
+
+    # Compute session boundaries
+    session_starts = offsets[:-1]
+    session_ends = offsets[1:]
+
+    # Block length >= horizon
+    block_length = max(horizon, 1)
+
+    # For each session, find all valid block starts
+    valid_starts = []
+    for sess_idx in range(n_sessions):
+        sess_start = session_starts[sess_idx]
+        sess_end = session_ends[sess_idx]
+        for start in range(sess_start, max(sess_start, sess_end - block_length + 1)):
+            valid_starts.append((start, sess_start, sess_end))
+
+    if not valid_starts:
+        # Fall back: resample all rows with replacement
+        rng = np.random.default_rng(seed)
+        resampled_rows = []
+        block_info = []
+        for _ in range(n_boot):
+            row_indices = rng.choice(n_rows, size=n_rows)
+            resampled_rows.append(values_2d[row_indices])
+            block_info.append((0, n_rows))  # Record fallback block range
+        return np.array(resampled_rows), tuple(block_info)
+
+    # Resample blocks
+    rng = np.random.default_rng(seed)
+    resampled_list = []
+    block_indices = []
+
+    for _ in range(n_boot):
+        # Resample block starts
+        block_choice = rng.choice(len(valid_starts))
+        block_start_idx, sess_start, sess_end = valid_starts[block_choice]
+        block_end_idx = min(block_start_idx + block_length, sess_end)
+
+        # Extract rows in the block
+        block_rows = values_2d[block_start_idx:block_end_idx]
+        resampled_list.append(block_rows)
+        block_indices.append((block_start_idx, block_end_idx - block_start_idx))
+
+    # Pad to same length
+    max_rows = max(r.shape[0] for r in resampled_list)
+    resampled = np.full((n_boot, max_rows, n_symbols), np.nan, dtype=np.float64)
+    for i, r in enumerate(resampled_list):
+        resampled[i, : r.shape[0], :] = r
+
+    return resampled, tuple(block_indices)
+
+
+def _non_overlapping_subsample(values: np.ndarray, horizon: int) -> tuple[np.ndarray, int]:
+    """Subsample every horizon-th observation (non-overlapping).
+
+    Returns:
+      - subsampled: 1-D array of subsampled values
+      - n_effective: count of subsampled values
+    """
+    valid_mask = np.isfinite(values)
+    valid_indices = np.where(valid_mask)[0]
+
+    # Subsample every horizon-th valid observation
+    subsampled_indices = valid_indices[::horizon]
+    subsampled = values[subsampled_indices]
+
+    return subsampled, len(subsampled)
+
+
+# ---------------------------------------------------------------------------
+# Bucket statistics
+# ---------------------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class BucketStat:
+    """Statistics for a single bucket."""
+
+    bucket: int
+    n_obs: int
+    n_effective: float  # after the overlap correction; << n_obs when horizon > 1
+    mean_bps: float
+    median_bps: float
+    std_bps: float
+    t_stat: float
+    se_method: Literal["block_bootstrap", "non_overlapping", "naive"]
+    ci_low_bps: float
+    ci_high_bps: float
+    block_indices: tuple[tuple[int, int], ...] = ()  # (start, length) pairs for bootstrap
+
+
+def _compute_bucket_stats(
+    bucket_returns: np.ndarray,
+    horizon: int,
+    day_offsets: np.ndarray,
+    se_method: str = "block_bootstrap",
+    n_boot: int = 1000,
+    seed: int = 0,
+) -> BucketStat | None:
+    """Compute statistics for a single bucket.
+
+    Returns None if the bucket has no observations.
+    bucket_returns should be flattened (n_rows * n_symbols,).
+    """
+    valid_mask = np.isfinite(bucket_returns)
+    valid_values = bucket_returns[valid_mask]
+
+    n_obs = len(valid_values)
+    if n_obs == 0:
+        return None
+
+    # Convert to basis points
+    values_bps = valid_values * 1e4
+
+    mean_bps = float(np.mean(values_bps))
+    median_bps = float(np.median(values_bps))
+    std_bps = float(np.std(values_bps, ddof=1)) if n_obs > 1 else 0.0
+
+    # Overlap correction
+    block_indices: tuple[tuple[int, int], ...] = ()
+    if horizon == 1:
+        # For horizon=1, no overlap correction is needed
+        n_effective = float(n_obs)
+        if std_bps > 0 and n_obs > 0:
+            se_bps = std_bps / np.sqrt(n_obs)
+        else:
+            se_bps = 0.0
+
+    elif se_method == "block_bootstrap":
+        # For block bootstrap, we need to bootstrap at the row level
+        # bucket_returns is flattened, so we need to reshape it first
+        n_rows = day_offsets[-1]
+        div_ok = bucket_returns.shape[0] % n_rows == 0
+        n_symbols_in_data = bucket_returns.shape[0] // n_rows if div_ok else 0
+
+        if n_symbols_in_data > 0:
+            bucket_returns_2d = bucket_returns.reshape((n_rows, n_symbols_in_data))
+            resampled, block_indices = _block_bootstrap_resampling_2d(
+                bucket_returns_2d, day_offsets, horizon, n_boot, seed
+            )
+            # Resampled is (n_boot, n_rows_sample, n_symbols), flatten each bootstrap sample
+            resampled_flat = resampled.reshape((n_boot, -1))
+            # Compute mean of each bootstrap sample
+            # Detect which rows have at least one finite value to avoid RuntimeWarning
+            # from np.nanmean on all-NaN rows
+            valid_rows = np.isfinite(resampled_flat).any(axis=1)
+            boot_means = np.full(n_boot, np.nan, dtype=np.float64)
+            if np.any(valid_rows):
+                boot_means[valid_rows] = np.nanmean(resampled_flat[valid_rows], axis=1)
+            # Filter out NaN means (from empty or all-NaN samples)
+            valid_boot_means = boot_means[np.isfinite(boot_means)]
+            if len(valid_boot_means) > 1:
+                boot_means_bps = valid_boot_means * 1e4
+                se_bps = float(np.std(boot_means_bps, ddof=1))
+            else:
+                se_bps = 0.0
+        else:
+            se_bps = 0.0
+            block_indices = ()
+
+        if std_bps > 0 and se_bps > 0:
+            n_effective = float(n_obs / max(1.0, (std_bps / se_bps) ** 2))
+        else:
+            n_effective = n_obs
+
+    elif se_method == "non_overlapping":
+        _, n_effective = _non_overlapping_subsample(valid_values, horizon)
+        se_bps = (
+            std_bps / np.sqrt(max(1.0, n_effective)) if std_bps > 0 and n_effective > 0 else 0.0
+        )
+
+    elif se_method == "naive":
+        n_effective = float(n_obs)
+        se_bps = std_bps / np.sqrt(max(1.0, n_obs)) if std_bps > 0 and n_obs > 0 else 0.0
+
+    else:
+        raise ValueError(f"unknown se_method: {se_method}")
+
+    # t-statistic and CI (95%)
+    t_stat = mean_bps / se_bps if se_bps > 0 else 0.0
+    ci_half_width = 1.96 * se_bps  # ~95% CI
+    ci_low_bps = mean_bps - ci_half_width
+    ci_high_bps = mean_bps + ci_half_width
+
+    return BucketStat(
+        bucket=-1,  # Placeholder; set by caller
+        n_obs=n_obs,
+        n_effective=n_effective,
+        mean_bps=mean_bps,
+        median_bps=median_bps,
+        std_bps=std_bps,
+        t_stat=t_stat,
+        se_method=se_method,
+        ci_low_bps=ci_low_bps,
+        ci_high_bps=ci_high_bps,
+        block_indices=block_indices,
+    )
+
+
+# ---------------------------------------------------------------------------
+# ExpectancyTable
+# ---------------------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class ExpectancyTable:
+    """Expectancy table with bucket statistics."""
+
+    buckets: tuple[BucketStat, ...]
+    horizon: int
+    feature_name: str
+    n_total: int
+    cost_hurdle_bps: float
+    spread_bps: float  # top bucket mean minus bottom bucket mean
+    spread_t: float
+    survives_costs: bool  # abs(spread_bps) > 2 * cost_hurdle_bps
+
+    def explain(self) -> str:
+        """Full provenance: every stat, the SE method, the overlap correction, the cost
+        hurdle used and where it came from, and the verdict with its reasoning."""
+        lines = [
+            f"ExpectancyTable(horizon={self.horizon}, feature_name={self.feature_name!r})",
+            f"  n_total observations: {self.n_total}",
+            f"  SE method: {self.buckets[0].se_method if self.buckets else 'N/A'}",
+        ]
+
+        if self.buckets and self.buckets[0].se_method == "naive":
+            lines.append("  WARNING: NAIVE SE calculation, UNCORRECTED for overlap!")
+
+        if self.buckets:
+            lines.append(
+                f"  Overlap correction: Using {self.buckets[0].se_method} method; "
+                f"n_effective adjusts for serial correlation."
+            )
+
+        lines.extend(
+            [
+                f"  Cost hurdle: {self.cost_hurdle_bps} bps (from NSE intraday round-trip)",
+                f"  Spread (top - bottom): {self.spread_bps:.2f} bps",
+                f"  Spread t-statistic: {self.spread_t:.3f}",
+            ]
+        )
+
+        if abs(self.spread_bps) > 2 * self.cost_hurdle_bps:
+            lines.append(
+                f"  SURVIVES costs: spread {abs(self.spread_bps):.2f} bps "
+                f"> 2x hurdle {self.cost_hurdle_bps} bps"
+            )
+        else:
+            lines.append(
+                f"  DOES NOT survive costs: spread {abs(self.spread_bps):.2f} bps "
+                f"<= 2x hurdle {self.cost_hurdle_bps} bps"
+            )
+
+        return "\n".join(lines)
+
+    def to_frame(self) -> pd.DataFrame:
+        """Convert to DataFrame."""
+        data = {
+            "bucket": [b.bucket for b in self.buckets],
+            "n_obs": [b.n_obs for b in self.buckets],
+            "n_effective": [b.n_effective for b in self.buckets],
+            "mean_bps": [b.mean_bps for b in self.buckets],
+            "median_bps": [b.median_bps for b in self.buckets],
+            "std_bps": [b.std_bps for b in self.buckets],
+            "t_stat": [b.t_stat for b in self.buckets],
+            "se_method": [b.se_method for b in self.buckets],
+            "ci_low_bps": [b.ci_low_bps for b in self.buckets],
+            "ci_high_bps": [b.ci_high_bps for b in self.buckets],
+        }
+        return pd.DataFrame(data)
+
+
+def conditional_expectancy(
+    feature: np.ndarray,
+    fwd: ForwardReturns,
+    day_offsets: np.ndarray,
+    *,
+    n_buckets: int = 5,
+    method: str = "expanding_quantile",
+    se_method: str = "block_bootstrap",
+    n_boot: int = 1000,
+    seed: int = 0,
+    cost_hurdle_bps: float | None = None,
+    feature_name: str = "feature",
+) -> ExpectancyTable:
+    """Compute conditional expectancy table."""
+    feature64 = np.asarray(feature, dtype=np.float64)
+    if feature64.ndim != 2:
+        raise ValueError("feature must be 2-D")
+
+    # Get bucketing
+    bucketing = causal_buckets(
+        feature64,
+        day_offsets,
+        n_buckets=n_buckets,
+        method=method,
+        min_history=5000 if method == "expanding_quantile" else 50,
+    )
+
+    # Compute stats for each bucket
+    bucket_stats: list[BucketStat] = []
+    for bucket_idx in range(n_buckets):
+        # Find observations in this bucket
+        in_bucket = bucketing.labels == bucket_idx
+        bucket_returns = np.where(in_bucket, fwd.values, np.nan)
+        bucket_returns_flat = bucket_returns.flatten()
+
+        stat = _compute_bucket_stats(
+            bucket_returns_flat,
+            fwd.horizon,
+            day_offsets,
+            se_method=se_method,
+            n_boot=n_boot,
+            seed=seed,
+        )
+
+        if stat is not None:
+            stat_with_bucket = BucketStat(
+                bucket=bucket_idx,
+                n_obs=stat.n_obs,
+                n_effective=stat.n_effective,
+                mean_bps=stat.mean_bps,
+                median_bps=stat.median_bps,
+                std_bps=stat.std_bps,
+                t_stat=stat.t_stat,
+                se_method=stat.se_method,
+                ci_low_bps=stat.ci_low_bps,
+                ci_high_bps=stat.ci_high_bps,
+                block_indices=stat.block_indices,
+            )
+            bucket_stats.append(stat_with_bucket)
+
+    # Default cost hurdle
+    if cost_hurdle_bps is None:
+        cost_hurdle_bps = NSEIntradayEquityCosts().round_trip_bps(1e5)
+
+    # Compute spread
+    if len(bucket_stats) >= 2:
+        top_mean = bucket_stats[-1].mean_bps
+        bottom_mean = bucket_stats[0].mean_bps
+        spread_bps = top_mean - bottom_mean
+
+        # Compute t-stat for spread
+        top_se = bucket_stats[-1].std_bps / np.sqrt(
+            max(1.0, bucket_stats[-1].n_effective)
+        )
+        bottom_se = bucket_stats[0].std_bps / np.sqrt(
+            max(1.0, bucket_stats[0].n_effective)
+        )
+        spread_se = np.sqrt(top_se**2 + bottom_se**2) if (top_se or bottom_se) else 0.0
+        spread_t = spread_bps / spread_se if spread_se > 0 else 0.0
+    else:
+        spread_bps = 0.0
+        spread_t = 0.0
+
+    survives_costs = abs(spread_bps) > 2 * cost_hurdle_bps
+
+    # Count total observations
+    n_total = fwd.n_defined
+
+    return ExpectancyTable(
+        buckets=tuple(bucket_stats),
+        horizon=fwd.horizon,
+        feature_name=feature_name,
+        n_total=n_total,
+        cost_hurdle_bps=cost_hurdle_bps,
+        spread_bps=spread_bps,
+        spread_t=spread_t,
+        survives_costs=survives_costs,
+    )
+
+
+# ---------------------------------------------------------------------------
+# Decomposition functions
+# ---------------------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class CellStat:
+    """Statistics for a single cell in a double-sort."""
+
+    n_obs: int
+    mean_bps: float
+    median_bps: float
+    std_bps: float
+    t_stat: float
+    se_method: Literal["block_bootstrap", "non_overlapping", "naive"]
+    ci_low_bps: float
+    ci_high_bps: float
+
+
+@dataclass(frozen=True)
+class SortResult:
+    """Result of a double-sort."""
+
+    cells: tuple[tuple[CellStat, ...], ...]  # ROW-MAJOR: (a-bucket outer, b-bucket inner)
+    n_total: int
+    n_buckets_a: int
+    n_buckets_b: int
+    thin_cell_threshold: int
+    thin_cells: tuple[tuple[int, int], ...]  # (i, j) pairs of thin cells
+
+
+def double_sort(
+    feature_a: np.ndarray,
+    feature_b: np.ndarray,
+    fwd: ForwardReturns,
+    day_offsets: np.ndarray,
+    *,
+    n_buckets_a: int = 5,
+    n_buckets_b: int = 5,
+    method: str = "expanding_quantile",
+    se_method: str = "block_bootstrap",
+    seed: int = 0,
+    thin_cell_threshold: int = 30,
+) -> SortResult:
+    """Perform a double-sort on two features."""
+    feature_a64 = np.asarray(feature_a, dtype=np.float64)
+    feature_b64 = np.asarray(feature_b, dtype=np.float64)
+
+    # Get bucketing for both features
+    buck_a = causal_buckets(
+        feature_a64, day_offsets, n_buckets=n_buckets_a, method=method
+    )
+    buck_b = causal_buckets(
+        feature_b64, day_offsets, n_buckets=n_buckets_b, method=method
+    )
+
+    # Compute stats for each cell
+    cells: list[list[CellStat]] = []
+    thin_cells: list[tuple[int, int]] = []
+
+    for i in range(n_buckets_a):
+        row = []
+        for j in range(n_buckets_b):
+            in_cell = (buck_a.labels == i) & (buck_b.labels == j)
+            cell_returns = np.where(in_cell, fwd.values, np.nan).flatten()
+
+            stat = _compute_bucket_stats(
+                cell_returns,
+                fwd.horizon,
+                day_offsets,
+                se_method=se_method,
+                n_boot=100,
+                seed=seed,
+            )
+
+            if stat is not None:
+                cell_stat = CellStat(
+                    n_obs=stat.n_obs,
+                    mean_bps=stat.mean_bps,
+                    median_bps=stat.median_bps,
+                    std_bps=stat.std_bps,
+                    t_stat=stat.t_stat,
+                    se_method=stat.se_method,
+                    ci_low_bps=stat.ci_low_bps,
+                    ci_high_bps=stat.ci_high_bps,
+                )
+            else:
+                # Empty cell
+                cell_stat = CellStat(
+                    n_obs=0,
+                    mean_bps=0.0,
+                    median_bps=0.0,
+                    std_bps=0.0,
+                    t_stat=0.0,
+                    se_method=se_method,
+                    ci_low_bps=0.0,
+                    ci_high_bps=0.0,
+                )
+
+            row.append(cell_stat)
+
+            # Check for thin cells (both empty and underfilled)
+            if cell_stat.n_obs < thin_cell_threshold:
+                thin_cells.append((i, j))
+
+        cells.append(row)
+
+    # n_total is the count of observations (cells), not rows
+    # Each row contributes n_symbols cells (one per symbol)
+    n_total = fwd.n_defined * feature_a.shape[1]  # rows * n_symbols
+
+    return SortResult(
+        cells=tuple(tuple(row) for row in cells),
+        n_total=n_total,
+        n_buckets_a=n_buckets_a,
+        n_buckets_b=n_buckets_b,
+        thin_cell_threshold=thin_cell_threshold,
+        thin_cells=tuple(thin_cells),
+    )
+
+
+def expectancy_by_year(
+    feature: np.ndarray,
+    fwd: ForwardReturns,
+    day_offsets: np.ndarray,
+    dates: np.ndarray,
+    *,
+    n_buckets: int = 5,
+    method: str = "expanding_quantile",
+    se_method: str = "block_bootstrap",
+    n_boot: int = 1000,
+    seed: int = 0,
+    feature_name: str = "feature",
+) -> dict[int, ExpectancyTable]:
+    """Compute expectancy by calendar year."""
+    feature64 = np.asarray(feature, dtype=np.float64)
+    dates_arr = np.asarray(dates, dtype=object)
+    n_rows = feature64.shape[0]
+
+    # Map rows to years
+    session_id = np.searchsorted(day_offsets[1:], np.arange(n_rows), side="right")
+    years = np.array([dates_arr[min(i, len(dates_arr) - 1)].year for i in session_id])
+
+    result = {}
+    for year in np.unique(years):
+        year_mask = years == year
+
+        # Filter feature and fwd to this year
+        feature_year = np.where(year_mask[:, None], feature64, np.nan)
+        fwd_year_values = np.where(year_mask[:, None], fwd.values, np.nan)
+        # Count defined rows (not cells)
+        rows_with_any_finite_year = np.any(np.isfinite(fwd_year_values), axis=1)
+        n_defined_year = int(np.sum(rows_with_any_finite_year))
+
+        # Create a temporary ForwardReturns for this year
+        fwd_year = ForwardReturns(
+            values=fwd_year_values,
+            horizon=fwd.horizon,
+            session_bounded=fwd.session_bounded,
+            n_defined=n_defined_year,
+            n_nan_tail=int((~np.isfinite(fwd_year_values)).sum()),
+        )
+
+        # Compute expectancy for this year
+        table_year = conditional_expectancy(
+            feature_year,
+            fwd_year,
+            day_offsets,
+            n_buckets=n_buckets,
+            method=method,
+            se_method=se_method,
+            n_boot=n_boot,
+            seed=seed,
+            feature_name=feature_name,
+        )
+
+        result[year] = table_year
+
+    return result
+
+
+def expectancy_by_time_of_day(
+    feature: np.ndarray,
+    fwd: ForwardReturns,
+    day_offsets: np.ndarray,
+    minute_of_day: np.ndarray,
+    *,
+    n_buckets: int = 5,
+    time_bucket_minutes: int = 60,
+    method: str = "expanding_quantile",
+    se_method: str = "block_bootstrap",
+    n_boot: int = 1000,
+    seed: int = 0,
+    feature_name: str = "feature",
+) -> dict[int, ExpectancyTable]:
+    """Compute expectancy by time-of-day bucket."""
+    feature64 = np.asarray(feature, dtype=np.float64)
+    minute_arr = np.asarray(minute_of_day, dtype=int)
+
+    # Map rows to time buckets
+    time_buckets = (minute_arr // time_bucket_minutes) * time_bucket_minutes
+
+    result = {}
+    for tb in np.unique(time_buckets):
+        tb_mask = time_buckets == tb
+
+        # Filter feature and fwd to this time bucket
+        feature_tb = np.where(tb_mask[:, None], feature64, np.nan)
+        fwd_tb_values = np.where(tb_mask[:, None], fwd.values, np.nan)
+        # Count defined rows
+        rows_with_any_finite_tb = np.any(np.isfinite(fwd_tb_values), axis=1)
+        n_defined_tb = int(np.sum(rows_with_any_finite_tb))
+
+        # Create a temporary ForwardReturns for this time bucket
+        fwd_tb = ForwardReturns(
+            values=fwd_tb_values,
+            horizon=fwd.horizon,
+            session_bounded=fwd.session_bounded,
+            n_defined=n_defined_tb,
+            n_nan_tail=int((~np.isfinite(fwd_tb_values)).sum()),
+        )
+
+        # Compute expectancy for this time bucket
+        table_tb = conditional_expectancy(
+            feature_tb,
+            fwd_tb,
+            day_offsets,
+            n_buckets=n_buckets,
+            method=method,
+            se_method=se_method,
+            n_boot=n_boot,
+            seed=seed,
+            feature_name=feature_name,
+        )
+
+        result[int(tb)] = table_tb
+
+    return result
+
+
+def expectancy_by_liquidity_decile(
+    feature: np.ndarray,
+    fwd: ForwardReturns,
+    day_offsets: np.ndarray,
+    prior_adv: np.ndarray,
+    *,
+    n_buckets: int = 10,
+    method: str = "expanding_quantile",
+    se_method: str = "block_bootstrap",
+    n_boot: int = 1000,
+    seed: int = 0,
+    feature_name: str = "feature",
+) -> dict[int, ExpectancyTable]:
+    """Compute expectancy by liquidity decile.
+
+    prior_adv must already be lagged (strictly prior sessions). The function does not
+    re-derive it, and @causal cannot detect a leak in it — so document that loudly
+    at the call site.
+    """
+    feature64 = np.asarray(feature, dtype=np.float64)
+    prior_adv64 = np.asarray(prior_adv, dtype=np.float64)
+
+    # Get bucketing for prior_adv (this is a caller contract: it's already prior)
+    adv_bucketing = causal_buckets(
+        prior_adv64, day_offsets, n_buckets=n_buckets, method="cross_sectional_rank"
+    )
+
+    result = {}
+    for decile in range(n_buckets):
+        decile_mask = adv_bucketing.labels == decile
+
+        # Filter feature and fwd to this decile
+        feature_decile = np.where(decile_mask, feature64, np.nan)
+        fwd_decile_values = np.where(decile_mask, fwd.values, np.nan)
+        # Count defined rows
+        rows_with_any_finite_decile = np.any(np.isfinite(fwd_decile_values), axis=1)
+        n_defined_decile = int(np.sum(rows_with_any_finite_decile))
+
+        # Create a temporary ForwardReturns for this decile
+        fwd_decile = ForwardReturns(
+            values=fwd_decile_values,
+            horizon=fwd.horizon,
+            session_bounded=fwd.session_bounded,
+            n_defined=n_defined_decile,
+            n_nan_tail=int((~np.isfinite(fwd_decile_values)).sum()),
+        )
+
+        # Compute expectancy for this decile
+        table_decile = conditional_expectancy(
+            feature_decile,
+            fwd_decile,
+            day_offsets,
+            n_buckets=n_buckets,
+            method=method,
+            se_method=se_method,
+            n_boot=n_boot,
+            seed=seed,
+            feature_name=feature_name,
+        )
+
+        result[decile] = table_decile
+
+    return result

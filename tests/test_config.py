@@ -7,7 +7,7 @@ import pytest
 import yaml
 from pydantic import ValidationError
 
-from nifty_quant.config import RunConfig, canonical_json, config_hash, load_run_config, load_yaml
+from nifty_quant.config import RunConfig, canonical_json, config_hash, load_run_config
 
 
 def test_run_config_unknown_extra_key_raises_validation_error() -> None:

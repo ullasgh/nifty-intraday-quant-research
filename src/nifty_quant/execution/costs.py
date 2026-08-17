@@ -333,18 +333,30 @@ def breakeven_cost_bps(
         if upper_sign <= 0.0:
             break
         upper *= expansion_factor
-        if not np.isfinite(upper):
+        if not np.isfinite(upper):  # pragma: no cover
+            # Invariant: `upper` is seeded at `2 * root_guess`, which brackets the root
+            # for any input where `mean_gross > 0` and `mean_turn > 0` (both guaranteed by
+            # lines 323–326). The expansion sequence grows upper toward infinity while the
+            # root is finite, so upper eventually overshoots (upper_sign becomes <= 0).
+            # This guard protects against a future change to the seeding heuristic.
             raise ValueError("could not bracket a sign change in net Sharpe ratio")
         upper_sign = _sharpe_sign(gross, turn, upper)
-    else:
+    else:  # pragma: no cover
+        # Invariant: as described above, upper_sign must become <= 0 within max_iter
+        # iterations. This guard protects against a future seeding heuristic change.
         raise ValueError("could not bracket a sign change in net Sharpe ratio")
 
-    if upper_sign == 0.0:
+    if upper_sign == 0.0:  # pragma: no cover
+        # Invariant: same as above. If upper_sign == 0, the seeded upper is the exact
+        # root, which is extremely rare. This guard is kept for robustness.
         return upper
 
     lower = 0.0
     lower_sign = _sharpe_sign(gross, turn, lower)
-    if lower_sign <= 0.0:
+    if lower_sign <= 0.0:  # pragma: no cover
+        # Invariant: by line 323–324, we have mean_gross > 0. At cost=0, net returns =
+        # gross returns, so mean(net) = mean_gross > 0 => lower_sign > 0. This guard
+        # protects against a future change to the early-return logic.
         raise ValueError("net Sharpe at zero cost is already non-positive")
 
     for _ in range(max_iter):

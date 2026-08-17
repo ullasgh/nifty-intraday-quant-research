@@ -8,7 +8,11 @@ import typer
 
 from nifty_quant import __version__
 
-if TYPE_CHECKING:
+if TYPE_CHECKING:  # pragma: no cover - False at runtime by language definition
+    # `typing.TYPE_CHECKING` is a hard-coded `False` in every CPython execution; only static
+    # checkers (mypy/pyright) treat it as True, and they parse rather than execute. Combined
+    # with `from __future__ import annotations` above, the annotations referencing `np`/`Panel`
+    # are never evaluated at runtime either, so no call path can reach this block.
     import numpy as np
 
     from nifty_quant.data.panel import Panel
@@ -65,6 +69,36 @@ def _ensure_plugins_loaded() -> None:
     import nifty_quant.strategy.plugins  # noqa: F401
 
 
+def _decision_and_final_rows(
+    panel: "Panel",
+    decision_times: tuple[str, ...] | None,
+) -> "np.ndarray":
+    """Reconstruct the strategy's decision rows and unconditional final row.
+
+    This helper is shared by `_daily_returns`, `_daily_turnover`, and
+    `_daily_return_ts` so none of them can reconstruct a different row set for
+    the same backtest.
+    """
+    import numpy as np
+
+    n_rows = panel.ts.shape[0]
+    if n_rows == 0:
+        return np.empty(0, dtype=np.int64)
+
+    if decision_times is None:
+        decision_rows = np.arange(1, n_rows, dtype=np.int64)
+    else:
+        parts = [panel.rows_at_time(t) for t in decision_times]
+        decision_rows = (
+            np.unique(np.concatenate(parts)).astype(np.int64, copy=False)
+            if parts
+            else np.empty(0, dtype=np.int64)
+        )
+        decision_rows = decision_rows[decision_rows != 0]
+
+    return np.concatenate((decision_rows, np.array([n_rows - 1], dtype=np.int64)))
+
+
 def _daily_returns(
     returns: "np.ndarray",
     panel: "Panel",
@@ -113,18 +147,7 @@ def _daily_returns(
     if n_rows == 0:
         return np.empty(0, dtype=np.float64)
 
-    if decision_times is None:
-        decision_rows = np.arange(1, n_rows, dtype=np.int64)
-    else:
-        parts = [panel.rows_at_time(t) for t in decision_times]
-        decision_rows = (
-            np.unique(np.concatenate(parts)).astype(np.int64, copy=False)
-            if parts
-            else np.empty(0, dtype=np.int64)
-        )
-        decision_rows = decision_rows[decision_rows != 0]
-
-    row_indices = np.concatenate((decision_rows, np.array([n_rows - 1], dtype=np.int64)))
+    row_indices = _decision_and_final_rows(panel, decision_times)
 
     if row_indices.size != returns.size:
         raise ValueError(
@@ -135,6 +158,159 @@ def _daily_returns(
 
     day_indices = np.searchsorted(panel.day_offsets, row_indices, side="right") - 1
     return aggregate_returns_by_group(returns, day_indices)
+
+
+def _daily_turnover(
+    turnover: "np.ndarray",
+    panel: "Panel",
+    decision_times: tuple[str, ...] | None,
+) -> "np.ndarray":
+    """Aggregate decision-row turnover into one additive total per trading day.
+
+    Returns compound within a session, whereas turnover sums within a session because
+    turnover is the notional churned and is therefore an additive quantity. Compounding
+    turnover would be meaningless. Use this helper instead of raw per-decision-row
+    turnover whenever pooling or concatenating it with day-aggregated returns, or the
+    two series will end up on different bases.
+    """
+    import numpy as np
+
+    if turnover.size == 0:
+        return np.empty(0, dtype=np.float64)
+
+    n_rows = panel.ts.shape[0]
+    if n_rows == 0:
+        return np.empty(0, dtype=np.float64)
+
+    row_indices = _decision_and_final_rows(panel, decision_times)
+
+    if row_indices.size != turnover.size:
+        raise ValueError(
+            "Daily-turnover reconstruction length mismatch: reconstructed "
+            f"{row_indices.size} decision/final rows but turnover has "
+            f"{turnover.size} entries."
+        )
+
+    day_indices = np.searchsorted(panel.day_offsets, row_indices, side="right") - 1
+    turnover = np.asarray(turnover, dtype=np.float64).reshape(-1)
+    starts = np.r_[0, np.flatnonzero(np.diff(day_indices) != 0) + 1]
+    return np.add.reduceat(turnover, starts)
+
+
+def _daily_return_ts(
+    panel: "Panel",
+    decision_times: tuple[str, ...] | None,
+    n_days: int,
+) -> "np.ndarray":
+    """Return UTC-midnight timestamps for daily-return values.
+
+    The int64 result has one epoch-second timestamp per requested day, ordered by the
+    distinct reconstructed day groups in the same ascending order as `_daily_returns`.
+    If ``n_days`` does not match those groups, a best-effort fallback uses trailing
+    panel days and repeats day zero as needed; this is intended for callers using
+    externally supplied or stubbed daily-return lengths and cannot recover an arbitrary
+    true row-to-day mapping.
+    """
+    from datetime import datetime, timezone
+
+    import numpy as np
+
+    if n_days == 0:
+        return np.empty(0, dtype=np.int64)
+
+    if panel.ts.shape[0] == 0:
+        return np.empty(0, dtype=np.int64)
+
+    row_indices = _decision_and_final_rows(panel, decision_times)
+    if row_indices.size == 0:
+        unique_days = np.empty(0, dtype=np.int64)
+    else:
+        day_indices = np.searchsorted(panel.day_offsets, row_indices, side="right") - 1
+        unique_days = np.unique(day_indices)
+
+    if unique_days.size != n_days:
+        # Unreachable when n_days comes from the real _daily_returns output because
+        # step 4 derives that length from these same reconstructed day groups.
+        unique_days = np.arange(
+            max(0, len(panel.dates) - n_days),
+            len(panel.dates),
+            dtype=np.int64,
+        )
+        if unique_days.size < n_days:
+            padding = n_days - unique_days.size
+            if len(panel.dates) == 0:
+                unique_days = np.zeros(n_days, dtype=np.int64)
+            else:
+                unique_days = np.concatenate(
+                    (np.zeros(padding, dtype=np.int64), unique_days)
+                )
+
+    if len(panel.dates) == 0:
+        return np.zeros(n_days, dtype=np.int64)
+
+    session_dates = panel.dates[unique_days]
+    return np.asarray(
+        [
+            int(
+                datetime.combine(
+                    session_date,
+                    datetime.min.time(),
+                    tzinfo=timezone.utc,
+                ).timestamp()
+            )
+            for session_date in session_dates
+        ],
+        dtype=np.int64,
+    )
+
+
+def _write_returns_parquet(
+    path: Path,
+    ts: "np.ndarray",
+    daily_returns: "np.ndarray",
+) -> None:
+    """Write the two-column return artifact specified by ``specs/returns_persistence.md``."""
+    import numpy as np
+    import pandas as pd
+
+    frame = pd.DataFrame(
+        {
+            "ts": np.asarray(ts, dtype=np.int64),
+            "return": np.asarray(daily_returns, dtype=np.float64),
+        }
+    )
+    frame.to_parquet(path, index=False)
+
+
+def _tradable_mask_summary(panel: "Panel", mask: "np.ndarray") -> str:
+    """One-line debuggability summary of what the tradable filter excluded.
+
+    Reports two distinct, never-conflated numbers: how many of the
+    (row, symbol) cells simply have no bar (``present``), and -- separately --
+    how many present bars were excluded by the tradable filter itself
+    (liquidity / circuit-lock / staleness gating). ``mask`` is always a subset
+    of ``present`` (tradable implies present), so this is a decomposition, not
+    a merge of the two concepts.
+    """
+    import numpy as np
+
+    close = panel.field("close")
+    present = ~np.isnan(close)
+    total = present.size
+    if total == 0:
+        return "tradable filter: n/a (empty panel)"
+    present_count = int(np.count_nonzero(present))
+    tradable_count = int(np.count_nonzero(mask))
+    excluded_count = total - tradable_count
+    present_but_excluded = present_count - tradable_count
+    return (
+        f"tradable filter: excluded {100.0 * excluded_count / total:.2f}% of "
+        f"(row, symbol) cells overall "
+        f"[present={100.0 * present_count / total:.2f}% of cells; "
+        f"of present cells, "
+        f"{100.0 * present_but_excluded / present_count if present_count else 0.0:.2f}% "
+        f"excluded by liquidity/circuit-lock/staleness gating]"
+    )
 
 
 @app.command()
@@ -295,6 +471,22 @@ def backtest(
     start: str = typer.Option(..., "--start"),
     end: str = typer.Option(..., "--end"),
     universe_name: str = typer.Option("all_equity", "--universe"),
+    tradable_filter: bool = typer.Option(
+        True,
+        "--tradable-filter/--no-tradable-filter",
+        help=(
+            "Gate on liquidity/circuit-lock/staleness via "
+            "nifty_quant.data.validate.tradable_mask (enabled by default)."
+        ),
+    ),
+    min_adv_inr: float = typer.Option(
+        5e7,
+        "--min-adv-inr",
+        help=(
+            "Minimum 20-session average daily traded value (INR) for the liquidity "
+            "component of the tradable filter."
+        ),
+    ),
 ) -> None:
     """Run a single full-sample backtest."""
     start_d = _parse_date(start, "--start")
@@ -339,6 +531,7 @@ def backtest(
         from nifty_quant.config import config_hash as run_config_hash
         from nifty_quant.data.manifest import Manifest
         from nifty_quant.data.panel import PanelSpec, load_panel
+        from nifty_quant.data.validate import tradable_mask
         from nifty_quant.execution.costs import NSEIntradayEquityCosts, breakeven_cost_bps
         from nifty_quant.research.registry import TrialRecord, TrialRegistry
         from nifty_quant.strategy.registry import config_hash as strategy_config_hash
@@ -357,6 +550,13 @@ def backtest(
         )
         panel = load_panel(spec)
 
+        tradable_full: np.ndarray | None
+        if tradable_filter:
+            tradable_full = tradable_mask(panel, min_adv_inr=min_adv_inr)
+            typer.echo(_tradable_mask_summary(panel, tradable_full))
+        else:
+            tradable_full = None
+
         cost_model = NSEIntradayEquityCosts()
         t0 = time.monotonic()
 
@@ -369,6 +569,7 @@ def backtest(
                 decision_latency_bars=0,
                 cost_model=cost_model,
             ),
+            tradable=tradable_full,
         )
 
         decision_times = strat.data_request().decision_times
@@ -437,6 +638,7 @@ def backtest(
                         decision_latency_bars=latency_bars,
                         cost_model=cost_model,
                     ),
+                    tradable=tradable_full,
                 )
                 latency_sharpes[latency_bars] = float(
                     compute_metrics(
@@ -504,6 +706,8 @@ def backtest(
         )
 
         result.trades.to_parquet(trial_dir / "result.parquet")
+        returns_ts = _daily_return_ts(panel, decision_times, daily_net.size)
+        _write_returns_parquet(trial_dir / "returns.parquet", returns_ts, daily_net)
 
         manifest_fingerprint = None
         try:
@@ -530,6 +734,8 @@ def backtest(
                 code_version=__version__,
                 wall_s=time.monotonic() - t0,
                 result_path=str(trial_dir),
+                ruined=bool(result.ruined),
+                ruin_index=int(result.ruin_index),
                 error=None,
             )
         )
@@ -562,6 +768,8 @@ def backtest(
                     code_version=__version__,
                     wall_s=None,
                     result_path=None,
+                    ruined=None,
+                    ruin_index=None,
                     error=str(exc),
                 )
             )
@@ -579,6 +787,22 @@ def walkforward(
     start: str | None = typer.Option(None, "--start"),
     end: str | None = typer.Option(None, "--end"),
     universe_name: str = typer.Option("all_equity", "--universe"),
+    tradable_filter: bool = typer.Option(
+        True,
+        "--tradable-filter/--no-tradable-filter",
+        help=(
+            "Gate on liquidity/circuit-lock/staleness via "
+            "nifty_quant.data.validate.tradable_mask (enabled by default)."
+        ),
+    ),
+    min_adv_inr: float = typer.Option(
+        5e7,
+        "--min-adv-inr",
+        help=(
+            "Minimum 20-session average daily traded value (INR) for the liquidity "
+            "component of the tradable filter."
+        ),
+    ),
 ) -> None:
     """Run an out-of-sample walk-forward evaluation."""
     from nifty_quant.calendar import DEFAULT_RESEARCH_START
@@ -649,6 +873,7 @@ def walkforward(
         )
         from nifty_quant.data.manifest import Manifest
         from nifty_quant.data.panel import PanelSpec, load_panel
+        from nifty_quant.data.validate import tradable_mask
         from nifty_quant.execution.costs import NSEIntradayEquityCosts, breakeven_cost_bps
         from nifty_quant.research.registry import TrialRecord, TrialRegistry
         from nifty_quant.research.splits import HoldoutLock
@@ -656,6 +881,7 @@ def walkforward(
         from nifty_quant.universe.static import load_universe, survivorship_report
 
         strat = registry.build(cfg)
+        wf_chash = strategy_config_hash(cfg)
         universe = load_universe(universe_name)
         typer.echo(survivorship_report(universe, start_d, end_d).warning_line())
 
@@ -667,6 +893,14 @@ def walkforward(
             end=end_d,
         )
         panel = load_panel(spec)
+
+        full_tradable_mask: np.ndarray | None
+        if tradable_filter:
+            full_tradable_mask = tradable_mask(panel, min_adv_inr=min_adv_inr)
+            typer.echo(_tradable_mask_summary(panel, full_tradable_mask))
+        else:
+            full_tradable_mask = None
+
         cost_model = NSEIntradayEquityCosts()
 
         holdout = HoldoutLock(path=settings.RESULTS_ROOT / "holdout_lock.json")
@@ -687,14 +921,27 @@ def walkforward(
 
         for split in splits:
             test_panel = panel.sub(start=split.test[0], end=split.test[1])
+            test_tradable_mask = (
+                tradable_mask(test_panel, min_adv_inr=min_adv_inr) if tradable_filter else None
+            )
             res = run_backtest(
                 strat,
                 test_panel,
                 BacktestConfig(capital=1e7, cost_model=cost_model),
+                tradable=test_tradable_mask,
             )
             decision_times = strat.data_request().decision_times
             split_daily_gross = _daily_returns(res.gross_returns, test_panel, decision_times)
             split_daily_net = _daily_returns(res.returns, test_panel, decision_times)
+            split_daily_turnover = _daily_turnover(res.turnover, test_panel, decision_times)
+            split_trial_dir = settings.RESULTS_ROOT / "trials" / wf_chash / split.id
+            split_trial_dir.mkdir(parents=True, exist_ok=True)
+            split_returns_ts = _daily_return_ts(
+                test_panel, decision_times, split_daily_net.size
+            )
+            _write_returns_parquet(
+                split_trial_dir / "returns.parquet", split_returns_ts, split_daily_net
+            )
             gross_sharpe = float(compute_metrics(split_daily_gross).sharpe)
             net_sharpe = float(compute_metrics(split_daily_net).sharpe)
             mean_turnover = float(np.mean(res.turnover)) if res.turnover.size else 0.0
@@ -716,7 +963,7 @@ def walkforward(
 
             trial_registry.record(
                 TrialRecord(
-                    config_hash=strategy_config_hash(cfg),
+                    config_hash=wf_chash,
                     ts=datetime.now(timezone.utc).isoformat(timespec="seconds"),
                     strategy=strategy,
                     params_json=json.dumps(cfg.get("params", {})),
@@ -731,14 +978,16 @@ def walkforward(
                     data_fingerprint=manifest_fingerprint,
                     code_version=__version__,
                     wall_s=None,
-                    result_path=None,
+                    result_path=str(split_trial_dir),
+                    ruined=bool(res.ruined),
+                    ruin_index=int(res.ruin_index),
                     error=None,
                 )
             )
 
             pooled_net_list.append(split_daily_net)
             pooled_gross_list.append(split_daily_gross)
-            pooled_turnover_list.append(res.turnover)
+            pooled_turnover_list.append(split_daily_turnover)
             total_costs_list.append(res.total_costs)
 
         pooled_net = np.concatenate(pooled_net_list)
@@ -795,6 +1044,7 @@ def walkforward(
                     decision_latency_bars=latency_bars,
                     cost_model=cost_model,
                 ),
+                tradable=full_tradable_mask,
             )
         full_decision_times = strat.data_request().decision_times
         latency_sharpes = {
@@ -896,6 +1146,8 @@ def walkforward(
                 code_version=__version__,
                 wall_s=None,
                 result_path=None,
+                ruined=bool(full_result.ruined),
+                ruin_index=int(full_result.ruin_index),
                 error=None,
             )
         )
@@ -927,6 +1179,8 @@ def walkforward(
                     code_version=__version__,
                     wall_s=None,
                     result_path=None,
+                    ruined=None,
+                    ruin_index=None,
                     error=str(exc),
                 )
             )
@@ -1034,6 +1288,14 @@ def sweep(
                 )
                 sweep_decision_times = strat.data_request().decision_times
                 sweep_daily_net = _daily_returns(res.returns, panel, sweep_decision_times)
+                trial_dir = settings.RESULTS_ROOT / "trials" / chash
+                trial_dir.mkdir(parents=True, exist_ok=True)
+                sweep_returns_ts = _daily_return_ts(
+                    panel, sweep_decision_times, sweep_daily_net.size
+                )
+                _write_returns_parquet(
+                    trial_dir / "returns.parquet", sweep_returns_ts, sweep_daily_net
+                )
                 sweep_daily_gross = _daily_returns(res.gross_returns, panel, sweep_decision_times)
 
                 net = compute_metrics(sweep_daily_net)
@@ -1071,7 +1333,9 @@ def sweep(
                         data_fingerprint=manifest_fingerprint,
                         code_version=__version__,
                         wall_s=None,
-                        result_path=None,
+                        result_path=str(trial_dir),
+                        ruined=bool(res.ruined),
+                        ruin_index=int(res.ruin_index),
                         error=None,
                     )
                 )
@@ -1096,6 +1360,8 @@ def sweep(
                             code_version=__version__,
                             wall_s=None,
                             result_path=None,
+                            ruined=None,
+                            ruin_index=None,
                             error=str(exc),
                         )
                     )

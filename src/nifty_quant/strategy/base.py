@@ -346,7 +346,13 @@ class ArrayMarketView:
         rows = np.empty(n_days, dtype=np.int64)
         for i, day in enumerate(selected_days):
             day_indices = np.where(self._day_index == day)[0]
-            if day_indices.size == 0:
+            if day_indices.size == 0:  # pragma: no cover - unreachable class invariant
+                # `selected_days` is a slice of `prior_days`, which is filtered from
+                # `np.unique(self._day_index)`. Every value there is by construction a day
+                # index that occurs at least once, so this branch cannot be reached without a
+                # prior violation of the `_day_index` invariant established in `__init__`.
+                # Kept as a guard against a future refactor of that derivation; excluded from
+                # coverage rather than deleted so the invariant stays asserted in the code.
                 raise ValueError("No rows for prior session")
             rows[i] = day_indices[-1]
 

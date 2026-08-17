@@ -35,6 +35,24 @@ markers = [
     "slow: marks tests as slow (deselect with '-m \"not slow\"')",
 ]
 
+[tool.coverage.run]
+branch = true
+source = ["src/nifty_quant"]
+parallel = false
+
+[tool.coverage.report]
+show_missing = true
+skip_covered = false
+exclude_also = [
+    "if TYPE_CHECKING:",
+    "\\.\\.\\.$",
+    "raise NotImplementedError",
+]
+# NOTE: `fail_under` is deliberately NOT set here. The threshold is a ratchet that differs
+# per module (see coverage_floor.json) and is enforced explicitly by `scripts/coverage_gate.py`
+# via `make gate`. Putting a global fail_under here would make every ad-hoc `--cov` run exit
+# non-zero, which trains people to ignore the gate.
+
 [tool.ruff]
 line-length = 100
 target-version = "py312"

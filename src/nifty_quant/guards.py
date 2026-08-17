@@ -203,7 +203,13 @@ def panel_contract(
                             f"{func.__name__}: output contains {inf_count} infs"
                         )
                 if same_shape_as_arg_name is not None:
-                    if same_shape_as_arg_name not in bound.arguments:
+                    # pragma: no cover justification — `same_shape_as_arg_name` is resolved at
+                    # DECORATION time by `_static_arg_name(func, same_shape_as_arg)` against
+                    # `func`'s signature, and `bound.arguments` is built at call time from that
+                    # same signature. A name that resolved once therefore always binds. Kept as
+                    # a guard against a future change that resolves the name from somewhere
+                    # other than the signature.
+                    if same_shape_as_arg_name not in bound.arguments:  # pragma: no cover
                         raise ContractViolation(
                             f"{func.__name__}: unknown argument {same_shape_as_arg!r}"
                         )
@@ -295,9 +301,12 @@ def causal(
                     f"{func.__name__}: causal guard requires an ndarray output"
                 )
 
+            # No `n_rows < 2` early-return here: the guard above already raises
+            # ContractViolation for `x.shape[0] < 2`, so n_rows >= 2 is established by this
+            # point. A second check was vestigial dead code, removed rather than excluded
+            # from coverage — it implied a supported "too short to probe" mode that does not
+            # exist, since such inputs are rejected outright.
             n_rows = x.shape[0]
-            if n_rows < 2:
-                return y0
 
             rng = np.random.default_rng(seed)
             cut_count = min(max(n_probes, 0), n_rows - 1)
@@ -359,7 +368,14 @@ def causal(
                                 f"{func.__name__}: causal violation at cut {k}, "
                                 f"first mismatching row {row_index}"
                             )
-                    raise ContractViolation(
+                    # pragma: no cover justification — unreachable fallback. The enclosing
+                    # `array_equal(y0[:k+1], y1[:k+1])` returned False, so at least one row in
+                    # that slice must differ, and the loop above scans every row in it and
+                    # raises on the first mismatch. Reaching here would mean a slice compares
+                    # unequal while every one of its rows compares equal. Kept so the failure
+                    # is a named ContractViolation rather than a silent fall-through if the
+                    # comparison strategy above ever changes.
+                    raise ContractViolation(  # pragma: no cover
                         f"{func.__name__}: causal violation at cut {k} "
                         "but row loop found no mismatch"
                     )

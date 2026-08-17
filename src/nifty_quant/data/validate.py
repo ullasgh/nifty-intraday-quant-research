@@ -698,7 +698,15 @@ def tradable_mask(
         start = int(day_offsets[session_idx])
         end = int(day_offsets[session_idx + 1])
         prev_ix = int(day_offsets[session_idx]) - 1
-        if start < end and prev_ix >= 0:
+        # The False arm is unreachable for any constructible Panel and is excluded from
+        # coverage: the loop starts at session_idx 1, and Panel.__init__ runs
+        # check_day_offsets, which enforces day_offsets[0] == 0 and strict increase. So
+        # start < end always holds, and prev_ix = day_offsets[session_idx] - 1 >= 0.
+        # Kept rather than removed because a negative prev_ix would make close[prev_ix, :]
+        # wrap around to the LAST row of the panel — silently seeding every session's
+        # prev_close with future data instead of raising. That is a wrong-answer failure,
+        # not a crash, so the guard stays.
+        if start < end and prev_ix >= 0:  # pragma: no branch - Panel invariant, see above
             prev_close[start:end, :] = close[prev_ix, :]
 
     locked = circuit_locked_mask(

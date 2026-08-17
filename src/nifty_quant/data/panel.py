@@ -595,17 +595,17 @@ def load_panel(
         start_idx = 0
         end_excl = 0
     else:
-        if spec.start is None:
-            start_idx = 0
-        else:
-            idx = np.flatnonzero(dates_full >= spec.start)
-            start_idx = 0 if len(idx) == 0 else int(idx[0])
+        # `spec.start` / `spec.end` are non-Optional `datetime.date` (see PanelSpec). The
+        # former `is None` branches here were vestigial and unreachable: `key()`,
+        # `estimated_bytes()` and the `range(spec.start.year, ...)` above all dereference
+        # them first, so a None would have raised long before this point. They are removed
+        # rather than pragma'd because they advertised an unbounded-range load that the rest
+        # of the module cannot actually perform.
+        idx = np.flatnonzero(dates_full >= spec.start)
+        start_idx = 0 if len(idx) == 0 else int(idx[0])
 
-        if spec.end is None:
-            end_excl = n_days_full
-        else:
-            idx = np.flatnonzero(dates_full <= spec.end)
-            end_excl = 0 if len(idx) == 0 else int(idx[-1]) + 1
+        idx = np.flatnonzero(dates_full <= spec.end)
+        end_excl = 0 if len(idx) == 0 else int(idx[-1]) + 1
 
     if start_idx > end_excl:
         start_idx = end_excl

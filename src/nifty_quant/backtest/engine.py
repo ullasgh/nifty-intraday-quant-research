@@ -643,7 +643,14 @@ def run_backtest(
             ruin_index = min(net_ruin_idx, gross_ruin_idx)
         elif net_ruin_idx != -1:
             ruin_index = net_ruin_idx
-        elif gross_ruin_idx != -1:
+        elif gross_ruin_idx != -1:  # pragma: no cover - unreachable, see invariant below
+            # Charges are non-negative, so net equity <= gross equity pointwise. The gross
+            # curve can therefore only cross zero at or after the net curve does, i.e.
+            # `gross_ruin_idx != -1` implies `net_ruin_idx != -1`, which the first branch has
+            # already caught. Both indices are the FIRST trip and are computed before any
+            # post-ruin zeroing, so the zeroing cannot make the curves cross and invalidate
+            # this. Kept so the arm is explicit rather than silently falling through to -1 if
+            # the cost sign convention ever changes.
             ruin_index = gross_ruin_idx
         else:
             ruin_index = -1
