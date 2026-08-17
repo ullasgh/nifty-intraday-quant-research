@@ -28,7 +28,7 @@ import numpy as np
 import pandas as pd
 
 import nifty_quant.guards as guards
-from nifty_quant.backtest.portfolio import GrossNotionalSizer, Portfolio
+from nifty_quant.backtest.portfolio import GrossNotionalSizer, Portfolio, SizingResult
 from nifty_quant.data.panel import Panel
 from nifty_quant.execution.costs import (
     CostModel,
@@ -69,8 +69,10 @@ class BacktestResult:
     initial_capital: float = 1e7
     n_symbols_absent: int = 0
     absent_symbols: tuple[str, ...] = ()
+    ruined: bool = False
+    ruin_index: int = -1
 
-    def to_dict(self) -> dict[str, float | int]:
+    def to_dict(self) -> dict[str, float | int | bool]:
         if self.equity_curve.size and self.initial_capital != 0.0:
             final_equity = float(self.equity_curve[-1])
             total_return = float(final_equity / self.initial_capital - 1.0)
@@ -86,6 +88,8 @@ class BacktestResult:
             "final_equity": final_equity,
             "total_return": total_return,
             "mean_turnover": float(np.mean(self.turnover)) if self.turnover.size else 0.0,
+            "ruined": self.ruined,
+            "ruin_index": self.ruin_index,
         }
 
 
@@ -94,15 +98,48 @@ def _parse_hhmm(value: str) -> int:
     return int(hour_str) * 60 + int(minute_str)
 
 
-def _compute_returns(equity: np.ndarray, initial_capital: float) -> np.ndarray:
-    if equity.size == 0:
-        return np.empty(0, dtype=np.float64)
-    out = np.empty(equity.size, dtype=np.float64)
-    out[0] = equity[0] / initial_capital - 1.0 if initial_capital != 0.0 else 0.0
-    for idx in range(1, equity.size):
-        denom = equity[idx - 1]
-        out[idx] = equity[idx] / denom - 1.0 if denom != 0.0 else 0.0
-    return out
+def _compute_returns(equity: np.ndarray, initial_capital: float) -> tuple[np.ndarray, int]:
+    """Return (returns, first_ruin_index).
+
+    A step is "ruined" if its denominator (initial_capital for index 0, else the prior
+    equity value) is <= 0 or non-finite, or if its numerator (the current equity value)
+    is non-finite. A ruined step's return is forced to 0.0 rather than letting a bad
+    denominator sign-flip the ratio or a bad numerator propagate NaN. Once ruined, every
+    subsequent index also emits 0.0 -- a ruined series never resumes normal division.
+    first_ruin_index is -1 if the guard never trips.
+    """
+    equity = np.asarray(equity, dtype=np.float64)
+    n = equity.size
+    if n == 0:
+        return np.empty(0, dtype=np.float64), -1
+
+    initial_bad = not np.isfinite(initial_capital) or initial_capital <= 0.0
+
+    bad = np.empty(n, dtype=np.bool_)
+    bad[0] = initial_bad or not np.isfinite(equity[0])
+    if n > 1:
+        prev = equity[:-1]
+        bad[1:] = (~np.isfinite(prev)) | (prev <= 0.0) | (~np.isfinite(equity[1:]))
+
+    ruined_mask = np.logical_or.accumulate(bad)
+
+    if bad.any():
+        first_ruin_index = int(np.flatnonzero(bad)[0])
+    else:
+        first_ruin_index = -1
+
+    returns = np.empty(n, dtype=np.float64)
+    with np.errstate(divide="ignore", invalid="ignore", over="ignore"):
+        if bad[0]:
+            returns[0] = 0.0
+        else:
+            returns[0] = equity[0] / initial_capital - 1.0
+
+        if n > 1:
+            normal = equity[1:] / equity[:-1] - 1.0
+            returns[1:] = np.where(ruined_mask[1:], 0.0, normal)
+
+    return returns, first_ruin_index
 
 
 def run_backtest(
@@ -197,6 +234,7 @@ def run_backtest(
         )
 
         pending_orders: dict[int, np.ndarray] = {}
+        in_flight: np.ndarray = np.zeros(n_sym, dtype=np.float64)
         active_stops: dict[int, float] = {}
         square_off_queued = False
 
@@ -221,20 +259,63 @@ def run_backtest(
             "notional",
             "is_buy",
             "charges",
+            "decision_price",
+            "fill_price",
+            "shortfall_bps",
+            "participation",
+            "filled_frac",
         )
 
         def _record_trade(
-            t: int, sym_idx: int, qty: float, price: float, charges: float
+            t: int,
+            sym_idx: int,
+            qty: float,
+            price: float,
+            charges: float,
+            desired_qty: float,
         ) -> None:
+            qty_f = float(qty)
+            price_f = float(price)
+            decision_price = price_f if t == 0 else float(close[t - 1, sym_idx])
+            side = 1.0 if qty_f > 0.0 else -1.0
+            notional = abs(qty_f * price_f)
+
+            if np.isfinite(decision_price) and decision_price > 0.0 and np.isfinite(price_f):
+                shortfall_bps = 1e4 * (price_f - decision_price) / decision_price * side
+            else:
+                shortfall_bps = 0.0
+
+            bar_traded_value = float(volume_safe[t, sym_idx] * price_f)
+            if (
+                np.isfinite(notional)
+                and np.isfinite(bar_traded_value)
+                and bar_traded_value > 0.0
+            ):
+                participation = notional / bar_traded_value
+            else:
+                participation = 0.0
+
+            desired_qty_f = float(desired_qty)
+            denom = abs(desired_qty_f)
+            if np.isfinite(qty_f) and np.isfinite(denom) and denom > 0.0:
+                filled_frac = abs(qty_f) / denom
+            else:
+                filled_frac = 0.0
+
             records.append(
                 {
                     "ts": int(panel.ts[t]),
                     "symbol": panel.symbols[sym_idx],
-                    "qty": float(qty),
-                    "price": float(price),
-                    "notional": abs(float(qty) * float(price)),
-                    "is_buy": bool(qty > 0),
+                    "qty": qty_f,
+                    "price": price_f,
+                    "notional": notional,
+                    "is_buy": bool(qty_f > 0.0),
                     "charges": float(charges),
+                    "decision_price": decision_price,
+                    "fill_price": price_f,
+                    "shortfall_bps": shortfall_bps,
+                    "participation": participation,
+                    "filled_frac": filled_frac,
                 }
             )
 
@@ -266,6 +347,7 @@ def run_backtest(
                     float(filled[sym_idx]),
                     float(fill_price_arr[sym_idx]),
                     float(charges_arr.total[sym_idx]),
+                    float(order[sym_idx]),
                 )
 
             fill_notional = float(np.sum(np.abs(filled) * fill_price_arr))
@@ -304,6 +386,7 @@ def run_backtest(
                     float(order[sym_idx]),
                     float(price_arr[sym_idx]),
                     float(charges_arr.total[sym_idx]),
+                    float(order[sym_idx]),
                 )
 
             fill_notional = float(np.sum(np.abs(order) * price_arr))
@@ -343,6 +426,9 @@ def run_backtest(
 
             pending = pending_orders.pop(t, None)
             if pending is not None:
+                in_flight -= pending
+                if not pending_orders:
+                    in_flight[:] = 0.0
                 notional_since_snapshot += _execute_model_fill(pending, t)
 
             if req.needs_intrabar_risk:
@@ -461,13 +547,23 @@ def run_backtest(
                         target_weights = masked_weights * (orig_gross / masked_gross)
                     else:
                         target_weights = masked_weights
-                    target_shares = config.sizer.to_shares(
-                        target_weights, mark_prices, capital_now
+                    bar_traded_value = close[cursor] * volume_safe[cursor]
+                    sizing_result = config.sizer.to_shares(
+                        target_weights,
+                        mark_prices,
+                        capital_now,
+                        bar_traded_value=bar_traded_value,
+                        max_participation=config.fill_model.max_participation,
                     )
-                    order = target_shares - portfolio.shares
+                    assert isinstance(sizing_result, SizingResult)
+                    target_shares = sizing_result.shares
+                    order = target_shares - portfolio.shares - in_flight
                     fill_row = t + 1 + int(config.decision_latency_bars)
                     if fill_row < n_rows:
+                        if fill_row in pending_orders:
+                            in_flight -= pending_orders[fill_row]
                         pending_orders[fill_row] = order
+                        in_flight += order
 
                     for symbol, sym_idx in panel.sym_ix.items():
                         stop_key = f"stop:{symbol}"
@@ -489,7 +585,11 @@ def run_backtest(
                     else:
                         fill_row = t + 1
                         if fill_row < n_rows and not is_last_row:
-                            pending_orders[fill_row] = -portfolio.shares.copy()
+                            square_off_order = -portfolio.shares.copy()
+                            if fill_row in pending_orders:
+                                in_flight -= pending_orders[fill_row]
+                            pending_orders[fill_row] = square_off_order
+                            in_flight += square_off_order
                             square_off_queued = True
 
             if is_last_row:
@@ -533,8 +633,20 @@ def run_backtest(
             else np.empty((0, n_sym), dtype=np.float64)
         )
 
-        returns_arr = _compute_returns(equity_curve_arr, float(config.capital))
-        gross_returns_arr = _compute_returns(gross_curve_arr, float(config.capital))
+        returns_arr, net_ruin_idx = _compute_returns(equity_curve_arr, float(config.capital))
+        gross_returns_arr, gross_ruin_idx = _compute_returns(
+            gross_curve_arr, float(config.capital)
+        )
+
+        ruined = net_ruin_idx != -1 or gross_ruin_idx != -1
+        if net_ruin_idx != -1 and gross_ruin_idx != -1:
+            ruin_index = min(net_ruin_idx, gross_ruin_idx)
+        elif net_ruin_idx != -1:
+            ruin_index = net_ruin_idx
+        elif gross_ruin_idx != -1:
+            ruin_index = gross_ruin_idx
+        else:
+            ruin_index = -1
 
         trades = pd.DataFrame(records, columns=trade_columns)
         trades = trades.astype(
@@ -546,6 +658,11 @@ def run_backtest(
                 "notional": np.float64,
                 "is_buy": bool,
                 "charges": np.float64,
+                "decision_price": np.float64,
+                "fill_price": np.float64,
+                "shortfall_bps": np.float64,
+                "participation": np.float64,
+                "filled_frac": np.float64,
             }
         )
 
@@ -564,4 +681,6 @@ def run_backtest(
             initial_capital=float(config.capital),
             n_symbols_absent=n_symbols_absent,
             absent_symbols=absent_symbols,
+            ruined=ruined,
+            ruin_index=ruin_index,
         )

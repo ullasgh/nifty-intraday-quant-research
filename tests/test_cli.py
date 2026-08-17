@@ -117,7 +117,10 @@ def _fake_negative_edge_result():
     from nifty_quant.backtest.engine import BacktestResult
 
     rng = np.random.default_rng(0)
-    n = 100
+    # 1500 matches the real 4-session x 375-bar RELIANCE panel for
+    # 2024-01-02..2024-01-05 that the backtest command's new daily-return-aggregation
+    # reconstruction requires an exact row-count match against.
+    n = 1500
     gross_returns = rng.normal(loc=-0.001, scale=0.005, size=n)
     turnover = np.full(n, 1.0)
     returns = gross_returns - 0.0005 * turnover  # net is also negative

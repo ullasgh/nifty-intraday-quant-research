@@ -10,12 +10,21 @@ Design notes:
   is the pre-open call-auction price and is not reliably obtainable.
 - ``mode="reversal"`` is the default.  The blueprint's original rule (long the
   extreme winners, short the extreme losers) is ``mode="momentum"``.
-- Fills are assumed to occur at the decision bar's open.  ``precompute`` therefore
-  uses the open price at both the entry and decision checkpoints.  Using the
-  decision bar's close would leak the rest of that bar's price action into the
-  signal.
-- ``precompute`` returns one row per session that has both checkpoints, aligned to
-  the panel's full row index.  All other rows are NaN.
+- ``precompute`` writes each decision point's signal and return into row
+  ``decision_row - 1``, the row the engine's backtest loop reads at decision time.
+  That row's values are computed from ``open[entry_row]`` and
+  ``close[decision_row - 1]``.  ``open[entry_row]`` is causally safe because
+  ``entry_time`` is validated to be strictly before ``decision_time`` and both rows
+  are always in the same session, so it is at or before the row being written.
+  ``close[decision_row - 1]`` is the closing print of the row being written itself,
+  exactly the information available when that row closes.  Using
+  ``open[decision_row]`` (the first print at/after ``decision_time``) would leak
+  information from after the cursor row, so it must not be used.
+- A decision row that is the first bar of its session has no safe cursor row in the
+  same session: ``decision_row - 1`` would land in the previous session, or wrap to
+  the final row of the whole panel when the decision row is absolute row 0.  Such
+  sessions are detected via ``panel.day_offsets`` and dropped before any price is
+  read; their output rows remain NaN.
 """
 
 from __future__ import annotations
@@ -239,6 +248,21 @@ class XSecZScoreStrategy(Strategy):
         ``precompute`` because ``guards.causal`` requires its ``row_arg`` to resolve
         to an actual ndarray argument, while ``precompute`` only receives a
         ``PanelLike`` object.
+
+        Output arrays are populated at ``decision_rows[decision_pos] - 1``, the row
+        the engine's cursor reads at each decision time (one row before the bar
+        labelled ``decision_time``).  The value written into that row uses
+        ``open[entry_row]`` and ``close[decision_row - 1]``.  ``open[entry_row]`` is
+        always at or before the row being written because ``entry_time <
+        decision_time`` and both are looked up within the same session.
+        ``close[decision_row - 1]`` is the closing print of the row being written
+        itself, so no information from at or after ``decision_row`` is used.
+
+        Decision rows that are the first row of their session would make
+        ``decision_row - 1`` step across the session boundary (or wrap to the final
+        row of the whole panel when the decision row is absolute row 0).  Those
+        sessions are dropped using ``panel.day_offsets`` before any price is read;
+        their rows remain NaN in the output.
         """
         p = self.params
         n_rows = len(panel.ts)
@@ -264,9 +288,31 @@ class XSecZScoreStrategy(Strategy):
         z_full = np.full((n_rows, n_sym), np.nan, dtype=np.float64)
 
         if common_days.size > 0:
+            # Drop sessions whose decision row is the first bar of that session.  For
+            # such a session ``decision_rows[decision_pos] - 1`` either wraps to the
+            # last row of the whole panel (when the decision row is absolute row 0)
+            # or lands in the *previous* session, so writing there would corrupt
+            # another day's signal.  This also covers the absolute row 0 wraparound.
+            session_start_rows = panel.day_offsets[decision_days[decision_pos]]
+            keep = decision_rows[decision_pos] != session_start_rows
+            common_days = common_days[keep]
+            entry_pos = entry_pos[keep]
+            decision_pos = decision_pos[keep]
+
+        if common_days.size > 0:
             open_field = np.asarray(panel.field("open"), dtype=np.float64)
+            close_field = np.asarray(panel.field("close"), dtype=np.float64)
+
+            # `entry_time` is validated to be strictly before `decision_time`, and
+            # both checkpoints are always looked up within the SAME session via
+            # `rows_at_time`, so `entry_rows[entry_pos] < decision_rows[decision_pos]`
+            # i.e. `entry_rows[entry_pos] <= decision_rows[decision_pos] - 1`; the
+            # entry price is always at or before the row being written, never after it.
             entry_price = open_field[entry_rows[entry_pos]]
-            decision_price = open_field[decision_rows[decision_pos]]
+
+            # Causal decision price: close of row t-1, the last fully closed bar at
+            # decision_time.  Never use open[t] (first print at/after decision_time).
+            decision_price = close_field[decision_rows[decision_pos] - 1]
 
             valid = (
                 np.isfinite(entry_price)
@@ -292,7 +338,7 @@ class XSecZScoreStrategy(Strategy):
                     ret_common, min_names=p.min_names, robust=p.robust
                 )
 
-            target_rows = decision_rows[decision_pos]
+            target_rows = decision_rows[decision_pos] - 1
             ret_full[target_rows] = ret_common
             z_full[target_rows] = z_common
 
@@ -354,7 +400,9 @@ class XSecZScoreStrategy(Strategy):
 
         Tradability is not available here because ``Panel`` carries no per-bar
         tradable mask; only :meth:`on_decision` via ``MarketView.tradable`` applies
-        tradability filtering.
+        tradability filtering.  Decision rows that are the first bar of their
+        session are skipped for weight computation because their cursor row would be
+        invalid.
         """
         p = self.params
         signals = self.precompute(panel)
@@ -362,11 +410,20 @@ class XSecZScoreStrategy(Strategy):
 
         decision_rows = panel.rows_at_time(p.decision_time)
         n_sym = len(panel.symbols)
+        n_rows = len(panel.ts)
+
+        day_index = (
+            np.searchsorted(panel.day_offsets, np.arange(n_rows), side="right") - 1
+        )
 
         weights = np.empty((len(decision_rows), n_sym), dtype=np.float64)
         for i, row in enumerate(decision_rows):
+            session_start = panel.day_offsets[day_index[row]]
+            if row == session_start:
+                weights[i] = 0.0
+                continue
             weights[i] = _select_and_weight(
-                z_full[row],
+                z_full[row - 1],
                 mode=p.mode,
                 long_threshold=p.long_threshold,
                 short_threshold=p.short_threshold,

@@ -49,6 +49,8 @@ class VolumeBreakoutParams(BaseModel):
     direction: Literal["continuation", "fade"] = "continuation"
     exit_mode: Literal["time", "opposite", "stop_target"] = "time"
     hold_bars: int = 30
+    min_hold_bars: int = 5
+    cooldown_bars: int = 0
     square_off_time: str = "15:20"
     stop_loss_pct: float = 0.01
     target_pct: float = 0.02
@@ -64,6 +66,22 @@ class VolumeBreakoutParams(BaseModel):
         if v <= 0:
             raise ValueError("hurst_window must be positive")
         return v
+
+
+def _edge_trigger(cond: np.ndarray, day_offsets: np.ndarray) -> np.ndarray:
+    """Convert a level condition into an edge-triggered (rising-edge) signal.
+
+    ``cond`` is a 2-D boolean array of shape (n_rows, n_sym).  ``day_offsets``
+    is a 1-D array of session-start row offsets (length n_days+1).  The first
+    bar of each session is treated as having no prior-bar continuation, so a
+    True on the first bar of a session is a fresh edge.
+    """
+    prev = np.zeros_like(cond, dtype=bool)
+    if cond.shape[0] > 1:
+        prev[1:] = cond[:-1]
+    starts = np.asarray(day_offsets[:-1], dtype=np.intp)
+    prev[starts] = False
+    return np.asarray(cond & ~prev, dtype=bool)
 
 
 def _volume_breakout_core(
@@ -150,12 +168,17 @@ def _volume_breakout_core(
     elif direction != "continuation":
         raise ValueError(f"Unsupported direction: {direction!r}")
 
+    # Edge-triggered entries: True only on the bar where the level condition first
+    # becomes True, respecting session boundaries.
+    edge_long = _edge_trigger(raw_long, day_offsets)
+    edge_short = _edge_trigger(raw_short, day_offsets)
+
     hurst_stack = np.where(np.isnan(hurst), -np.inf, hurst).astype(np.float64)
 
     return np.stack(
         [
-            raw_long.astype(np.float64),
-            raw_short.astype(np.float64),
+            edge_long.astype(np.float64),
+            edge_short.astype(np.float64),
             sigma.astype(np.float64),
             vol_z.astype(np.float64),
             hurst_stack,
@@ -174,6 +197,8 @@ class VolumeBreakoutStrategy(Strategy):
     def __init__(self, params: VolumeBreakoutParams) -> None:
         super().__init__(params)
         self._bars_in_position: dict[str, int] | None = None
+        self._cooldown_remaining: dict[str, int] | None = None
+        self._cooldown_side: dict[str, int] | None = None
 
     def data_request(self) -> DataRequest:
         """Return the data request necessary for precompute."""
@@ -241,7 +266,12 @@ class VolumeBreakoutStrategy(Strategy):
             view.symbols
         ):
             self._bars_in_position = {sym: 0 for sym in view.symbols}
+            self._cooldown_remaining = {sym: 0 for sym in view.symbols}
+            self._cooldown_side = {sym: 0 for sym in view.symbols}
         bars = self._bars_in_position
+        cooldown_remaining = self._cooldown_remaining
+        cooldown_side = self._cooldown_side
+        assert bars is not None and cooldown_remaining is not None and cooldown_side is not None
 
         shares = np.asarray(state.shares, dtype=np.float64)
         tradable = np.asarray(view.tradable, dtype=bool)
@@ -261,6 +291,8 @@ class VolumeBreakoutStrategy(Strategy):
         bar_label = ist_label(view.ts)
         trading_open = bar_label < p.square_off_time
 
+        exited_this_bar: set[str] = set()
+
         # Determine exits for currently open positions.
         for i, sym in enumerate(view.symbols):
             pos = shares[i]
@@ -271,10 +303,10 @@ class VolumeBreakoutStrategy(Strategy):
             if not trading_open:
                 exit_pos = True
             elif p.exit_mode == "time":
-                exit_pos = bars[sym] >= p.hold_bars
+                exit_pos = bars[sym] >= p.hold_bars and bars[sym] >= p.min_hold_bars
             elif p.exit_mode == "opposite":
-                exit_pos = (pos > 0 and short_sig[i]) or (
-                    pos < 0 and long_sig[i]
+                exit_pos = bars[sym] >= p.min_hold_bars and (
+                    (pos > 0 and short_sig[i]) or (pos < 0 and long_sig[i])
                 )
             elif p.exit_mode == "stop_target":
                 # PortfolioState has no entry price, so real stop/target
@@ -284,7 +316,11 @@ class VolumeBreakoutStrategy(Strategy):
             else:
                 raise ValueError(f"Unsupported exit_mode: {p.exit_mode!r}")
 
-            if not exit_pos:
+            if exit_pos:
+                cooldown_remaining[sym] = p.cooldown_bars
+                cooldown_side[sym] = 1 if pos > 0 else -1
+                exited_this_bar.add(sym)
+            else:
                 sign[i] = 1 if pos > 0 else -1
 
         # New entries for currently flat names, respecting the defensive
@@ -293,8 +329,23 @@ class VolumeBreakoutStrategy(Strategy):
             flat = shares == 0
             new_long = flat & tradable & long_sig
             new_short = (flat & tradable & short_sig) & ~new_long
+
+            # Apply same-side cooldown suppression.
+            for i, sym in enumerate(view.symbols):
+                if cooldown_remaining[sym] > 0:
+                    if cooldown_side[sym] == 1:
+                        new_long[i] = False
+                    elif cooldown_side[sym] == -1:
+                        new_short[i] = False
+
             sign[new_long] = 1
             sign[new_short] = -1
+
+        # Decrement cooldown counters for symbols that did not exit this bar.
+        # Exited symbols keep their full cooldown value until the next bar.
+        for sym in view.symbols:
+            if sym not in exited_this_bar and cooldown_remaining[sym] > 0:
+                cooldown_remaining[sym] -= 1
 
         # Volatility-targeted sizing.  Proportionality is scale-invariant;
         # annualization would cancel during cross-sectional normalization.

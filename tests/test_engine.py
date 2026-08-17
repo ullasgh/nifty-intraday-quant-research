@@ -326,7 +326,12 @@ def test_rejection_when_symbol_not_tradable():
     assert 0.0 < result.rejected_order_rate < 1.0
 
 
-def test_participation_cap_partial_fill():
+# This test previously asserted `unfilled_notional_pct > 0.0`, which encoded a real defect:
+# capacity was checked too late, at fill time, after 57.5-81% of intended notional had
+# already been silently dropped. GrossNotionalSizer is now capacity-aware and pre-caps
+# target notional at max_participation * bar_traded_value before sizing, so nothing is
+# dropped at fill time in this scenario and the correct expectation is 0.0.
+def test_capacity_aware_sizing_leaves_no_unfilled_notional():
     volume = np.full((N_ROWS, N_SYM), 100.0, dtype=np.float64)
     panel = make_panel(flat_close(100.0), volume=volume)
     strategy = ConstantWeightStrategy(
@@ -340,7 +345,57 @@ def test_participation_cap_partial_fill():
 
     result = run_backtest(strategy, panel, config)
 
-    assert result.unfilled_notional_pct > 0.0
+    assert result.unfilled_notional_pct == 0.0
+
+
+# FillModel.fill is a pure per-bar, stateless function; it cannot carry a shortfall forward
+# by construction. Call it directly to keep its participation-cap behaviour covered now that
+# GrossNotionalSizer pre-caps capacity before the fill model runs.
+def test_fill_model_caps_and_drops_shortfall_directly():
+    fill_model = FillModel(slippage=ZeroSlippage(), max_participation=0.01)
+
+    orders = np.array([5.0, -0.5, 10.0])
+    prices = np.array([100.0, 200.0, 50.0])
+    bar_traded_value = np.array([10_000.0, 20_000.0, 5_000.0])
+    tradable = np.ones_like(prices, dtype=bool)
+
+    desired_notional = np.abs(orders) * prices
+    participation_cap = fill_model.max_participation * bar_traded_value
+    capped_notional = np.minimum(desired_notional, participation_cap)
+    expected_unfilled = desired_notional - capped_notional
+
+    result = fill_model.fill(orders, prices, bar_traded_value, tradable)
+
+    # Symbol 0 and symbol 2 exceed their caps; symbol 1 fills in full.
+    np.testing.assert_allclose(
+        np.abs(result.filled_qty * result.fill_price),
+        capped_notional,
+        rtol=1e-12,
+        atol=1e-12,
+    )
+    assert result.unfilled_notional[0] > 0.0
+    assert result.unfilled_notional[2] > 0.0
+    np.testing.assert_allclose(
+        result.unfilled_notional,
+        expected_unfilled,
+        rtol=1e-12,
+        atol=1e-12,
+    )
+
+    assert result.filled_qty[1] == orders[1]
+    assert result.fill_price[1] == prices[1]
+    assert result.unfilled_notional[1] == 0.0
+
+    # A second, independent bar with no order for the previously capped symbol 0 shows the
+    # shortfall is not carried forward: FillModel has no state and cannot remember it.
+    second_result = fill_model.fill(
+        np.array([0.0, 0.5, 0.0]),
+        prices,
+        bar_traded_value,
+        tradable,
+    )
+    assert second_result.unfilled_notional[0] == 0.0
+    assert second_result.filled_qty[0] == 0.0
 
 
 def test_conservative_stop_fills_at_open_not_stop_price():

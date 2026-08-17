@@ -1,0 +1,18 @@
+strategy: eod_overextension
+# End-of-Day Over-Extension / overnight gap. Positions are held OVERNIGHT (delivery, not
+# intraday): a backtest of this config MUST use NSEDeliveryEquityCosts (STT 0.1% both
+# sides, DP ~Rs 15.93/scrip) from nifty_quant.execution.costs, NOT NSEIntradayEquityCosts.
+params:
+  session_open_time: "09:16"
+  signal_time: "15:10"
+  entry_time: "15:20"
+  exit_time: "09:16"
+  entry_threshold: 0.01
+  volume_z_threshold: 2.0
+  volume_window: 30
+  vol_window: 30
+  n_max: 10
+  direction: both
+  sigma_floor: 1.0e-5
+  max_weight: 0.10
+  gross: 1.0

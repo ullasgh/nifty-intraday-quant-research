@@ -2,11 +2,16 @@ from __future__ import annotations
 
 from datetime import date
 from pathlib import Path
-from typing import NoReturn
+from typing import TYPE_CHECKING, NoReturn
 
 import typer
 
 from nifty_quant import __version__
+
+if TYPE_CHECKING:
+    import numpy as np
+
+    from nifty_quant.data.panel import Panel
 
 app = typer.Typer()
 
@@ -58,6 +63,78 @@ def _parse_date(value: str, flag: str) -> date:
 
 def _ensure_plugins_loaded() -> None:
     import nifty_quant.strategy.plugins  # noqa: F401
+
+
+def _daily_returns(
+    returns: "np.ndarray",
+    panel: "Panel",
+    decision_times: tuple[str, ...] | None,
+) -> "np.ndarray":
+    """Aggregate decision-row returns into one compounded return per trading day.
+
+    ``BacktestResult`` returns one entry per decision row plus an unconditional final
+    row, not one entry per trading day.  Computing metrics directly on those rows with
+    the default ``periods_per_year=252`` would annualize by the wrong factor for
+    bar-frequency and checkpoint strategies.  This helper reconstructs the engine's
+    decision-row selection from ``Strategy.data_request().decision_times`` and
+    ``Panel.rows_at_time``, appends the unconditional final row, maps rows to days using
+    ``Panel.day_offsets``, and compounds each day's returns with
+    ``aggregate_returns_by_group``.
+
+    Parameters
+    ----------
+    returns:
+        1-D array of raw per-decision-row returns from a ``BacktestResult``.
+    panel:
+        Panel used for the backtest; its ``ts``, ``day_offsets``, and ``rows_at_time``
+        are enough to reconstruct the engine's selection.
+    decision_times:
+        The strategy's decision times (``None`` means every row).
+
+    Returns
+    -------
+    np.ndarray
+        1-D float64 array of daily compounded returns. Empty input returns an empty
+        array.
+
+    Raises
+    ------
+    ValueError
+        If reconstructed row count does not match ``returns`` exactly.
+    """
+    import numpy as np
+
+    from nifty_quant.backtest.metrics import aggregate_returns_by_group
+
+    if returns.size == 0:
+        return np.empty(0, dtype=np.float64)
+
+    n_rows = panel.ts.shape[0]
+    if n_rows == 0:
+        return np.empty(0, dtype=np.float64)
+
+    if decision_times is None:
+        decision_rows = np.arange(1, n_rows, dtype=np.int64)
+    else:
+        parts = [panel.rows_at_time(t) for t in decision_times]
+        decision_rows = (
+            np.unique(np.concatenate(parts)).astype(np.int64, copy=False)
+            if parts
+            else np.empty(0, dtype=np.int64)
+        )
+        decision_rows = decision_rows[decision_rows != 0]
+
+    row_indices = np.concatenate((decision_rows, np.array([n_rows - 1], dtype=np.int64)))
+
+    if row_indices.size != returns.size:
+        raise ValueError(
+            "Daily-return reconstruction length mismatch: reconstructed "
+            f"{row_indices.size} decision/final rows but backtest returns has "
+            f"{returns.size} entries."
+        )
+
+    day_indices = np.searchsorted(panel.day_offsets, row_indices, side="right") - 1
+    return aggregate_returns_by_group(returns, day_indices)
 
 
 @app.command()
@@ -254,7 +331,10 @@ def backtest(
 
         from nifty_quant import settings
         from nifty_quant.backtest.engine import BacktestConfig, run_backtest
-        from nifty_quant.backtest.metrics import compute_metrics
+        from nifty_quant.backtest.metrics import (
+            compute_metrics,
+            sharpe_standard_error,
+        )
         from nifty_quant.config import RunConfig
         from nifty_quant.config import config_hash as run_config_hash
         from nifty_quant.data.manifest import Manifest
@@ -291,8 +371,13 @@ def backtest(
             ),
         )
 
-        gross = compute_metrics(result.gross_returns)
-        net = compute_metrics(result.returns)
+        decision_times = strat.data_request().decision_times
+        daily_gross = _daily_returns(result.gross_returns, panel, decision_times)
+        daily_net = _daily_returns(result.returns, panel, decision_times)
+
+        gross = compute_metrics(daily_gross)
+        net = compute_metrics(daily_net)
+        net_se_ann = sharpe_standard_error(daily_net, annualized=True, periods_per_year=252)
         mean_turnover = float(np.mean(result.turnover)) if result.turnover.size else 0.0
 
         # Representative per-leg notional: capital, not realized per-trade notional.
@@ -302,7 +387,11 @@ def backtest(
             (result.total_costs / (turnover_sum * 1e7) * 10_000.0) if turnover_sum > 0 else 0.0
         )
 
-        typer.echo(f"gross Sharpe: {gross.sharpe:.3f}    net Sharpe: {net.sharpe:.3f}")
+        typer.echo(
+            f"gross Sharpe: {gross.sharpe:.3f}    "
+            f"net Sharpe: {net.sharpe:.3f} (ann. SE={net_se_ann:.3f})    "
+            f"[daily returns, n_days={len(daily_net)}]"
+        )
         typer.echo(f"mean turnover: {mean_turnover:.4f}")
         typer.echo(f"modelled round-trip cost: {modelled_bps:.2f} bps")
         typer.echo(f"realized total cost of turnover: {realized_cost_bps:.2f} bps")
@@ -335,6 +424,7 @@ def backtest(
             typer.echo(f"breakeven cost: n/a ({exc})")
 
         # Derived statistic: latency sensitivity. Same degrade-to-n/a treatment.
+        latency_ruined: dict[int, bool] = {0: bool(result.ruined)}
         try:
             latency_sharpes = {0: float(net.sharpe)}
             for latency_bars in (1, 2):
@@ -349,11 +439,19 @@ def backtest(
                     ),
                 )
                 latency_sharpes[latency_bars] = float(
-                    compute_metrics(latency_result.returns).sharpe
+                    compute_metrics(
+                        _daily_returns(latency_result.returns, panel, decision_times)
+                    ).sharpe
                 )
+                latency_ruined[latency_bars] = bool(latency_result.ruined)
+            ruined_suffix = {
+                lat: " [RUINED]" if latency_ruined[lat] else "" for lat in (0, 1, 2)
+            }
             typer.echo(
-                f"latency sensitivity: net Sharpe lat0={latency_sharpes[0]:.3f} "
-                f"lat1={latency_sharpes[1]:.3f} lat2={latency_sharpes[2]:.3f}"
+                f"latency sensitivity: net Sharpe lat0={latency_sharpes[0]:.3f}"
+                f"{ruined_suffix[0]} "
+                f"lat1={latency_sharpes[1]:.3f}{ruined_suffix[1]} "
+                f"lat2={latency_sharpes[2]:.3f}{ruined_suffix[2]}"
             )
             if latency_sharpes[0] > 0 and (
                 latency_sharpes[1] <= 0 or latency_sharpes[1] < 0.5 * latency_sharpes[0]
@@ -364,10 +462,12 @@ def backtest(
                 )
         except Exception as exc:
             latency_sharpes = {0: float(net.sharpe)}
+            latency_ruined = {0: bool(result.ruined)}
             typer.echo(f"latency sensitivity: n/a ({exc})")
 
         typer.echo(f"rejected_order_rate: {float(result.rejected_order_rate):.3f}")
         typer.echo(f"unfilled_notional_pct: {float(result.unfilled_notional_pct):.3f}")
+        typer.echo(f"ruined: {result.ruined}    ruin_index: {result.ruin_index}")
 
         run_cfg = RunConfig(
             strategy=strategy,
@@ -592,8 +692,11 @@ def walkforward(
                 test_panel,
                 BacktestConfig(capital=1e7, cost_model=cost_model),
             )
-            gross_sharpe = float(compute_metrics(res.gross_returns).sharpe)
-            net_sharpe = float(compute_metrics(res.returns).sharpe)
+            decision_times = strat.data_request().decision_times
+            split_daily_gross = _daily_returns(res.gross_returns, test_panel, decision_times)
+            split_daily_net = _daily_returns(res.returns, test_panel, decision_times)
+            gross_sharpe = float(compute_metrics(split_daily_gross).sharpe)
+            net_sharpe = float(compute_metrics(split_daily_net).sharpe)
             mean_turnover = float(np.mean(res.turnover)) if res.turnover.size else 0.0
             split_breakeven = (
                 float(breakeven_cost_bps(res.gross_returns, res.turnover))
@@ -604,7 +707,8 @@ def walkforward(
             typer.echo(
                 f"{split.id}  train={split.train[0]}..{split.train[1]}  "
                 f"test={split.test[0]}..{split.test[1]}  n_trades={res.n_trades}  "
-                f"gross_sharpe={gross_sharpe:.3f}  net_sharpe={net_sharpe:.3f}"
+                f"gross_sharpe={gross_sharpe:.3f}  net_sharpe={net_sharpe:.3f}  "
+                f"n_days={len(split_daily_net)}"
             )
 
             if split.test[1] >= holdout_start:
@@ -632,8 +736,8 @@ def walkforward(
                 )
             )
 
-            pooled_net_list.append(res.returns)
-            pooled_gross_list.append(res.gross_returns)
+            pooled_net_list.append(split_daily_net)
+            pooled_gross_list.append(split_daily_gross)
             pooled_turnover_list.append(res.turnover)
             total_costs_list.append(res.total_costs)
 
@@ -644,6 +748,9 @@ def walkforward(
 
         pooled_gross_metrics = compute_metrics(pooled_gross)
         pooled_net_metrics = compute_metrics(pooled_net)
+        pooled_net_se_ann = sharpe_standard_error(
+            pooled_net, annualized=True, periods_per_year=252
+        )
         pooled_mean_turnover = (
             float(np.mean(pooled_turnover)) if pooled_turnover.size else 0.0
         )
@@ -662,7 +769,8 @@ def walkforward(
 
         typer.echo(
             f"gross Sharpe: {pooled_gross_metrics.sharpe:.3f}    "
-            f"net Sharpe: {pooled_net_metrics.sharpe:.3f}"
+            f"net Sharpe: {pooled_net_metrics.sharpe:.3f} (ann. SE={pooled_net_se_ann:.3f})    "
+            f"[daily returns, n_days={len(pooled_net)}]"
         )
         typer.echo(f"mean turnover: {pooled_mean_turnover:.4f}")
         typer.echo(f"modelled round-trip cost: {modelled_bps:.2f} bps")
@@ -688,15 +796,28 @@ def walkforward(
                     cost_model=cost_model,
                 ),
             )
+        full_decision_times = strat.data_request().decision_times
         latency_sharpes = {
-            lat: float(compute_metrics(res.returns).sharpe)
+            lat: float(
+                compute_metrics(
+                    _daily_returns(res.returns, panel, full_decision_times)
+                ).sharpe
+            )
             for lat, res in latency_results.items()
+        }
+        latency_ruined: dict[int, bool] = {
+            lat: bool(res.ruined) for lat, res in latency_results.items()
         }
         full_result = latency_results[0]
 
+        ruined_suffix = {
+            lat: " [RUINED]" if latency_ruined[lat] else "" for lat in (0, 1, 2)
+        }
         typer.echo(
-            f"latency sensitivity: net Sharpe lat0={latency_sharpes[0]:.3f} "
-            f"lat1={latency_sharpes[1]:.3f} lat2={latency_sharpes[2]:.3f}"
+            f"latency sensitivity: net Sharpe lat0={latency_sharpes[0]:.3f}"
+            f"{ruined_suffix[0]} "
+            f"lat1={latency_sharpes[1]:.3f}{ruined_suffix[1]} "
+            f"lat2={latency_sharpes[2]:.3f}{ruined_suffix[2]}"
         )
         if latency_sharpes[0] > 0 and (
             latency_sharpes[1] <= 0 or latency_sharpes[1] < 0.5 * latency_sharpes[0]
@@ -708,6 +829,7 @@ def walkforward(
 
         typer.echo(f"rejected_order_rate: {float(full_result.rejected_order_rate):.3f}")
         typer.echo(f"unfilled_notional_pct: {float(full_result.unfilled_notional_pct):.3f}")
+        typer.echo(f"ruined: {full_result.ruined}    ruin_index: {full_result.ruin_index}")
 
         n_trials = max(trial_registry.n_trials(strategy=strategy), 1)
         var_trial_sharpes = trial_registry.var_trial_sharpes(strategy=strategy)
@@ -744,6 +866,8 @@ def walkforward(
                 sr0=sr0,
                 dsr=dsr,
                 pbo=pbo,
+                ruined=bool(full_result.ruined),
+                n_trades=int(full_result.n_trades),
             )
         )
 
@@ -864,7 +988,10 @@ def sweep(
 
         from nifty_quant import settings
         from nifty_quant.backtest.engine import BacktestConfig, run_backtest
-        from nifty_quant.backtest.metrics import compute_metrics
+        from nifty_quant.backtest.metrics import (
+            compute_metrics,
+            sharpe_standard_error,
+        )
         from nifty_quant.data.manifest import Manifest
         from nifty_quant.data.panel import PanelSpec, load_panel
         from nifty_quant.execution.costs import NSEIntradayEquityCosts, breakeven_cost_bps
@@ -905,8 +1032,15 @@ def sweep(
                     panel,
                     BacktestConfig(capital=1e7, cost_model=cost_model),
                 )
-                net = compute_metrics(res.returns)
-                gross = compute_metrics(res.gross_returns)
+                sweep_decision_times = strat.data_request().decision_times
+                sweep_daily_net = _daily_returns(res.returns, panel, sweep_decision_times)
+                sweep_daily_gross = _daily_returns(res.gross_returns, panel, sweep_decision_times)
+
+                net = compute_metrics(sweep_daily_net)
+                gross = compute_metrics(sweep_daily_gross)
+                net_se_ann = sharpe_standard_error(
+                    sweep_daily_net, annualized=True, periods_per_year=252
+                )
                 mean_turnover = float(np.mean(res.turnover)) if res.turnover.size else 0.0
                 breakeven = (
                     float(breakeven_cost_bps(res.gross_returns, res.turnover))
@@ -914,7 +1048,11 @@ def sweep(
                     else None
                 )
 
-                typer.echo(f"[{i + 1}/{len(param_dicts)}] {params} -> net_sharpe={net.sharpe:.3f}")
+                typer.echo(
+                    f"[{i + 1}/{len(param_dicts)}] {params} -> "
+                    f"net_sharpe={net.sharpe:.3f} (ann. SE={net_se_ann:.3f})  "
+                    f"n_days={len(sweep_daily_net)}"
+                )
 
                 registry_db.record(
                     TrialRecord(

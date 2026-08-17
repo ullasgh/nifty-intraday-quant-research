@@ -27,6 +27,51 @@ def _is_negligible_std(std: float, arr: np.ndarray) -> bool:
     return float(std) <= 1e-9 * scale
 
 
+def aggregate_returns_by_group(returns: np.ndarray, group_ids: np.ndarray) -> np.ndarray:
+    """Aggregate per-period returns into one compounded return per group.
+
+    Parameters
+    ----------
+    returns : np.ndarray
+        1-D array of simple per-period returns. ``1 + r`` is the growth factor.
+        Converted to float64 and flattened.
+    group_ids : np.ndarray
+        1-D integer array of same length as *returns*. Entries with the same group
+        id must be contiguous, and *group_ids* must be non-decreasing.
+
+    Returns
+    -------
+    np.ndarray
+        1-D float64 array of compounded per-group returns. Empty input returns an
+        empty array. NaN values in *returns* propagate to the group result.
+
+    Raises
+    ------
+    ValueError
+        If *returns* and *group_ids* have different lengths, or if *group_ids* is
+        not non-decreasing.
+    """
+    returns = np.asarray(returns, dtype=np.float64).reshape(-1)
+    group_ids = np.asarray(group_ids, dtype=np.int64).reshape(-1)
+
+    if returns.size != group_ids.size:
+        raise ValueError("returns and group_ids must have the same length")
+    if np.any(np.diff(group_ids) < 0):
+        raise ValueError("group_ids must be non-decreasing")
+
+    if returns.size == 0:
+        return returns
+
+    starts = np.r_[0, np.flatnonzero(np.diff(group_ids) != 0) + 1]
+    compounded = np.multiply.reduceat(1.0 + returns, starts) - 1.0
+
+    group_sizes = np.diff(np.r_[starts, group_ids.size])
+    single_row_groups = group_sizes == 1
+    compounded[single_row_groups] = returns[starts[single_row_groups]]
+
+    return compounded
+
+
 @dataclass(frozen=True)
 class PerformanceMetrics:
     total_return: float
@@ -282,15 +327,32 @@ def drawdown_series(equity_curve: np.ndarray) -> np.ndarray:
     return dd
 
 
-def sharpe_standard_error(returns: np.ndarray, *, adjust_autocorr: bool = True) -> float:
-    """Return the standard error of the per-period Sharpe ratio estimate.
+def sharpe_standard_error(
+    returns: np.ndarray,
+    *,
+    adjust_autocorr: bool = True,
+    annualized: bool = False,
+    periods_per_year: int = 252,
+) -> float:
+    """Return the standard error of a Sharpe ratio estimate.
 
-    Base iid formula: ``sqrt((1 + 0.5 * SR^2) / T)``.  ``SR`` here is the raw per-period
-    Sharpe ratio, not annualized and without an rf adjustment.  If ``adjust_autocorr``,
-    apply Lo (2002) scaling using sample autocorrelations up to lag ``min(T-2, 10)``
-    with a biased covariance denominator.  Returns ``NaN`` when ``T < 3`` or sample
-    standard deviation is zero.
+    Base iid formula: ``sqrt((1 + 0.5 * SR^2) / T)``.  ``SR`` here is the raw
+    per-period Sharpe ratio, not annualized and without an rf adjustment.  If
+    ``adjust_autocorr``, apply Lo (2002) scaling using sample autocorrelations up to
+    lag ``min(T-2, 10)`` with a biased covariance denominator.  Returns ``NaN`` when
+    ``T < 3`` or sample standard deviation is zero.
+
+    By default (``annualized=False``), the returned value is the same per-period,
+    non-annualized standard error this function has always returned.  If
+    ``annualized=True``, the final standard error is multiplied by
+    ``sqrt(periods_per_year)`` so it can be compared directly against this repo's
+    annualized ``sharpe_ratio``.  If ``annualized=True`` and ``periods_per_year`` is
+    non-finite or ``<= 0``, returns ``NaN`` instead of letting ``math.sqrt`` propagate
+    a bad value.
     """
+    if annualized and (not math.isfinite(periods_per_year) or periods_per_year <= 0.0):
+        return float("nan")
+
     arr = np.asarray(returns, dtype=np.float64).reshape(-1)
     t = len(arr)
     if t < 3:
@@ -304,24 +366,28 @@ def sharpe_standard_error(returns: np.ndarray, *, adjust_autocorr: bool = True) 
     se = math.sqrt((1.0 + 0.5 * sr**2) / t)
 
     if not adjust_autocorr:
-        return float(se)
+        per_period_se = float(se)
+    else:
+        max_lag = min(t - 2, 10)
+        if max_lag <= 0:
+            per_period_se = float(se)
+        else:
+            x = arr - float(np.mean(arr))
+            var_biased = float(np.mean(x * x))
 
-    max_lag = min(t - 2, 10)
-    if max_lag <= 0:
-        return float(se)
+            weighted_rho_sum = 0.0
+            for k in range(1, max_lag + 1):
+                cov_biased = float(np.mean(x[k:] * x[:-k]))
+                rho_k = cov_biased / var_biased
+                weighted_rho_sum += ((t - k) / t) * rho_k
 
-    x = arr - float(np.mean(arr))
-    var_biased = float(np.mean(x * x))
+            autocorr_scale = 1.0 + 2.0 * weighted_rho_sum
+            autocorr_scale = max(autocorr_scale, 1e-8)
+            per_period_se = float(se * math.sqrt(autocorr_scale))
 
-    weighted_rho_sum = 0.0
-    for k in range(1, max_lag + 1):
-        cov_biased = float(np.mean(x[k:] * x[:-k]))
-        rho_k = cov_biased / var_biased
-        weighted_rho_sum += ((t - k) / t) * rho_k
-
-    autocorr_scale = 1.0 + 2.0 * weighted_rho_sum
-    autocorr_scale = max(autocorr_scale, 1e-8)
-    return float(se * math.sqrt(autocorr_scale))
+    if annualized:
+        return float(per_period_se * math.sqrt(periods_per_year))
+    return per_period_se
 
 
 def turnover(weights: np.ndarray) -> np.ndarray:
@@ -541,10 +607,34 @@ def verdict_line(
     sr0: float,
     dsr: float,
     pbo: float,
+    *,
+    ruined: bool = False,
+    n_trades: int | None = None,
+    min_trades_for_sharpe: int = 30,
 ) -> str:
-    """Return a one-line summary ending in ESTABLISHED or NOT ESTABLISHED."""
+    """Return a one-line summary with an ESTABLISHED/NOT ESTABLISHED verdict.
+
+    A ruined run produces a hard capital-destroyed warning instead: the ruin guard forces
+    post-ruin returns to zero, which flatters the computed Sharpe and makes it unreliable.
+    If *n_trades* is set below *min_trades_for_sharpe*, a small-sample warning is appended.
+    The default floor of 30 trades is a common quant/statistics rule-of-thumb below which a
+    Sharpe/t-stat is too dominated by small-sample noise to be considered approximately
+    normal.
+    """
+    if ruined:
+        return (
+            "RUINED: capital destroyed (ruin guard tripped) | Sharpe is not meaningful "
+            "because post-ruin returns are forced to 0.0, which flatters it | NOT ESTABLISHED"
+        )
+
     verdict = "ESTABLISHED" if dsr >= 0.95 else "NOT ESTABLISHED"
-    return (
+    line = (
         f"Sharpe={sharpe_net:.3f} (SE={sr_se:.3f}) | trials={n_trials} "
         f"(eff={n_eff:.3f}) | SR0={sr0:.3f} | DSR={dsr:.3f} | PBO={pbo:.3f} | {verdict}"
     )
+    if n_trades is not None and n_trades < min_trades_for_sharpe:
+        line += (
+            f" | WARNING: too few trades for the Sharpe to be statistically meaningful "
+            f"(n_trades={n_trades}, min_trades_for_sharpe={min_trades_for_sharpe})"
+        )
+    return line

@@ -1,0 +1,18 @@
+strategy: carver_trend
+params:
+  speeds:
+    - [8, 32]
+    - [16, 64]
+    - [32, 128]
+  vol_window: 36
+  forecast_cap: 20.0
+  forecast_scalar: null
+  target_abs_forecast: 10.0
+  scalar_min_periods: 200
+  scalar_floor: 1.0e-6
+  sigma_floor: 1.0e-6
+  target_vol_ann: 0.15
+  max_weight: 0.10
+  gross: 1.0
+  rebalance_buffer: 0.01
+  square_off_time: "15:20"

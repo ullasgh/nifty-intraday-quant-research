@@ -5,12 +5,16 @@ params:
   volume_z_threshold: 2.0
   hurst_window: 390
   hurst_threshold: 0.55
-  use_hurst: true
+  # use_hurst: true is unusable in production: ~1.8M trades/yr on full universe,
+  # equity driven to -10M on 10M capital (measured on real NSE data).
+  use_hurst: false
   vol_window: 30
   deseasonalize: true
   direction: continuation
   exit_mode: time
   hold_bars: 30
+  min_hold_bars: 5
+  cooldown_bars: 0
   square_off_time: "15:20"
   stop_loss_pct: 0.01
   target_pct: 0.02

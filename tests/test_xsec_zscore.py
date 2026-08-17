@@ -10,6 +10,7 @@ import yaml
 from pydantic import ValidationError
 
 from nifty_quant import guards
+from nifty_quant.backtest.engine import BacktestConfig, run_backtest
 from nifty_quant.data.panel import Panel, PanelSpec, load_panel
 from nifty_quant.strategy import registry
 from nifty_quant.strategy.plugins.xsec_zscore import (
@@ -72,6 +73,88 @@ def _build_panel(sessions, symbols, fields=("open", "close")) -> Panel:
     )
 
 
+def _build_dense_ohlcv_panel(dates, symbols, *, seed=0, bars_per_day=375) -> Panel:
+    """Build a dense regular panel with open/high/low/close/volume fields.
+
+    Each day has bars from 09:15 through 15:29 left-labelled, containing entry_time,
+    decision_time, cursor row, and exit_time. The 09:16 open and 10:59 close are set
+    per symbol with enough cross-sectional spread for the Z-score strategy to select
+    names under min_names=4.
+    """
+    symbols = tuple(symbols)
+    n_sym = len(symbols)
+
+    ts_list = []
+    row_counts = []
+    dates_arr = []
+    for d in dates:
+        base = dt.datetime(d.year, d.month, d.day, 9, 15, tzinfo=IST)
+        for i in range(bars_per_day):
+            ts_list.append(base + dt.timedelta(minutes=i))
+        row_counts.append(bars_per_day)
+        dates_arr.append(d)
+
+    ts = np.array([int(t.timestamp()) for t in ts_list], dtype=np.int64)
+    day_offsets = np.array([0] + list(np.cumsum(row_counts)), dtype=np.int32)
+    dates_arr = np.array(dates_arr, dtype=object)
+
+    n_rows = len(ts_list)
+    shape = (n_rows, n_sym)
+    open_arr = np.full(shape, np.nan, dtype=np.float32)
+    high_arr = np.full(shape, np.nan, dtype=np.float32)
+    low_arr = np.full(shape, np.nan, dtype=np.float32)
+    close_arr = np.full(shape, np.nan, dtype=np.float32)
+    volume_arr = np.full(shape, 1e6, dtype=np.float32)
+
+    entry_prices = np.array([100.0 + i * 5.0 for i in range(n_sym)], dtype=np.float64)
+    decision_closes = np.array([110.0 + i * 10.0 for i in range(n_sym)], dtype=np.float64)
+
+    for day_idx in range(len(dates)):
+        start = day_idx * bars_per_day
+        idx_1059 = start + 104
+        idx_1100 = start + 105
+        idx_1520 = start + 365
+
+        for i in range(n_sym):
+            entry = entry_prices[i]
+            dec = decision_closes[i]
+
+            segment = slice(start, start + bars_per_day)
+            open_arr[segment, i] = entry
+            close_arr[segment, i] = entry
+            high_arr[segment, i] = entry + 0.2
+            low_arr[segment, i] = entry - 0.2
+
+            open_arr[idx_1059, i] = dec
+            close_arr[idx_1059, i] = dec
+            high_arr[idx_1059, i] = dec + 0.2
+            low_arr[idx_1059, i] = dec - 0.2
+
+            open_arr[idx_1100, i] = dec + 0.5
+            close_arr[idx_1100, i] = dec + 0.5
+            high_arr[idx_1100, i] = dec + 1.0
+            low_arr[idx_1100, i] = dec + 0.1
+
+            open_arr[idx_1520, i] = entry + 1.0
+            close_arr[idx_1520, i] = entry + 1.0
+            high_arr[idx_1520, i] = entry + 1.2
+            low_arr[idx_1520, i] = entry + 0.8
+
+    return Panel(
+        fields={
+            "open": open_arr,
+            "high": high_arr,
+            "low": low_arr,
+            "close": close_arr,
+            "volume": volume_arr,
+        },
+        symbols=symbols,
+        ts=ts,
+        day_offsets=day_offsets,
+        dates=dates_arr,
+    )
+
+
 def test_causal_precompute():
     symbols = ("A", "B", "C", "D", "E", "F")
     sessions = []
@@ -97,8 +180,8 @@ def test_causal_precompute():
 
         start = int(panel.day_offsets[k + 1])
         rng = np.random.default_rng(42 + k)
-        open_arr[start:] = rng.uniform(50.0, 200.0, size=open_arr[start:].shape).astype(np.float32)
-        close_arr[start:] = rng.uniform(50.0, 200.0, size=close_arr[start:].shape).astype(np.float32)
+        open_arr[start:] = rng.uniform(50.0, 200.0, open_arr[start:].shape).astype(np.float32)
+        close_arr[start:] = rng.uniform(50.0, 200.0, close_arr[start:].shape).astype(np.float32)
 
         scrambled = Panel(
             fields={"open": open_arr, "close": close_arr},
@@ -138,7 +221,7 @@ def test_xsec_zscore_and_momentum_reversal_sign_flip():
         [
             {
                 "date": dt.date(2024, 1, 1),
-                "bars": {"09:16": entry, "11:00": decision},
+                "bars": {"09:16": entry, "10:59": decision, "11:00": decision},
             }
         ],
         symbols,
@@ -148,7 +231,9 @@ def test_xsec_zscore_and_momentum_reversal_sign_flip():
     strategy = XSecZScoreStrategy(params=XSecZScoreParams(min_names=5))
     signals = strategy.precompute(panel)
     row = panel.rows_at_time("11:00")[0]
-    z_row = signals["zscore"][row]
+    # The engine reads the precomputed signal at cursor = decision_row - 1 (see
+    # engine.py); precompute() writes there, not at the decision-time row itself.
+    z_row = signals["zscore"][row - 1]
 
     r = np.log(np.array([110.0, 105.0, 100.0, 95.0, 90.0]) / 100.0)
     expected_z = (r - r.mean()) / r.std(ddof=0)
@@ -225,7 +310,7 @@ def test_min_names_blanks_small_finite_cross_section():
         [
             {
                 "date": dt.date(2024, 1, 1),
-                "bars": {"09:16": entry, "11:00": decision},
+                "bars": {"09:16": entry, "10:59": decision, "11:00": decision},
             }
         ],
         symbols,
@@ -235,7 +320,8 @@ def test_min_names_blanks_small_finite_cross_section():
     strategy = XSecZScoreStrategy(params=XSecZScoreParams())
     signals = strategy.precompute(panel)
     row = panel.rows_at_time(strategy.params.decision_time)[0]
-    z_row = signals["zscore"][row]
+    # Signal lives at cursor = decision_row - 1 (the row the engine reads).
+    z_row = signals["zscore"][row - 1]
 
     assert np.all(np.isnan(z_row))
 
@@ -348,6 +434,259 @@ def test_tradability_does_not_promote_lower_ranked_name():
     assert np.sum(w > 0) == 2
 
 
+def test_no_lookahead_precompute_is_causal():
+    # THIS TEST MUST FAIL against the pre-fix code (open[t] leaking into row t-1)
+    # and pass after the fix.
+    symbols = tuple(f"S{i}" for i in range(6))
+    sessions = []
+    for day in range(1, 5):
+        d = dt.date(2024, 1, day)
+        entry = {sym: 100.0 + i for i, sym in enumerate(symbols)}
+        decision_close = {sym: 110.0 + i * 3 for i, sym in enumerate(symbols)}
+        decision_open = {sym: 999.0 + i for i, sym in enumerate(symbols)}
+        sessions.append(
+            {
+                "date": d,
+                "bars": {
+                    "09:16": entry,
+                    "10:59": decision_close,
+                    "11:00": decision_open,
+                },
+            }
+        )
+
+    panel = _build_panel(sessions, symbols, fields=("open", "close"))
+    strategy = XSecZScoreStrategy(params=XSecZScoreParams(min_names=6))
+    original_signals = strategy.precompute(panel)
+    decision_rows = panel.rows_at_time(strategy.params.decision_time)
+
+    for t in decision_rows:
+        cursor = t - 1
+        for variant in ("scale", "nan"):
+            open_arr = panel.field("open").copy()
+            close_arr = panel.field("close").copy()
+            if variant == "scale":
+                open_arr[t:] *= 1e6
+                close_arr[t:] *= 1e6
+            else:
+                open_arr[t:] = np.nan
+                close_arr[t:] = np.nan
+
+            mutated = Panel(
+                fields={"open": open_arr, "close": close_arr},
+                symbols=panel.symbols,
+                ts=panel.ts,
+                day_offsets=panel.day_offsets,
+                dates=panel.dates,
+            )
+            mutated_signals = strategy.precompute(mutated)
+            np.testing.assert_array_equal(
+                original_signals["zscore"][cursor],
+                mutated_signals["zscore"][cursor],
+            )
+            np.testing.assert_array_equal(
+                original_signals["ret"][cursor],
+                mutated_signals["ret"][cursor],
+            )
+
+
+def test_strategy_actually_opens_positions_through_run_backtest():
+    symbols = tuple(f"S{i}" for i in range(8))
+    dates = [dt.date(2024, 1, d) for d in range(5, 10)]
+    panel = _build_dense_ohlcv_panel(dates, symbols, seed=42)
+    strategy = XSecZScoreStrategy(params=XSecZScoreParams(min_names=4))
+    result = run_backtest(strategy, panel, BacktestConfig())
+    assert result.n_trades > 0
+
+
+def test_signal_present_at_engine_cursor_row():
+    symbols = ("A", "B", "C", "D", "E")
+    entry = {sym: 100.0 for sym in symbols}
+    decision = {
+        "A": 110.0,
+        "B": 105.0,
+        "C": 100.0,
+        "D": 95.0,
+        "E": 90.0,
+    }
+    panel = _build_panel(
+        [
+            {
+                "date": dt.date(2024, 1, 1),
+                "bars": {"09:16": entry, "10:59": decision, "11:00": decision},
+            }
+        ],
+        symbols,
+        fields=("open", "close"),
+    )
+    strategy = XSecZScoreStrategy(params=XSecZScoreParams(min_names=5))
+    signals = strategy.precompute(panel)
+    decision_row = panel.rows_at_time(strategy.params.decision_time)[0]
+    cursor = decision_row - 1
+    z_row = signals["zscore"][cursor]
+    assert np.any(np.isfinite(z_row))
+    assert np.any(z_row != 0.0)
+
+
+def test_decision_row_zero_does_not_wrap():
+    # Session 1 (date1) has a SINGLE bar, stamped with the decision-time label
+    # ("11:00"), placed at absolute row 0 of the whole panel -- day_offsets[0] is
+    # always 0, so this row is simultaneously "decision row is absolute row 0" and
+    # "decision row is the first row of its own session". It has no entry-time bar
+    # (impossible to have one earlier, since row 0 is the panel's first row), so it
+    # can never appear in `common_days` and must get no signal. Session 2 (date2,
+    # strictly later so `ts` stays monotonic) has a real 09:16 -> 10:59 -> 11:00
+    # triple, giving precompute a legitimate common day whose cursor row (10:59) is
+    # NOT the entry row, so its return is non-degenerate. The 11:00 bar's own price
+    # is poisoned to confirm it is never read (causal fix under test).
+    symbols = ("A", "B")
+    date1 = dt.date(2024, 1, 1)
+    date2 = dt.date(2024, 1, 2)
+
+    panel = _build_panel(
+        [
+            {"date": date1, "bars": {"11:00": {"A": 100.0, "B": 200.0}}},
+            {
+                "date": date2,
+                "bars": {
+                    "09:16": {"A": 100.0, "B": 200.0},
+                    "10:59": {"A": 110.0, "B": 210.0},
+                    "11:00": {"A": 999.0, "B": 999.0},
+                },
+            },
+        ],
+        symbols,
+        fields=("open", "close"),
+    )
+    strategy = XSecZScoreStrategy(params=XSecZScoreParams(min_names=2))
+    signals = strategy.precompute(panel)
+
+    # Session 1's only row (absolute row 0, also the panel's LAST-row wraparound
+    # target under -1 indexing) gets no signal: no entry bar existed for it.
+    assert np.all(np.isnan(signals["zscore"][0]))
+    assert np.all(np.isnan(signals["ret"][0]))
+
+    # Session 2's real signal lands at its cursor row (the 10:59 bar, row 2), not
+    # at its entry row (row 1) and not at its own decision row (row 3, the panel's
+    # actual last row).
+    assert np.all(np.isfinite(signals["zscore"][2]))
+    assert np.all(np.isfinite(signals["ret"][2]))
+    assert np.all(np.isnan(signals["zscore"][1]))
+    assert np.all(np.isnan(signals["ret"][1]))
+
+    # The panel's actual final row (session 2's own decision row, holding the
+    # poisoned 999.0 price) must stay NaN: nothing wrapped a row-0-adjacent value
+    # into it, and the decision row itself is never a write target.
+    assert np.all(np.isnan(signals["zscore"][-1]))
+    assert np.all(np.isnan(signals["ret"][-1]))
+
+
+def test_decision_row_at_session_start_is_skipped():
+    # Session 1 (date1) has a real 09:16 -> 10:59 -> 11:00 triple, so precompute
+    # legitimately writes a signal at its cursor row (10:59, not its own first row).
+    # Session 2 (date2, strictly later) has a SINGLE bar stamped with the
+    # decision-time label ("11:00") as its own first (and only) row -- the
+    # "decision row is the first bar of its session" shape, with no entry bar in
+    # that session, sitting immediately after session 1. Its 11:00 price is
+    # poisoned to make any accidental read/leak obvious.
+    symbols = ("A", "B")
+    date1 = dt.date(2024, 1, 1)
+    date2 = dt.date(2024, 1, 2)
+
+    panel = _build_panel(
+        [
+            {
+                "date": date1,
+                "bars": {
+                    "09:16": {"A": 100.0, "B": 200.0},
+                    "10:59": {"A": 110.0, "B": 210.0},
+                    "11:00": {"A": 999.0, "B": 999.0},
+                },
+            },
+            {"date": date2, "bars": {"11:00": {"A": 999.0, "B": 999.0}}},
+        ],
+        symbols,
+        fields=("open", "close"),
+    )
+    strategy = XSecZScoreStrategy(params=XSecZScoreParams(min_names=2))
+    signals = strategy.precompute(panel)
+
+    # Session 1's real signal lands at its cursor row (10:59, row 1), unaffected by
+    # session 2 existing at all.
+    assert np.all(np.isfinite(signals["zscore"][1]))
+    assert np.all(np.isfinite(signals["ret"][1]))
+
+    # Session 1's own entry row (row 0) and decision row (row 2) are not write
+    # targets.
+    assert np.all(np.isnan(signals["zscore"][0]))
+    assert np.all(np.isnan(signals["ret"][0]))
+    assert np.all(np.isnan(signals["zscore"][2]))
+    assert np.all(np.isnan(signals["ret"][2]))
+
+    # Session 2's decision-at-session-start row (row 3, the panel's last row, and
+    # also the poisoned price) never gets a signal: it has no entry pairing and is
+    # its own session's first row.
+    assert np.all(np.isnan(signals["zscore"][3]))
+    assert np.all(np.isnan(signals["ret"][3]))
+
+
+def test_never_reads_0915_bar():
+    symbols = tuple(f"S{i}" for i in range(6))
+    entry = {sym: 100.0 + i for i, sym in enumerate(symbols)}
+    decision = {sym: 110.0 + (i % 3) * 5 for i, sym in enumerate(symbols)}
+    poison = {sym: 1e9 for sym in symbols}
+
+    panel_with_0915 = _build_panel(
+        [
+            {
+                "date": dt.date(2024, 1, 1),
+                "bars": {
+                    "09:15": poison,
+                    "09:16": entry,
+                    "10:59": decision,
+                    "11:00": decision,
+                },
+            }
+        ],
+        symbols,
+        fields=("open", "close"),
+    )
+    panel_without_0915 = _build_panel(
+        [
+            {
+                "date": dt.date(2024, 1, 1),
+                "bars": {
+                    "09:16": entry,
+                    "10:59": decision,
+                    "11:00": decision,
+                },
+            }
+        ],
+        symbols,
+        fields=("open", "close"),
+    )
+
+    strategy = XSecZScoreStrategy(params=XSecZScoreParams(min_names=6))
+    sig_with = strategy.precompute(panel_with_0915)
+    sig_without = strategy.precompute(panel_without_0915)
+
+    cursor_with = panel_with_0915.rows_at_time("11:00")[0] - 1
+    cursor_without = panel_without_0915.rows_at_time("11:00")[0] - 1
+
+    np.testing.assert_array_equal(
+        sig_with["zscore"][cursor_with],
+        sig_without["zscore"][cursor_without],
+    )
+    np.testing.assert_array_equal(
+        sig_with["ret"][cursor_with],
+        sig_without["ret"][cursor_without],
+    )
+
+    ret_finite = sig_with["ret"][cursor_with]
+    finite_vals = ret_finite[np.isfinite(ret_finite)]
+    assert np.all(np.abs(finite_vals) < 1e6)
+
+
 def test_params_validation():
     with pytest.raises(ValidationError):
         XSecZScoreParams(entry_time="11:00", decision_time="11:00")
@@ -405,7 +744,9 @@ def test_two_configs_one_class():
                 "date": d,
                 "bars": {
                     "09:16": p09,
+                    "10:59": p11,
                     "11:00": p11,
+                    "14:29": p14,
                     "14:30": p14,
                     "15:20": p15,
                 },
@@ -476,10 +817,11 @@ def test_real_data_slow() -> None:
     z = signals["zscore"]
 
     decision_rows = panel.rows_at_time(strategy.params.decision_time)
-    n_sessions_with_signal = int(np.sum(np.any(np.isfinite(z[decision_rows]), axis=1)))
+    cursor_rows = decision_rows - 1
+    n_sessions_with_signal = int(np.sum(np.any(np.isfinite(z[cursor_rows]), axis=1)))
     assert n_sessions_with_signal > 200
 
-    for row in decision_rows:
+    for row in cursor_rows:
         row_z = z[row]
         finite = row_z[np.isfinite(row_z)]
         if finite.size >= strategy.params.min_names:
