@@ -24,16 +24,23 @@ if TYPE_CHECKING:  # pragma: no cover
     from nifty_quant.data.panel import Panel
 
 from nifty_quant.data.panel import PanelSpec, load_panel
-from nifty_quant.universe.static import load_universe, survivorship_report
 from nifty_quant.execution.costs import NSEIntradayEquityCosts
+from nifty_quant.universe.static import load_universe, survivorship_report
 
 
 def _compute_morning_range_mean(
     panel: Panel,
     open_minute: int,
     morning_minute: int,
+    enforce_min_prior_count: bool = True,
 ) -> tuple[np.ndarray, np.ndarray]:
     """Compute the morning range (high - low) for each session, and a 20-session prior mean.
+
+    Parameters:
+    -----------
+    enforce_min_prior_count : bool
+        If True, enforce minimum of 20 non-NaN prior sessions per symbol.
+        If False, allow any count of prior sessions (for reporting pre-enforcement).
 
     Returns:
         (morning_ranges, prior_mean_by_session): both shape (n_symbols, n_sessions)
@@ -44,7 +51,6 @@ def _compute_morning_range_mean(
     day_offsets = panel.day_offsets
     n_sessions = len(day_offsets) - 1
 
-    panel_open = panel.field("open").astype(np.float64)
     panel_high = panel.field("high").astype(np.float64)
     panel_low = panel.field("low").astype(np.float64)
     minute_of_day = panel.minute_of_day()
@@ -64,9 +70,6 @@ def _compute_morning_range_mean(
         # Session must have both 09:16 and 10:00
         if len(open_rows) == 0 or len(morning_rows) == 0:
             continue
-
-        open_row = curr_start + open_rows[0]
-        morning_row = curr_start + morning_rows[0]
 
         # Compute morning range: high[09:16:10:00] - low[09:16:10:00]
         # We compute range over the session's full session bars (all bars in [09:16, 10:00])
@@ -88,10 +91,17 @@ def _compute_morning_range_mean(
         morning_ranges[:, i] = range_val
 
         # Compute prior 20-session mean (sessions i-20:i, exclusive of i)
+        # Enforce minimum of 20 non-NaN prior sessions per symbol (the literal reading
+        # of "strictly prior 20-session mean", not a tuned threshold).
         if i >= 20:
             prior_ranges = morning_ranges[:, i - 20 : i]
-            # For each symbol, compute mean of prior 20 sessions
-            prior_mean[:, i] = np.nanmean(prior_ranges, axis=1)
+            # For each symbol, compute mean only if at least 20 non-NaN values exist
+            n_prior = np.sum(np.isfinite(prior_ranges), axis=1)
+            mean_prior = np.nanmean(prior_ranges, axis=1)
+            if enforce_min_prior_count:
+                prior_mean[:, i] = np.where(n_prior >= 20, mean_prior, np.nan)
+            else:
+                prior_mean[:, i] = mean_prior
 
     return morning_ranges, prior_mean
 
@@ -252,22 +262,43 @@ def run_h4_recon(
     morning_minute = 10 * 60  # 10:00
     exit_minute = 15 * 60 + 20  # 15:20
 
-    print(f"Computing morning ranges and prior means ...")
+    print("Computing morning ranges and prior means (with enforcement)...")
     morning_ranges, prior_mean = _compute_morning_range_mean(
-        panel, open_minute, morning_minute
+        panel, open_minute, morning_minute, enforce_min_prior_count=True
     )
 
-    print(f"Computing morning move signs ...")
+    print("Computing prior means WITHOUT enforcement (for comparison)...")
+    _, prior_mean_no_enforce = _compute_morning_range_mean(
+        panel, open_minute, morning_minute, enforce_min_prior_count=False
+    )
+
+    print("Computing morning move signs ...")
     move_signs = _compute_morning_move_sign(panel, open_minute, morning_minute)
 
-    print(f"Computing intraday returns ...")
+    print("Computing intraday returns ...")
     intraday_rets = _compute_intraday_returns(panel, morning_minute, exit_minute)
 
     # Compute expansion signal: (morning_range / prior_20_mean) * sign(move)
+    # NOTE: This is a LONG-ONLY, UP-MOVES-ONLY test by construction:
+    #   expansion_ratio = ratio * sign(move) where sign is -1 / 0 / +1
+    #   Mask = expansion_ratio > thresh (positive threshold)
+    #   DOWN moves (sign=-1) give negative expansion_ratio, can never exceed positive thresh
+    #   FLAT moves (sign=0) give zero expansion_ratio, can never exceed positive thresh
+    # The reported edge is therefore the long leg's raw demeaned return, not sign*ret.
     expansion_ratio = morning_ranges / prior_mean * move_signs
+    expansion_ratio_no_enforce = morning_ranges / prior_mean_no_enforce * move_signs
 
     # Cross-sectionally demean the intraday returns
     demeaned_rets = _cross_sectional_demean(intraday_rets)
+
+    # Count symbol-sessions dropped due to one-sided constraint
+    flat_move_mask = (move_signs == 0.0)
+    down_move_mask = (move_signs < 0.0)
+    total_flat_moves = np.sum(flat_move_mask)
+    total_down_moves = np.sum(down_move_mask)
+    print("Note: test is one-sided (long-only, up-moves only):")
+    print(f"  Flat moves (sign=0) dropped: {total_flat_moves} symbol-sessions")
+    print(f"  Down moves (sign<0) dropped: {total_down_moves} symbol-sessions")
 
     # Cost hurdle (per-round-trip)
     cost_model = NSEIntradayEquityCosts()
@@ -322,18 +353,36 @@ def run_h4_recon(
             "n_obs": n_obs,
         })
 
-    # Summary statistics
-    n_total_obs = np.sum(np.isfinite(demeaned_rets))
-    n_total_sessions = np.sum(np.nansum(np.isfinite(demeaned_rets), axis=0) > 0)
+    # Summary statistics: condition on signal availability (expansion_ratio valid AND finite)
+    # WITH enforcement
+    signal_mask = np.isfinite(expansion_ratio)
+    signal_obs = demeaned_rets[signal_mask]
+    n_total_obs = np.sum(np.isfinite(signal_obs))
+    n_total_sessions = np.sum(np.sum(signal_mask, axis=0) > 0)
+    symbols_with_signal = np.sum(np.sum(signal_mask, axis=1) > 0)
+
+    # WITHOUT enforcement (for comparison)
+    signal_mask_no_enforce = np.isfinite(expansion_ratio_no_enforce)
+    signal_obs_no_enforce = demeaned_rets[signal_mask_no_enforce]
+    n_total_obs_no_enforce = np.sum(np.isfinite(signal_obs_no_enforce))
+    n_total_sessions_no_enforce = np.sum(np.sum(signal_mask_no_enforce, axis=0) > 0)
+    symbols_with_signal_no_enforce = np.sum(np.sum(signal_mask_no_enforce, axis=1) > 0)
 
     print(f"\n{'='*80}")
-    print(f"H4 Reconnaissance Results")
+    print("H4 Reconnaissance Results")
     print(f"{'='*80}")
     print(f"Universe: {universe_name}")
-    print(f"Symbols in result: {panel.n_symbols()}")
     print(f"Window: {start} .. {end}")
-    print(f"Total observations (all sessions): {n_total_obs}")
-    print(f"Total sessions with any valid observation: {n_total_sessions}")
+    print()
+    print("BEFORE enforcing minimum 20-session prior count (defect 3 unenforced):")
+    print(f"  Symbols with signal: {symbols_with_signal_no_enforce}")
+    print(f"  Total observations: {n_total_obs_no_enforce}")
+    print(f"  Total sessions: {n_total_sessions_no_enforce}")
+    print()
+    print("AFTER enforcing minimum 20-session prior count (defect 3 fixed):")
+    print(f"  Symbols with signal: {symbols_with_signal}")
+    print(f"  Total observations: {n_total_obs}")
+    print(f"  Total sessions: {n_total_sessions}")
     print()
 
     # Print table header
@@ -346,23 +395,28 @@ def run_h4_recon(
             f"{res['t_stat']:>8.2f} {res['n_sessions']:>12} {res['n_obs']:>12}"
         )
 
-    # Yearly breakdown
-    print()
-    print("Yearly breakdown:")
-    print(f"{'threshold':<20} {'2018':>12} {'2024':>12} {'2025':>12}")
-    print(f"{'-'*60}")
-
+    # Yearly breakdown (all 8 years)
+    all_years = list(range(2018, 2026))
     dates = panel.dates
     # Convert dates (numpy array of date objects) to years
     years_array = np.array([d.year for d in dates])
 
+    # BEFORE enforcement
+    print()
+    print("Yearly breakdown BEFORE enforcement (edge in bps):")
+    header = "threshold".ljust(20)
+    for year in all_years:
+        header += f"{year:>10}"
+    print(header)
+    print(f"{'-'*(20 + 10*len(all_years))}")
+
     for thresh in thresholds:
-        mask = expansion_ratio > thresh
+        mask = expansion_ratio_no_enforce > thresh
         demeaned_rets_masked = demeaned_rets.copy()
         demeaned_rets_masked[~mask] = np.nan
 
         year_results = {}
-        for year in [2018, 2024, 2025]:
+        for year in all_years:
             year_mask = (years_array == year)
             year_cols = np.where(year_mask)[0]
 
@@ -375,10 +429,51 @@ def run_h4_recon(
             else:
                 year_results[year] = np.nan
 
-        print(
-            f"expand > {thresh:<3.1f}      {year_results.get(2018, np.nan):>12.1f} "
-            f"{year_results.get(2024, np.nan):>12.1f} {year_results.get(2025, np.nan):>12.1f}"
-        )
+        row = f"expand > {thresh:<3.1f}    "
+        for year in all_years:
+            val = year_results.get(year, np.nan)
+            if np.isnan(val):
+                row += f"{'nan':>10}"
+            else:
+                row += f"{val:>10.1f}"
+        print(row)
+
+    # AFTER enforcement
+    print()
+    print("Yearly breakdown AFTER enforcement (edge in bps):")
+    header = "threshold".ljust(20)
+    for year in all_years:
+        header += f"{year:>10}"
+    print(header)
+    print(f"{'-'*(20 + 10*len(all_years))}")
+
+    for thresh in thresholds:
+        mask = expansion_ratio > thresh
+        demeaned_rets_masked = demeaned_rets.copy()
+        demeaned_rets_masked[~mask] = np.nan
+
+        year_results = {}
+        for year in all_years:
+            year_mask = (years_array == year)
+            year_cols = np.where(year_mask)[0]
+
+            rets_year = demeaned_rets_masked[:, year_cols].ravel()
+            rets_year_finite = rets_year[np.isfinite(rets_year)]
+
+            if len(rets_year_finite) > 0:
+                mean_ret_year = np.mean(rets_year_finite)
+                year_results[year] = mean_ret_year * 10000
+            else:
+                year_results[year] = np.nan
+
+        row = f"expand > {thresh:<3.1f}    "
+        for year in all_years:
+            val = year_results.get(year, np.nan)
+            if np.isnan(val):
+                row += f"{'nan':>10}"
+            else:
+                row += f"{val:>10.1f}"
+        print(row)
 
     # Survivorship report
     print()
