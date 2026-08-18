@@ -758,10 +758,17 @@ def _davies_harte(n: int, H: float, rng: np.random.Generator) -> np.ndarray:
     if n == 0:
         return np.zeros(0, dtype=np.float64)
 
+    if n < 2:
+        # Explicit contract. The previous guard here (`m = 2 * (n - 1); if m < 2: m = 2`)
+        # was dead AND misleading: it looked like n == 1 was supported, but execution then
+        # fell through to `c[n - 1:] = gamma[1:][::-1]` and died with an opaque
+        # "could not broadcast input array from shape (0,) into shape (2,)". The only
+        # caller, `fbm`, already returns np.zeros(1) for n == 1 and raises for n <= 0, so
+        # no in-contract call reaches here.
+        raise ValueError("_davies_harte requires n >= 2; fbm handles n == 1 separately")
+
     gamma = _autocov_fgn(n, H)
     m = 2 * (n - 1)
-    if m < 2:
-        m = 2
 
     c = np.zeros(m, dtype=np.float64)
     c[:n] = gamma

@@ -347,7 +347,9 @@ def breakeven_cost_bps(
             # root is finite, so upper eventually overshoots (upper_sign becomes <= 0).
             # This guard protects against a future change to the seeding heuristic.
             raise ValueError("could not bracket a sign change in net Sharpe ratio")
-        upper_sign = _sharpe_sign(gross, turn, upper)
+        # Same invariant as the two guards above: the seed already overshoots the root, so
+        # the loop breaks on its first check and this re-evaluation never runs.
+        upper_sign = _sharpe_sign(gross, turn, upper)  # pragma: no cover
     else:  # pragma: no cover
         # Invariant: as described above, upper_sign must become <= 0 within max_iter
         # iterations. This guard protects against a future seeding heuristic change.

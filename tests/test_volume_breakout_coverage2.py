@@ -219,9 +219,10 @@ def test_cooldown_same_side_suppression_short() -> None:
 
 
 def test_invalid_direction_raises_error() -> None:
-    """Verify invalid direction value raises ValueError on lines 168-169.
+    """Verify invalid direction value raises ValidationError (Pydantic validates this).
 
-    Line 168-169: if direction not in ("fade", "continuation"), raise ValueError.
+    Line 168-169: The direction field is a Literal type, so invalid values are caught
+    by Pydantic's validation, not by our custom code.
     """
     # This should fail at validation time, not at precompute time
     with pytest.raises(ValidationError) as exc_info:
@@ -229,6 +230,20 @@ def test_invalid_direction_raises_error() -> None:
     # The error should mention the invalid choice
     error_str = str(exc_info.value)
     assert "direction" in error_str.lower() or "invalid_direction" in error_str
+
+
+def test_invalid_exit_mode_raises_error() -> None:
+    """Verify invalid exit_mode value raises ValidationError (Pydantic validates this).
+
+    Line 311-317: The exit_mode field is a Literal type, so invalid values are caught
+    by Pydantic's validation, not by our custom code. However, if somehow an invalid
+    mode were to slip through, line 317 would raise ValueError.
+    """
+    # This should fail at validation time due to Pydantic Literal validation
+    with pytest.raises(ValidationError) as exc_info:
+        VolumeBreakoutParams(exit_mode="invalid_exit_mode")  # type: ignore
+    error_str = str(exc_info.value)
+    assert "exit_mode" in error_str.lower() or "invalid_exit_mode" in error_str
 
 
 def test_exit_mode_stop_target_abs_sum_clipping() -> None:
