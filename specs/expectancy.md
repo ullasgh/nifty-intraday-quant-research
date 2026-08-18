@@ -156,9 +156,25 @@ than enough to turn noise into a "highly significant" result.
 ### Cost hurdle
 
 `cost_hurdle_bps=None` resolves from `execution.costs.NSEIntradayEquityCosts.round_trip_bps`
-(measured: **8.3 bps** at Rs 1,00,000 notional, **4.0 bps** at Rs 10,00,000). `survives_costs`
-requires the top-minus-bottom spread to exceed **2x** the hurdle — a single-x margin leaves
-nothing for slippage, which this repo's own accounting excludes from "gross" anyway.
+(measured: **8.26 bps** at Rs 1,00,000, **4.02 bps** at Rs 10,00,000, **3.59 bps** at Rs 1 Cr notional).
+`survives_costs` requires the top-minus-bottom spread to exceed **2x** the hurdle. **The 2x is an
+accounting identity, not a margin:** a hypothesis is a two-leg spread (long N shares of top quintile,
+short N of bottom), so P&L is `N × spread` while cost is `2 × round_trip_bps(N) × N/1e4`, giving
+break-even at `spread > 2 × round_trip_bps`. **The gate has zero slippage allowance:** `NSEIntradayEquityCosts`
+prices only brokerage + STT + statutory charges; the repo's own fill model adds `half_spread_bps=1.5`
+and `impact_coef=10.0` (four fills per round-trip), making the true hurdle several bps higher.
+Hypotheses near 2x should be read as failing, not marginal.
+
+**Size-dependence (verified via `NSEIntradayEquityCosts.round_trip_bps()`):**
+
+| notional per leg | round_trip_bps | 2x break-even |
+|---|---|---|
+| Rs 1L | 8.26452 | 16.52904 |
+| Rs 10L | 4.01652 | 8.03304 |
+| Rs 1Cr | 3.59172 | 7.18344 |
+
+A verdict quoting a hurdle is meaningless without naming the clip size. Above roughly Rs 10L,
+the modelled cost stops being the binding constraint because spread and impact are unpriced.
 
 ### Other required functions
 

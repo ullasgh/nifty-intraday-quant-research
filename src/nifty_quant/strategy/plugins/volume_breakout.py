@@ -314,7 +314,15 @@ class VolumeBreakoutStrategy(Strategy):
                 # safety net as 'time'.
                 exit_pos = bars[sym] >= p.hold_bars
             else:
-                raise ValueError(f"Unsupported exit_mode: {p.exit_mode!r}")
+                # Unreachable: `exit_mode` is declared on the pydantic Params model as
+                # Literal["time", "opposite", "stop_target"], so any other value is
+                # rejected at CONSTRUCTION time and can never reach this dispatch. The
+                # three arms above are exhaustive over that Literal. Kept so that adding a
+                # member to the Literal without adding an arm here fails loudly instead of
+                # silently leaving `exit_pos` unbound.
+                raise ValueError(  # pragma: no cover
+                    f"Unsupported exit_mode: {p.exit_mode!r}"
+                )
 
             if exit_pos:
                 cooldown_remaining[sym] = p.cooldown_bars

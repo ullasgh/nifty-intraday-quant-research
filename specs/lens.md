@@ -192,5 +192,6 @@ NOT a survivor regardless of its pooled statistic.
 
 - Delegate, never duplicate. A test asserts equality with the underlying module's own output.
 - No new thresholds (CLAUDE.md rule 8) — the six criteria above are the agreed ones and their
-  numbers come from measured values (8.3 bps round trip, 2x margin, 6-of-8 years).
+  numbers come from measured values (8.26 bps round trip, 2x break-even accounting identity for
+  two-leg spreads, 6-of-8 years).
 - 100% line and branch coverage; full annotation; `ruff` clean.
