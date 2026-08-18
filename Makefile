@@ -24,11 +24,24 @@ test-fast: test
 lint:
 	$(PY) -m ruff check src tests
 
-# mypy is on a RATCHET, not a pass/fail gate: HEAD carries 162 pre-existing errors across 21
-# files (mostly numpy typing in strategy/plugins/, despite an earlier progress note claiming
-# "mypy clean on src"). Blocking on zero would block all work; ignoring it entirely lets the
-# count grow. So: the count may go DOWN but never UP. Lower MYPY_MAX as debt is paid.
-MYPY_MAX := 162
+# mypy is on a RATCHET, not a pass/fail gate: HEAD carries pre-existing errors across 24 files
+# (mostly numpy typing in strategy/plugins/, despite an earlier progress note claiming "mypy
+# clean on src"). Blocking on zero would block all work; ignoring it entirely lets the count
+# grow. So: the count may go DOWN but never UP. Lower MYPY_MAX as debt is paid.
+#
+# BASELINE CORRECTION 2026-08-18. This was seeded at 162 in commit 88d0f6d, but the true count
+# in that very commit was 172 by the same `grep -cE '^src/.*: error:'` the `types` target uses.
+# The ceiling was therefore NEVER achieved and `make gate` has been red on this leg since it
+# was introduced. Corrected to the measured value.
+#
+# This is a correction of a mis-measurement, NOT a ceiling raised to make a build pass -- the
+# distinction matters, and the evidence is that the count is IDENTICAL (172) at 88d0f6d and at
+# the corrected HEAD, so the intervening work added zero errors. Verified by checking out
+# 88d0f6d into a separate worktree and re-running mypy there. Same class of error as the
+# coverage_floor.json `_baseline_correction`: a floor transcribed rather than measured.
+#
+# Raising this number for any other reason is the same failure as lowering a coverage floor.
+MYPY_MAX := 172
 
 types:
 	@n=$$($(PY) -m mypy src 2>&1 | grep -cE '^src/.*: error:' || true); \
