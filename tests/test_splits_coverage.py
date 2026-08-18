@@ -23,17 +23,22 @@ def _make_trading_dates(count: int) -> list[date]:
 def test_import_fallback_when_fcntl_import_raises(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    real_fcntl = fcntl
+    # Use monkeypatch to manage sys.modules changes so they're automatically
+    # restored after the test, preventing pollution of subsequent imports
+    if "nifty_quant.research.splits" in sys.modules:
+        monkeypatch.delitem(sys.modules, "nifty_quant.research.splits")
 
-    try:
-        monkeypatch.setitem(sys.modules, "fcntl", None)
-        sys.modules.pop("nifty_quant.research.splits", None)
-        reloaded = importlib.import_module("nifty_quant.research.splits")
-        assert reloaded.fcntl is None
-    finally:
-        monkeypatch.setitem(sys.modules, "fcntl", real_fcntl)
-        sys.modules.pop("nifty_quant.research.splits", None)
-        importlib.import_module("nifty_quant.research.splits")
+    real_fcntl = fcntl
+    monkeypatch.setitem(sys.modules, "fcntl", None)
+
+    reloaded = importlib.import_module("nifty_quant.research.splits")
+    assert reloaded.fcntl is None
+
+    # Restore and re-import so the module is in a clean state for other tests
+    monkeypatch.setitem(sys.modules, "fcntl", real_fcntl)
+    if "nifty_quant.research.splits" in sys.modules:
+        monkeypatch.delitem(sys.modules, "nifty_quant.research.splits")
+    importlib.import_module("nifty_quant.research.splits")
 
 
 def test_record_read_works_when_fcntl_unavailable(
