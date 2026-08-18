@@ -453,7 +453,14 @@ def run_backtest(
                                 trigger_price = min(stop_price, open_val)
                             else:
                                 trigger_price = stop_price
-                    elif position < 0:
+                    # `no branch`, not `no cover`: the short-stop body below IS covered; only
+                    # the fall-through exit is not. Reaching it needs `position` to be
+                    # neither > 0 nor < 0 while surviving the `== 0` skip above -- i.e. NaN.
+                    # FillBatch.__post_init__ raises ValueError on any non-finite notional,
+                    # and that check runs before every apply_fills call in both
+                    # _execute_model_fill and _execute_direct_fill, so portfolio.shares
+                    # cannot hold NaN -- not even via a duck-typed fill-model test double.
+                    elif position < 0:  # pragma: no branch
                         high_val = high[t, sym_idx]
                         if np.isfinite(high_val) and high_val >= stop_price:
                             triggered = True
@@ -561,7 +568,17 @@ def run_backtest(
                     fill_row = t + 1 + int(config.decision_latency_bars)
                     if fill_row < n_rows:
                         if fill_row in pending_orders:
-                            in_flight -= pending_orders[fill_row]
+                            # Unreachable from the DECISION side. For a fixed
+                            # decision_latency_bars L, fill_row = t + 1 + L is strictly
+                            # increasing in t, so two decisions can never share a fill row.
+                            # A collision with an earlier-queued SQUARE-OFF (which queues at
+                            # t_sq + 1) needs t_sq + 1 == t_dec + 1 + L with t_sq < t_dec,
+                            # i.e. t_sq = t_dec + L >= t_dec -- a contradiction for any
+                            # L >= 0. The realizable direction (square-off queued after the
+                            # decision) is caught by the square-off block's own identical
+                            # check below, which IS covered. Kept because it is the correct
+                            # netting if latency ever becomes per-decision rather than fixed.
+                            in_flight -= pending_orders[fill_row]  # pragma: no cover
                         pending_orders[fill_row] = order
                         in_flight += order
 
