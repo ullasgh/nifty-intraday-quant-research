@@ -326,7 +326,17 @@ def breakeven_cost_bps(
         return float("nan")
 
     root_guess = mean_gross * 10_000.0 / mean_turn
+    if not np.isfinite(root_guess):
+        # mean_gross * 1e4 / mean_turn can overflow float64 range (~1.8e308) for
+        # fully in-contract inputs (e.g. mean_gross ~1e300, mean_turn ~1e-300).
+        # Once root_guess is non-finite, the bracketing below is undefined, so
+        # signal "undefined" the same way the mean_turn <= 0 branch above does.
+        return float("nan")
     upper = max(1.0, 2.0 * root_guess)
+    if not np.isfinite(upper):
+        # root_guess itself can be finite yet still overflow once doubled here
+        # (e.g. root_guess ~1e308). Same undefined-bracket situation as above.
+        return float("nan")
     upper_sign = _sharpe_sign(gross, turn, upper)
 
     for _ in range(max_iter):
@@ -355,9 +365,7 @@ def breakeven_cost_bps(
         # iterations. This guard protects against a future seeding heuristic change.
         raise ValueError("could not bracket a sign change in net Sharpe ratio")
 
-    if upper_sign == 0.0:  # pragma: no cover
-        # Invariant: same as above. If upper_sign == 0, the seeded upper is the exact
-        # root, which is extremely rare. This guard is kept for robustness.
+    if upper_sign == 0.0:
         return upper
 
     lower = 0.0

@@ -36,16 +36,17 @@ single-day script):
   serial dependence in the sampling scheme).
 """
 
-import sys
 import datetime
+import sys
+
 import numpy as np
 import pandas as pd
 
 sys.path.insert(0, "src")
 
 from nifty_quant.data.panel import PanelSpec, load_panel
-from nifty_quant.universe.static import load_universe
 from nifty_quant.execution.costs import NSEIntradayEquityCosts
+from nifty_quant.universe.static import load_universe
 
 
 def load_checkpoints():
