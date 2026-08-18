@@ -49,16 +49,70 @@ def verdict(self, ..., strategy_returns: np.ndarray | None = None, ...) -> Hypot
   spread series, one value per rebalance period). It is NOT a 2-D panel.
 - **If `strategy_returns is None`, criterion 6 MUST report `NOT_EVALUATED`** with a reason
   naming what is missing. It must NEVER report PASS or FAIL from `fwd.values`.
-- If `strategy_returns` is supplied AND `effective_n_trials >= 2`, deflate against
-  `expected_max_sharpe(effective_n_trials, var_trial_sharpes=1.0)` as today.
+- If `strategy_returns` is supplied AND `effective_n_trials >= 2`, deflate CORRECTLY — see the
+  units defect below. Do NOT preserve today's comparison.
+
+### A SECOND defect in criterion 6: it compares a probability to a Sharpe ratio
+
+`deflated_sharpe` returns a **probability** — `stats.norm.cdf(z)` clipped to [0, 1]
+(`metrics.py:492-493`). `expected_max_sharpe(n, var_trial_sharpes=1.0)` returns a **Sharpe
+LEVEL**:
+
+    n:      2       3       4       5       8       10      20
+    value:  0.5198  0.8528  1.0521  1.1926  1.4590  1.5746  1.9007
+
+So `dsr > exp_max_sharpe` is **impossible for n >= 4**, and meaningless for n = 2 or 3. Since
+this program ran at least five hypotheses plus variants, a realistic `effective_n_trials` is
+~10 — meaning that the moment anyone actually passes `strategy_returns`, criterion 6 becomes an
+**automatic FAIL for every hypothesis**, killing everything including H2. That is a worse
+misreport than the one being fixed, so it must be repaired in the same pass.
+
+**Correct usage** (Bailey / Lopez de Prado): pass the expected-max Sharpe as the benchmark,
+then compare the resulting PROBABILITY against a significance level:
+
+    dsr = deflated_sharpe(strategy_returns, sr0=expected_max_sharpe(n_trials, var_trial_sharpes))
+    c6  = "PASS" if dsr > DSR_SIGNIFICANCE else "FAIL"
+
+- `DSR_SIGNIFICANCE` is a rule-8 decision cutoff. Define it as a NAMED module constant with its
+  derivation recorded beside it. Until derived, the implementer may set it to 0.95 with an
+  explicit `TODO(rule-8)` comment naming what must be measured — an undocumented inline literal
+  is not acceptable.
+- `var_trial_sharpes=1.0` is itself an unmeasured constant. `metrics.effective_n_trials(...)`
+  exists to measure trial structure from data; note in the code that fixing the variance at 1.0
+  is a placeholder, not a measurement.
+- **Any NaN `dsr` -> `NOT_EVALUATED`, never FAIL.** `deflated_sharpe` returns NaN for `t < 4`
+  (it needs skew and kurtosis, `metrics.py:476-487`) and for negligible std (`:471`). A
+  3-element or constant `strategy_returns` array is none of the listed degenerate cases yet
+  still yields NaN, and today's code maps NaN -> FAIL.
+- Partially-NaN `strategy_returns`: drop the non-finite entries and evaluate on the remainder
+  if >= 4 finite values survive; otherwise `NOT_EVALUATED`. State this explicitly so the two
+  suites cannot diverge.
 - If `strategy_returns` is supplied but `effective_n_trials < 2`, report `NOT_EVALUATED` with a
   reason stating that a single declared trial cannot be deflated. A one-trial "deflated" Sharpe
   is just a Sharpe; calling it deflated is the misreport being fixed.
 - A supplied `strategy_returns` that is empty, all-NaN, or shorter than 2 finite values also
   yields `NOT_EVALUATED`, never a crash and never 0.0.
 
-`NOT_EVALUATED` must never be silently counted as a PASS when computing the overall verdict —
-mirror exactly how criterion 5 already treats `NOT_EVALUATED` (read it and follow it).
+**How `NOT_EVALUATED` affects the overall verdict — literal, because my first draft of this
+line contradicted itself.** Criterion 5's actual precedent (`lens.py:824-828`) EXCLUDES
+`NOT_EVALUATED` from the conjunction, so `survived` can be `True` with a criterion unevaluated.
+Criterion 6 must follow that same precedent: **`NOT_EVALUATED` does not block `survived`**, and
+a test asserting on this must expect `survived is True` when every evaluated criterion passes.
+
+That is deliberate but uncomfortable, and the discomfort must be visible rather than papered
+over: with nothing in the repo currently passing `strategy_returns`, criterion 6 will report
+`NOT_EVALUATED` for every hypothesis, so a verdict can read "survived" with **zero
+multiple-testing correction applied**. Therefore:
+
+- `HypothesisVerdict` must expose a boolean (e.g. `any_not_evaluated`) that is True when any
+  criterion is `NOT_EVALUATED`, and `explain()` must state prominently that the verdict is
+  INCOMPLETE — not merely list `NOT_EVALUATED` among seven reason lines where a reader skims
+  past it.
+- The published verdict header must not read a bare "SURVIVED" while a criterion is
+  unevaluated.
+
+This is the honest middle path between deleting criterion 6 (losing a real check) and leaving
+it permanently decorative (implying seven criteria were applied when six were).
 
 ---
 
@@ -81,14 +135,35 @@ Note also that `>= 20` is itself a hand-chosen constant, which CLAUDE.md rule 8 
 
 ### Required behaviour — threshold-free by construction
 
-A calendar year is **complete** if and only if the panel window fully spans it:
+A calendar year is **complete** if and only if the panel contains at least one session in
+**each of the 12 calendar months** of that year.
 
 ```
-complete(year)  <==>  panel_first_date <= date(year, 1, 1)  AND  panel_last_date >= date(year, 12, 31)
+complete(year)  <==>  {d.month for d in panel.dates if d.year == year} == {1, 2, ..., 12}
 ```
 
-This introduces NO tunable threshold, which is the point — it satisfies rule 8 by having no
-cutoff to derive rather than by deriving one. Use the panel's own first and last dates.
+This introduces NO tunable threshold — 12 is definitional, not tunable — so it satisfies rule 8
+by having no cutoff to derive.
+
+**Why not the obvious date-span test.** My first draft used
+`panel_first_date <= date(year,1,1) AND panel_last_date >= date(year,12,31)`. It is WRONG,
+because `panel.dates` holds only TRADING sessions and `Panel.sub` slices with `dates <= end`:
+
+- A window ending 2023-12-31 has `panel_last_date = 2023-12-29` (the last NSE session), so
+  2023 would be marked PARTIAL despite being fully covered — and criterion 7 would silently
+  fall back to (2021, 2022). Same for 2022, whose last session is 2022-12-30. That is a
+  verdict-moving misclassification of a complete year.
+- The mirror risk at the start of a window (Jan 1 being a market holiday) does not bite the
+  published window — 2018-01-01 IS a real session — but the rule was fragile in principle.
+
+Verified against the real session calendar: 2025 (Jan-Jul only) -> incomplete; 2022 and 2023
+-> complete; window starting 2018-06-01 -> 2018 incomplete; window ending 2024-12-31 -> 2024
+complete. Interior years are complete under both rules, so this is a strict improvement.
+
+**Scope of the exclusion:** partial years are excluded from criterion 7 ONLY. Criterion 2's
+`n_years_total` (`stability_report`) continues to count every year present, including partial
+ones — do not change it in this pass. State this in the code so the two behaviours are not
+mistaken for an inconsistency.
 
 - Years failing this test are PARTIAL and must be excluded from `complete_years`.
 - If fewer than two complete years remain, criterion 7 reports `NOT_EVALUATED` (existing

@@ -59,7 +59,7 @@ def _decile_spreads(
     day_offsets: np.ndarray,
     liquidity: np.ndarray,
     *,
-    causal: bool,
+    causal: bool | str,
 ) -> dict[int, float]:
     """Return {decile: spread_bps} bucketing on `liquidity`.
 
@@ -67,6 +67,40 @@ def _decile_spreads(
     cross-sectional rank per row on a caller-supplied STRICTLY PRIOR quantity.
     causal=False reproduces Lens's current full-sample `np.quantile` bucketing.
     """
+    if causal == "production_geometry":
+        # Production uses 10 LIQUIDITY deciles x 5 FEATURE quintiles (lens.py:511 passes
+        # n_buckets=5 to conditional_expectancy while looping range(10) over deciles).
+        # `expectancy_by_liquidity_decile` couples BOTH to a single n_buckets, so it cannot
+        # express that geometry -- hence this explicit path. Deciles are still bucketed
+        # causally via cross_sectional_rank on the strictly-prior quantity.
+        from nifty_quant.features.core import cross_sectional_rank
+
+        ranks = cross_sectional_rank(liquidity)
+        labels = np.full(liquidity.shape, -1, dtype=np.int64)
+        ok = np.isfinite(ranks)
+        labels[ok] = np.clip((ranks[ok] * N_DECILES).astype(np.int64), 0, N_DECILES - 1)
+
+        out_pg: dict[int, float] = {}
+        for d in range(N_DECILES):
+            mask = labels == d
+            if not np.any(mask):
+                continue
+            feat_d = np.where(mask, feature_values, np.nan)
+            masked = np.where(mask, fwd.values, np.nan)
+            fwd_d = expectancy.ForwardReturns(
+                values=masked,
+                horizon=fwd.horizon,
+                session_bounded=fwd.session_bounded,
+                n_defined=int(np.sum(np.isfinite(masked))),
+                n_nan_tail=fwd.n_nan_tail,
+            )
+            table = expectancy.conditional_expectancy(
+                feat_d, fwd_d, day_offsets, n_buckets=5,
+                method="cross_sectional_rank", seed=SEED,
+            )
+            out_pg[d] = float(table.spread_bps)
+        return out_pg
+
     if causal:
         # method="cross_sectional_rank" is MANDATORY. The default here is
         # "expanding_quantile", which needs min_history rows per column and can never
@@ -146,13 +180,23 @@ def _report(name: str, spreads: dict[int, float]) -> None:
         return
     abs_vals = {d: abs(v) for d, v in finite.items()}
     argmax = max(abs_vals, key=lambda d: abs_vals[d])
-    med = float(np.median(list(abs_vals.values())))
-    ratio = abs_vals[argmax] / med if med > 0 else float("inf")
+    # PRODUCTION median, not np.median. `lens.py:665` uses
+    # `sorted_liquidity_edges[len(sorted_liquidity_edges) // 2]` -- the UPPER median for an
+    # even count, where np.median averages the 5th and 6th. The upper median is >= np.median,
+    # so np.median inflates the ratio. With 10 deciles and a 0.5% decision margin that
+    # difference alone can flip criterion 4. Both are reported below.
+    sorted_abs = sorted(abs_vals.values())
+    med_prod = float(sorted_abs[len(sorted_abs) // 2])
+    med_np = float(np.median(sorted_abs))
+    ratio = abs_vals[argmax] / med_prod if med_prod > 0 else float("inf")
+    ratio_np = abs_vals[argmax] / med_np if med_np > 0 else float("inf")
     bottom_is_max = argmax == 0
     fires = bottom_is_max and ratio > 2.0
-    print(f"  argmax |spread| = decile {argmax}   max/median ratio = {ratio:.4f}")
-    print(f"  bottom-is-argmax = {bottom_is_max}   ratio > 2 = {ratio > 2.0}")
-    print(f"  ==> criterion 4 FIRES: {fires}")
+    print(f"  argmax |spread| = decile {argmax}")
+    print(f"  max/median ratio, PRODUCTION median (upper): {ratio:.4f}")
+    print(f"  max/median ratio, np.median (averaged):      {ratio_np:.4f}")
+    print(f"  bottom-is-argmax = {bottom_is_max}   production ratio > 2 = {ratio > 2.0}")
+    print(f"  ==> criterion 4 FIRES (production convention): {fires}")
 
 
 def main() -> None:
@@ -210,9 +254,20 @@ def main() -> None:
         ),
     )
     _report(
-        "3. RUPEE TURNOVER, strictly-prior causal buckets  (the correct measurement)",
+        "3. RUPEE TURNOVER, strictly-prior causal, 10 deciles x 10 feature buckets",
         _decile_spreads(
             cp_feature.values, fwd, cp_panel.day_offsets, prior_rupee, causal=True
+        ),
+    )
+    _report(
+        "4. RUPEE TURNOVER, strictly-prior causal, 10 deciles x 5 feature quintiles "
+        "(PRODUCTION GEOMETRY -- this is the number that decides H2)",
+        _decile_spreads(
+            cp_feature.values,
+            fwd,
+            cp_panel.day_offsets,
+            prior_rupee,
+            causal="production_geometry",
         ),
     )
 
