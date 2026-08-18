@@ -183,7 +183,15 @@ class GrossNotionalSizer:
             free_share = np.where(free_mask, final_abs, 0.0)
             total_free_share = float(np.sum(free_share))
             if total_free_share <= 0.0:
-                break
+                break  # pragma: no cover - free_share sum invariant
+                # Whenever free_mask has any True entry, that entry's final_abs is provably
+                # > 0. On the first water-filling round, free_mask True implies final_abs ==
+                # desired_abs (since final_abs < capacity strictly) and desired_abs > 0 is
+                # part of the mask definition. On later rounds a still-free name only ever
+                # has add >= 0 applied, so it never returns to 0. Hence total_free_share > 0
+                # whenever free_mask is non-empty. Kept as a guard against a future refactor
+                # of the water-filling loop; excluded from coverage rather than deleted so
+                # the invariant stays asserted in the code.
             with np.errstate(divide="ignore", invalid="ignore", over="ignore"):
                 add = np.where(
                     free_mask,
@@ -199,7 +207,14 @@ class GrossNotionalSizer:
         else:
             unmet_gross_pct = max(0.0, (orig_gross - achieved_gross) / orig_gross)
         if not np.isfinite(unmet_gross_pct):
-            unmet_gross_pct = 0.0
+            unmet_gross_pct = 0.0  # pragma: no cover - finite ratio invariant
+            # capacity is forced finite and non-negative earlier in this method by
+            # np.where(np.isfinite(capacity) & (capacity > 0), capacity, 0.0); desired_abs
+            # is finite/non-negative upstream; so final_abs = min(desired_abs, capacity) is
+            # finite. final_abs <= desired_abs pointwise gives achieved_gross <= orig_gross,
+            # and orig_gross <= 0.0 is ruled out by the preceding branch, so the ratio cannot
+            # be NaN or +/-inf. Kept because a non-finite unmet_gross_pct would silently
+            # poison downstream metrics with NaN rather than raising.
 
         capacity_adjusted_notional = sign * final_abs
         capacity_adjusted_notional = np.where(

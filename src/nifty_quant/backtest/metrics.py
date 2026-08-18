@@ -370,7 +370,12 @@ def sharpe_standard_error(
     else:
         max_lag = min(t - 2, 10)
         if max_lag <= 0:
-            per_period_se = float(se)
+            per_period_se = float(se)  # pragma: no cover - t >= 3 invariant
+            # The t < 3 early return has already fired otherwise, so t >= 3 here, which
+            # implies max_lag = min(t - 2, 10) >= 1. The condition max_lag <= 0 is never
+            # true. Kept rather than removed because a zero or negative max_lag would make
+            # the autocorrelation adjustment loop silently skip all lags, producing an
+            # understated standard error without raising.
         else:
             x = arr - float(np.mean(arr))
             var_biased = float(np.mean(x * x))
@@ -516,7 +521,14 @@ def effective_n_trials(trial_returns: np.ndarray) -> float:
     sum_eig = float(np.sum(eigvals))
     sum_sq = float(np.sum(eigvals**2))
     if sum_sq == 0.0:
-        return 0.0
+        return 0.0  # pragma: no cover - correlation trace invariant
+        # corr is a correlation matrix from np.corrcoef, which has 1.0 on its diagonal by
+        # construction. Since eigenvalues are clipped at 0 but the trace (sum of eigenvalues)
+        # equals the sum of the diagonal, which is n_trials >= 2 here (the n_trials == 1 case
+        # already returned above), sum_eig > 0, and since eigvals are real and not all zero,
+        # the sum of squared eigenvalues is strictly positive for any valid correlation
+        # matrix. Kept as a guard against a future refactor that changes the eigenvalue
+        # clipping or the correlation input source.
 
     return float((sum_eig**2) / sum_sq)
 

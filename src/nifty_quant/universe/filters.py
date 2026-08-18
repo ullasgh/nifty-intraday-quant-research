@@ -27,7 +27,13 @@ def coverage_filter(
         return ()
     total_years = end.year - start.year + 1
     if total_years <= 0:
-        return ()
+        return ()  # pragma: no cover - date comparison invariant
+        # datetime.date comparison is lexicographic on (year, month, day), and the earlier
+        # if end < start: return () has already fired otherwise. So by this point end >=
+        # start holds as full dates, which necessarily implies end.year >= start.year -- a
+        # strictly smaller year would make the whole date smaller regardless of month/day.
+        # Therefore total_years = end.year - start.year + 1 >= 1 always. Kept as a guard
+        # against a future refactor that changes the date comparison logic.
 
     coverage = _load_coverage()
     kept: list[str] = []

@@ -332,7 +332,14 @@ def breakeven_cost_bps(
     for _ in range(max_iter):
         if upper_sign <= 0.0:
             break
-        upper *= expansion_factor
+        # Unreachable, and algebraically so rather than merely untested: `upper` is seeded
+        # at max(1.0, 2 * root_guess) and root_guess is the cost (in bps) at which mean net
+        # return is exactly zero. Both branches of the max exceed root_guess -- if
+        # root_guess < 0.5 then 1.0 > root_guess, otherwise 2 * root_guess > root_guess --
+        # so the seed always overshoots the root and `upper_sign <= 0.0` breaks on the first
+        # iteration. The expansion loop therefore never runs a second pass. Kept because it
+        # is the correct behaviour if the seeding heuristic is ever changed.
+        upper *= expansion_factor  # pragma: no cover
         if not np.isfinite(upper):  # pragma: no cover
             # Invariant: `upper` is seeded at `2 * root_guess`, which brackets the root
             # for any input where `mean_gross > 0` and `mean_turn > 0` (both guaranteed by
