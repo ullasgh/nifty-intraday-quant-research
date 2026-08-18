@@ -5,8 +5,7 @@ Authored under ``scripts/`` (not ``tests/``) because the task that produced
 ``tests/`` while v1's calibration run was in flight against the same panel -- see
 ``tests/test_calibrate_concentration_threshold.py``'s header for the identical precedent on
 v1. ``pyproject.toml`` sets ``testpaths = ["tests"]``, so this file is not auto-collected;
-it is run explicitly (``.venv/bin/python -m pytest scripts/test_calibrate_concentration_threshold_v2.py``)
-and should be moved into ``tests/`` at review, matching v1's file.
+Moved into ``tests/`` at review, matching v1's file, so pytest actually collects it.
 
 Focus: the pieces that actually CHANGED from v1 -- ``_prior_session_mean`` (strictly-prior
 per-symbol session lag) and ``_liquidity_deciles`` (causal cross-sectional-rank bucketing of
@@ -29,7 +28,7 @@ from pathlib import Path
 import numpy as np
 import pytest
 
-_SCRIPTS_DIR = Path(__file__).resolve().parent
+_SCRIPTS_DIR = Path(__file__).resolve().parent.parent / "scripts"
 
 
 def _load(module_name: str, filename: str):
@@ -42,7 +41,10 @@ def _load(module_name: str, filename: str):
 
 
 calib_v2 = _load("calibrate_concentration_threshold_v2", "calibrate_concentration_threshold_v2.py")
-calib_v1 = _load("calibrate_concentration_threshold_v1_for_mutation_check", "calibrate_concentration_threshold.py")
+calib_v1 = _load(
+    "calibrate_concentration_threshold_v1_for_mutation_check",
+    "calibrate_concentration_threshold.py",
+)
 
 
 # ---------------------------------------------------------------------------

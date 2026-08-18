@@ -10,13 +10,9 @@ from zoneinfo import ZoneInfo
 
 import numpy as np
 import pandas as pd
-import pytest
 
 from nifty_quant.data.panel import Panel
-from nifty_quant.features import core as core_features
-from nifty_quant.research import expectancy
 from nifty_quant.research.lens import (
-    Feature,
     Lens,
 )
 
@@ -526,10 +522,10 @@ def test_criterion4_fires_on_bottom_argmax_and_ratio() -> None:
     # If it doesn't exist yet in the current code, we'll skip this part
     try:
         from nifty_quant.research import lens as lens_module
-        threshold = lens_module.CONCENTRATION_THRESHOLD
+        _threshold = lens_module.CONCENTRATION_THRESHOLD
     except AttributeError:
         # Constant doesn't exist yet in current code
-        threshold = 2.0  # Use default for now
+        _threshold = 2.0  # Use default for now
 
     dates = [dt.date(2024, 1, i) for i in range(1, 6)]
     bars_per_session = 25
