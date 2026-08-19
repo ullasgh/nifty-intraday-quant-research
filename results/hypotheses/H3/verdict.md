@@ -7,7 +7,7 @@
 
 # H3_intraday_xsec_reversal
 
-**Verdict:** KILLED
+**Verdict:** KILLED (INCOMPLETE: one or more criteria NOT_EVALUATED)
 
 ## Kill Criteria
 
@@ -16,8 +16,8 @@
 - 3. Overlap correction criterion: FAIL
 - 4. Concentration criterion: PASS
 - 5. Latency profile criterion: NOT_EVALUATED
-- 6. Deflated Sharpe criterion: PASS (trials=1)
-- 7. Recent-years cost gate criterion: FAIL (years=2024,2025; edges=6.57,-1.07 bps; mean=2.75 bps; 2x hurdle=16.53 bps; dominant_sign='+')
+- 6. Deflated Sharpe criterion: NOT_EVALUATED (strategy_returns not supplied, trials=1)
+- 7. Recent-years cost gate criterion: FAIL (years=2023,2024; edges=7.27,6.57 bps; mean=6.92 bps; 2x hurdle=16.53 bps; dominant_sign='+'; excluded partial years: 2025)
 - Observed direction: POSITIVE top-minus-bottom spread (1.2124 bps) -- this is MOMENTUM, not reversal. Do not report this as a confirmed reversal.
 - UNIVERSE h3_panel WITH NO AS-OF DATE; 149 names; 15 of 149 names had no data in 2018. Returns before 2018 are survivorship-inflated.
 
@@ -26,15 +26,13 @@
 - Cost hurdle: 8.26 bps (round-trip)
 - SE method: block_bootstrap
 - Seed: 0
-- Signal: `r_morning = log(close[10:00] / open[09:16])`, cross-sectionally demeaned
-- Trade: enter 10:00 close, exit 15:20 close, market-neutral (forward leg also demeaned)
-- n_total = 1,866 sessions
 
 ## Per-year spread (bps)
 
 | 2018 | 2019 | 2020 | 2021 | 2022 | 2023 | 2024 | 2025 |
 |---|---|---|---|---|---|---|---|
 | -12.60 | -13.33 | +1.30 | +5.96 | +12.34 | +7.27 | +6.57 | -1.07 |
+<!-- HAND-WRITTEN, PRESERVED -->
 
 The sign flips in 2020 and stays flipped, so the near-zero pooled number is not a small
 effect -- it is two opposing regimes cancelling. Neither regime clears the gate on its own.
@@ -80,3 +78,4 @@ mechanism: overnight is where order imbalance accumulates with no continuous tra
 it; intraday, continuous liquidity clears imbalance as it arrives, leaving nothing to revert.
 
 **Consequence: further reversal variants on price-derived intraday signals are low-value.**
+

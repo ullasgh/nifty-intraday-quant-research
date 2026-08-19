@@ -6,7 +6,7 @@
 
 # H2_overnight_reversal
 
-**Verdict:** KILLED
+**Verdict:** KILLED (INCOMPLETE: one or more criteria NOT_EVALUATED)
 
 ## Kill Criteria
 
@@ -15,8 +15,8 @@
 - 3. Overlap correction criterion: PASS
 - 4. Concentration criterion: FAIL (concentrated in bottom liquidity decile)
 - 5. Latency profile criterion: NOT_EVALUATED
-- 6. Deflated Sharpe criterion: PASS (trials=1)
-- 7. Recent-years cost gate criterion: FAIL (years=2024,2025; edges=-10.98,-9.62 bps; mean=-10.30 bps; 2x hurdle=16.53 bps; dominant_sign='-')
+- 6. Deflated Sharpe criterion: NOT_EVALUATED (strategy_returns not supplied, trials=1)
+- 7. Recent-years cost gate criterion: FAIL (years=2023,2024; edges=-19.41,-10.98 bps; mean=-15.20 bps; 2x hurdle=16.53 bps; dominant_sign='-'; excluded partial years: 2025)
 - Observed direction: NEGATIVE top-minus-bottom spread (-24.3049 bps) -- consistent with REVERSAL, the hypothesized direction. horizon=1 bar(s) (horizon_mode='session'): one observation per symbol-day, non-overlapping, so no block-bootstrap overlap correction is needed even though Lens defaults to requesting it.
 - UNIVERSE h2_panel WITH NO AS-OF DATE; 149 names; 15 of 149 names had no data in 2018. Returns before 2018 are survivorship-inflated.
 
@@ -26,3 +26,8 @@
 - SE method: block_bootstrap
 - Seed: 0
 
+## Per-year spread (bps)
+
+| 2018 | 2019 | 2020 | 2021 | 2022 | 2023 | 2024 | 2025 |
+|---|---|---|---|---|---|---|---|
+| -39.18 | -25.86 | -41.73 | -26.03 | -17.95 | -19.41 | -10.98 | -9.62 |
