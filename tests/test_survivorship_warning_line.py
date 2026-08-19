@@ -57,12 +57,16 @@ def fake_manifest(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
     static_module._get_manifest.cache_clear()
 
 
-def test_warning_line_missing_names_omits_survivorship_inflated(report_missing: SurvivorshipReport) -> None:
+def test_warning_line_missing_names_omits_survivorship_inflated(
+    report_missing: SurvivorshipReport,
+) -> None:
     warning = report_missing.warning_line()
     assert "survivorship-inflated" not in warning.lower()
 
 
-def test_warning_line_missing_names_keeps_factual_counts(report_missing: SurvivorshipReport) -> None:
+def test_warning_line_missing_names_keeps_factual_counts(
+    report_missing: SurvivorshipReport,
+) -> None:
     warning = report_missing.warning_line()
     assert "UNIVERSE mini_universe" in warning
     assert "2 of 3 names had no data in 2018" in warning
