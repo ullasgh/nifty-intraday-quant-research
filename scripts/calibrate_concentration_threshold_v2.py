@@ -469,9 +469,9 @@ def main() -> None:
         records.append(_concentration_stat(spreads))
         if (rep + 1) % max(1, n_replicates // 10) == 0:
             elapsed = time.time() - t_loop
-            print(f"  replicate {rep + 1}/{n_replicates} ({elapsed:.1f}s elapsed)")
+            print(f"  replicate {rep + 1}/{n_replicates} ({elapsed:.1f}s elapsed)", flush=True)
 
-    print(f"\ncompleted {n_replicates} replicates in {time.time() - t_loop:.1f}s")
+    print(f"\ncompleted {n_replicates} replicates in {time.time() - t_loop:.1f}s", flush=True)
 
     ratios_arr = np.array(
         [r.ratio for r in records if r.ratio is not None], dtype=np.float64
@@ -482,7 +482,8 @@ def main() -> None:
     print(
         f"{n_ratio}/{n_replicates} replicates yielded a defined ratio; "
         f"{n_only_bottom_nonzero} had only the bottom decile nonzero (auto-fires at any "
-        f"threshold); remainder had a zero-median nonzero set"
+        f"threshold); remainder had a zero-median nonzero set",
+        flush=True
     )
 
     if n_ratio == 0:
@@ -502,29 +503,35 @@ def main() -> None:
     joint_fp_rate_p95 = sum(r.fired(p95_threshold) for r in records) / n_replicates
 
     print("\n=== [v2, corrected liquidity] Null distribution of "
-          "max(|spread_bps|) / median(|spread_bps|) ===")
-    print(f"seed={args.seed}  n_replicates={n_replicates}  n_with_defined_ratio={n_ratio}")
-    print(f"mean={mean_ratio:.4f}  median={median_ratio:.4f}  max_observed={max_ratio:.4f}")
+          "max(|spread_bps|) / median(|spread_bps|) ===",
+          flush=True)
+    print(f"seed={args.seed}  n_replicates={n_replicates}  n_with_defined_ratio={n_ratio}",
+          flush=True)
+    print(f"mean={mean_ratio:.4f}  median={median_ratio:.4f}  max_observed={max_ratio:.4f}",
+          flush=True)
     for p in percentiles:
-        print(f"  p{p} = {pct_values[p]:.4f}")
+        print(f"  p{p} = {pct_values[p]:.4f}", flush=True)
 
     print(f"\nhardcoded threshold 2.0 sits at the {pct_of_2:.1f}th percentile of the null "
-          f"ratio distribution")
+          f"ratio distribution", flush=True)
     print(f"observed H2 statistic {OBSERVED_H2_STATISTIC} sits at the {pct_of_observed:.1f}th "
-          f"percentile of the null ratio distribution")
-    print(f"derived p95 threshold (5% FP rate on the ratio alone) = {p95_threshold:.4f}")
+          f"percentile of the null ratio distribution", flush=True)
+    print(f"derived p95 threshold (5% FP rate on the ratio alone) = {p95_threshold:.4f}",
+          flush=True)
     print(f"H2's observed {OBSERVED_H2_STATISTIC} "
           f"{'EXCEEDS' if OBSERVED_H2_STATISTIC > p95_threshold else 'DOES NOT EXCEED'} "
-          f"the derived p95 threshold")
+          f"the derived p95 threshold", flush=True)
     print(f"bottom-decile-is-argmax rate under the null = "
           f"{100.0 * bottom_argmax_count / n_replicates:.1f}% (n={n_replicates}; "
-          f"~10% expected by chance alone with 10 deciles)")
+          f"~10% expected by chance alone with 10 deciles)", flush=True)
     print(f"JOINT false-positive rate at threshold=2.0 (ratio>2 AND bottom is argmax): "
           f"{joint_fp_rate_hardcoded:.4f} "
-          f"({sum(r.fired(HARDCODED_THRESHOLD) for r in records)}/{n_replicates})")
+          f"({sum(r.fired(HARDCODED_THRESHOLD) for r in records)}/{n_replicates})",
+          flush=True)
     print(f"JOINT false-positive rate at threshold={p95_threshold:.4f} (derived p95): "
           f"{joint_fp_rate_p95:.4f} "
-          f"({sum(r.fired(p95_threshold) for r in records)}/{n_replicates})")
+          f"({sum(r.fired(p95_threshold) for r in records)}/{n_replicates})",
+          flush=True)
 
 
 if __name__ == "__main__":
