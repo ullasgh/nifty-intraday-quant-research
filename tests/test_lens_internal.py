@@ -6,6 +6,7 @@ Focuses on edge cases, error paths, and branch combinations.
 
 from __future__ import annotations
 
+import calendar
 import datetime as dt
 from zoneinfo import ZoneInfo
 
@@ -22,6 +23,7 @@ from nifty_quant.research.lens import (
     HypothesisVerdict,
     Lens,
     StabilityReport,
+    compute_prior_adv,
 )
 
 _IST = ZoneInfo("Asia/Kolkata")
@@ -61,6 +63,42 @@ def _close_prices_from_log_returns(returns: np.ndarray) -> np.ndarray:
     return close_all[:-1, :]
 
 
+def _monthly_session_dates(year: int, n_sessions: int) -> list[dt.date]:
+    """`n_sessions` session dates for `year`, in STRICTLY CHRONOLOGICAL order
+    (required: `Panel`'s `check_sorted_unique` rejects a non-increasing `ts`),
+    covering every calendar month at least once when `n_sessions >= 12`.
+
+    Criterion 7's amended rule (specs/lens_criteria_6_7_repair.md Defect 2)
+    calls a year "complete" iff the panel holds a session in EACH of that
+    year's 12 calendar months -- `{d.month for d in panel.dates if
+    d.year == year} == {1..12}` -- never a session-count threshold. This
+    repo's usual `date(year, 1, 2 + session_idx)` generator (see
+    `_build_panel`'s default and the task brief's landmine 1) places every
+    session in January, so it can NEVER satisfy that rule regardless of how
+    many sessions are requested; this generator is what criterion-7 tests
+    need instead whenever a year must come back "complete".
+
+    `n_sessions < 12` deliberately gives a PARTIAL year (one session per
+    month for the first `n_sessions` months only, e.g. `n_sessions=6` ->
+    Jan-Jun, missing Jul-Dec) -- used by criterion-7 tests that need a
+    year to be excluded despite having many total sessions. `n_sessions
+    >= 12` spreads sessions evenly across all 12 months (extra sessions go
+    to the earliest months first), with each month's own sessions spread
+    across that month's real day count so the overall list stays strictly
+    increasing month-by-month, day-by-day."""
+    if n_sessions < 12:
+        return [dt.date(year, month, 1) for month in range(1, n_sessions + 1)]
+
+    base, extra = divmod(n_sessions, 12)
+    dates: list[dt.date] = []
+    for month in range(1, 13):
+        sessions_this_month = base + (1 if month <= extra else 0)
+        days_in_month = calendar.monthrange(year, month)[1]
+        days = np.linspace(1, days_in_month, sessions_this_month, dtype=int)
+        dates.extend(dt.date(year, month, int(day)) for day in days)
+    return dates
+
+
 def _build_panel(
     years: tuple[int, ...],
     sessions_per_year: int | dict[int, int] = 2,
@@ -70,10 +108,22 @@ def _build_panel(
     effect: float = 0.01,
     sigma: float = 0.0005,
     seed: int = 0,
+    monthly_years: set[int] | None = None,
 ) -> Panel:
-    """Build a Panel with specified years, sessions, and signal strength."""
+    """Build a Panel with specified years, sessions, and signal strength.
+
+    `monthly_years`: years in this set get `_monthly_session_dates` (12-month
+    coverage, for criterion-7 "complete year" tests) instead of the default
+    consecutive-January dates; unlisted years are unaffected. Since returns
+    are drawn deterministically per date in iteration order and depend only
+    on `date.year` (never the specific day-of-month), swapping only the
+    calendar placement of a year's dates changes no other computed value
+    (spread_bps, cost_hurdle_bps, t-stats) versus the January-only layout.
+    """
     if signal_years is None:
         signal_years = set(years)
+    if monthly_years is None:
+        monthly_years = set()
 
     if isinstance(sessions_per_year, int):
         year_sessions = {year: sessions_per_year for year in years}
@@ -82,8 +132,10 @@ def _build_panel(
 
     dates: list[dt.date] = []
     for year in years:
-        for session_idx in range(year_sessions[year]):
-            dates.append(dt.date(year, 1, 2 + session_idx))
+        if year in monthly_years:
+            dates += _monthly_session_dates(year, year_sessions[year])
+        else:
+            dates += [dt.date(year, 1, 2 + i) for i in range(year_sessions[year])]
 
     n_rows = len(dates) * bars_per_session
     rng = np.random.default_rng(seed)
@@ -1161,7 +1213,21 @@ def test_stability_liquidity_decile_preserves_shape_and_real_day_offsets() -> No
     and use the panel's real day_offsets, not a fabricated single-session
     [0, N]. Verified indirectly: n_total must equal the count of rows where
     at least one in-decile symbol has a finite, session-respecting forward
-    return, computed independently here from the panel's own day_offsets."""
+    return, computed independently here from the panel's own day_offsets.
+
+    The decile membership oracle below was rewritten against
+    specs/lens_criterion_4_repair.md (Required behaviour items 1-3): the
+    original oracle reimplemented the OLD algorithm -- a full-sample
+    `np.quantile` over raw share `volume` -- which is exactly the defect the
+    spec repairs (liquidity must be `close * volume` rupee turnover, bucketed
+    causally/strictly-prior via `compute_prior_adv` + `causal_buckets`, never
+    a full-sample quantile on share count). That old oracle is now wrong by
+    construction and must not be patched to match output; it is replaced
+    here by calling the actual production primitives
+    (`compute_prior_adv`, `expectancy.causal_buckets`) that `Lens.stability`
+    itself delegates to (`lens.py:552-558`), which is delegation to the real
+    algorithm, not a second reimplementation of it. This test's own intent
+    (shape/day_offsets preservation of the masked arrays) is unchanged."""
     panel = _build_liquidity_concentrated_panel()
     lens = Lens(panel)
     feature = lens.feature("return_1")
@@ -1171,12 +1237,13 @@ def test_stability_liquidity_decile_preserves_shape_and_real_day_offsets() -> No
     close = panel.field("close").astype(np.float64)
     fwd = expectancy.forward_returns(close, panel.day_offsets, 1)
 
-    volume = panel.field("volume").astype(np.float64)
-    volume_quantiles = np.quantile(volume[np.isfinite(volume)], np.linspace(0, 1, 11))
-    volume_deciles = np.searchsorted(volume_quantiles[1:-1], volume, side="right")
+    prior_adv = compute_prior_adv(panel)
+    adv_bucketing = expectancy.causal_buckets(
+        prior_adv, panel.day_offsets, n_buckets=10, method="cross_sectional_rank"
+    )
 
     for decile in (0, 1, 5, 9):
-        mask = volume_deciles == decile
+        mask = adv_bucketing.labels == decile
         masked_fwd = np.where(mask, fwd.values, np.nan)
         expected_n_total = int(np.sum(np.any(np.isfinite(masked_fwd), axis=1)))
         assert report.by_liquidity_decile[decile].n_total == expected_n_total
@@ -1316,8 +1383,25 @@ def test_verdict_criterion_4_fails_when_only_bottom_decile_has_any_edge() -> Non
     """Branch where every OTHER decile is exactly flat (spread_bps == 0.0,
     not merely small): the bottom decile is the sole nonzero contributor, so
     criterion 4 must FAIL via the single-nonzero-decile path rather than the
-    dominance-ratio path."""
-    panel = _build_liquidity_concentrated_panel(sigma_other_symbols=0.0)
+    dominance-ratio path.
+
+    `effect` is overridden down from the fixture's default 0.02 to 0.0005.
+    specs/lens_criterion_4_repair.md Defect 1 makes liquidity decile
+    membership a function of `close * volume` (rupee turnover), not the
+    fixture's static per-symbol share-volume column alone
+    (`compute_prior_adv`/`causal_buckets`, `lens.py:552-558`). At the
+    default `effect=0.02` applied every bar for 400 bars, the edge symbols'
+    cumulative price drift (up to exp(0.02*400) ~= exp(8), a ~2981x price
+    swing) dwarfs the fixture's modest 1x-60x volume spread, so a planted
+    edge symbol's rupee turnover migrates into non-bottom deciles across
+    sessions -- leaking real edge into deciles 1-9 and breaking the "only
+    the bottom decile has any edge" fixture this test relies on (measured:
+    at effect=0.02, deciles 0, 1, 3, 7, 9 all come back nonzero). At
+    effect=0.0005 the cumulative drift is negligible relative to the fixed
+    volume ordering, so turnover-decile membership stays stable across all
+    4 sessions and only decile 0 is nonzero, preserving this test's actual
+    intent under the new bucketing."""
+    panel = _build_liquidity_concentrated_panel(sigma_other_symbols=0.0, effect=0.0005)
     lens = Lens(panel)
     feature = lens.feature("return_1")
 
@@ -1540,13 +1624,23 @@ def test_verdict_criterion_4_fails_on_time_of_day_dominance() -> None:
 
 def test_verdict_criterion_6_pass_with_multiple_trials() -> None:
     """Criterion 6 PASSes with effective_n_trials >= 2 when the deflated
-    Sharpe clears expected_max_sharpe(n_trials): a strong, low-noise,
-    directional (non-symmetric-across-symbols) drift with a large sample."""
+    Sharpe (computed on the supplied `strategy_returns`, per
+    specs/lens_criteria_6_7_repair.md Defect 1 -- never on `fwd.values`)
+    clears `expected_max_sharpe(n_trials)`, compared as a PROBABILITY against
+    `DSR_SIGNIFICANCE` (the second defect's fix: `deflated_sharpe` returns a
+    probability, `expected_max_sharpe` a Sharpe level, so the correct form is
+    `deflated_sharpe(strategy_returns, sr0=expected_max_sharpe(n)) >
+    DSR_SIGNIFICANCE`, never a direct Sharpe-vs-Sharpe comparison).
+    `strategy_returns` is a strong, low-noise, directional 1-D per-period P&L
+    series, independent of the panel's own (flat, near-zero-drift) returns,
+    so this test cannot be satisfied by the old `fwd.values`-reading
+    implementation for a flat panel -- it must actually read the supplied
+    argument."""
     dates = [dt.date(2024, 1, 2 + i) for i in range(20)]
     bars = 50
     n_rows = bars * len(dates)
     rng = np.random.default_rng(9)
-    returns = 0.001 + rng.normal(0.0, 0.0005, size=(n_rows, _N_SYMBOLS))
+    returns = rng.normal(0.0, 0.0005, size=(n_rows, _N_SYMBOLS))
     close = _close_prices_from_log_returns(returns)
     volume = np.tile(np.arange(1, _N_SYMBOLS + 1, dtype=np.float64), (n_rows, 1))
     ts, day_offsets, dates_arr = _session_grid(dates, bars)
@@ -1559,12 +1653,14 @@ def test_verdict_criterion_6_pass_with_multiple_trials() -> None:
     )
     lens = Lens(panel)
     feature = lens.feature("return_1")
+    strategy_returns = 0.001 + rng.normal(0.0, 0.0005, size=1000)
 
     verdict = lens.verdict(
         "H_c6_multi_trial_pass",
         feature,
         1,
         effective_n_trials=2,
+        strategy_returns=strategy_returns,
         method="cross_sectional_rank",
         n_buckets=5,
         n_boot=100,
@@ -1575,9 +1671,17 @@ def test_verdict_criterion_6_pass_with_multiple_trials() -> None:
 
 
 def test_verdict_criterion_6_fails_with_zero_valid_forward_returns() -> None:
-    """When horizon >= bars_per_session, EVERY row's forward return runs off
-    the session end, so len(valid_returns) == 0 and criterion 6 must FAIL via
-    that path (not via a NaN deflated Sharpe computed on an empty array)."""
+    """A `strategy_returns` array that is entirely NaN (e.g. because the
+    strategy never traded in this window -- horizon >= bars_per_session
+    means every row's forward return runs off the session end, so the
+    hypothetical realised P&L series is undefined everywhere) must report
+    `NOT_EVALUATED`, never FAIL, per specs/lens_criteria_6_7_repair.md
+    Defect 1: 'A supplied strategy_returns that is empty, all-NaN, or
+    shorter than 2 finite values also yields NOT_EVALUATED, never a crash
+    and never 0.0.' This replaces the old FAIL assertion, which encoded the
+    repaired defect itself: the old code derived criterion 6 from
+    `fwd.values` (zero valid forward returns -> FAIL via an empty array),
+    not from a strategy P&L series at all."""
     dates = [dt.date(2024, 1, 1)]
     ts, day_offsets, dates_arr = _session_grid(dates, bars_per_session=3)
 
@@ -1594,14 +1698,21 @@ def test_verdict_criterion_6_fails_with_zero_valid_forward_returns() -> None:
     lens = Lens(panel)
     feature = lens.feature("return_1")
 
-    verdict = lens.verdict("H_c6_zero_valid", feature, horizon=3, effective_n_trials=1)
+    all_nan_strategy_returns = np.full(10, np.nan, dtype=np.float64)
+    verdict = lens.verdict(
+        "H_c6_zero_valid",
+        feature,
+        horizon=3,
+        effective_n_trials=2,
+        strategy_returns=all_nan_strategy_returns,
+    )
 
     close64 = panel.field("close").astype(np.float64)
     fwd = expectancy.forward_returns(close64, panel.day_offsets, 3)
     assert fwd.n_defined == 0
 
     c6_line = next(r for r in verdict.reasons if r.startswith("6."))
-    assert "FAIL" in c6_line
+    assert "NOT_EVALUATED" in c6_line
 
 
 # ==============================================================================
@@ -1623,6 +1734,7 @@ def _build_panel_year_effects(
     *,
     sigma: float = 0.0005,
     seed: int = 7,
+    monthly_years: set[int] | None = None,
 ) -> Panel:
     """Build a Panel with an independently-controlled signal magnitude per year.
 
@@ -1631,17 +1743,27 @@ def _build_panel_year_effects(
     needed to construct the H2 regression shape: a large early edge that decays
     below the cost hurdle in the most recent years while keeping the same sign
     throughout (so criteria 1 and 2 still PASS and only criterion 7 catches it).
+
+    `monthly_years`: years in this set get `_monthly_session_dates` (12-month
+    coverage, needed for a year to be "complete" under criterion 7's amended
+    rule) instead of consecutive-January dates; see `_build_panel`'s
+    identical parameter for why this changes no computed statistic besides
+    which calendar months each year's sessions land in.
     """
     years = tuple(sorted(year_effects))
     if isinstance(sessions_per_year, int):
         year_sessions = {year: sessions_per_year for year in years}
     else:
         year_sessions = dict(sessions_per_year)
+    if monthly_years is None:
+        monthly_years = set()
 
     dates: list[dt.date] = []
     for year in years:
-        for session_idx in range(year_sessions[year]):
-            dates.append(dt.date(year, 1, 2 + session_idx))
+        if year in monthly_years:
+            dates += _monthly_session_dates(year, year_sessions[year])
+        else:
+            dates += [dt.date(year, 1, 2 + i) for i in range(year_sessions[year])]
 
     n_rows = len(dates) * bars_per_session
     rng = np.random.default_rng(seed)
@@ -1672,11 +1794,18 @@ def _build_panel_year_effects(
 
 
 def test_verdict_criterion_7_passes_when_last_two_years_clear_hurdle() -> None:
-    """Criterion 7 PASSes when the last two complete years both clear 2x hurdle."""
+    """Criterion 7 PASSes when the last two complete years both clear 2x hurdle.
+
+    `monthly_years={2024, 2025}` (specs/lens_criteria_6_7_repair.md Defect 2:
+    a year is "complete" iff it has a session in each of its 12 calendar
+    months) is required for either year to be usable by criterion 7 at all --
+    the plain `date(year, 1, 2 + i)` placement this test used before can
+    never satisfy that rule (see `_monthly_session_dates`'s docstring)."""
     panel = _build_panel_year_effects(
         {2024: 0.01, 2025: 0.01},
         sessions_per_year={2024: 25, 2025: 25},
         bars_per_session=50,
+        monthly_years={2024, 2025},
     )
     lens = Lens(panel)
     feature = lens.feature("return_1")
@@ -1697,6 +1826,17 @@ def test_verdict_criterion_7_fails_on_decayed_edge_while_criteria_1_and_2_pass()
     what let H2 slip through -- while the last two years' mean edge sits under the
     cost hurdle, so criterion 7 must FAIL. This is the regression test for the gap
     that criterion 7 exists to close.
+
+    `monthly_years={2024, 2025}` makes ONLY those two years "complete" under
+    criterion 7's amended rule (specs/lens_criteria_6_7_repair.md Defect 2);
+    2018-2023 stay on their original January-only dates since criterion 2's
+    `n_years_total` counts every year present regardless of completeness (the
+    spec: "Scope of the exclusion: partial years are excluded from criterion 7
+    ONLY"), so those years need no change to keep criteria 1/2's pooled
+    sample and sign-stability count exactly as before. Because a date's
+    calendar placement never affects the returns drawn for it (see
+    `_build_panel_year_effects`'s `monthly_years` docstring), 2024/2025's own
+    spread_bps values are also unchanged by this move.
     """
     year_effects = {
         2018: 0.01,
@@ -1709,7 +1849,9 @@ def test_verdict_criterion_7_fails_on_decayed_edge_while_criteria_1_and_2_pass()
         2025: 0.0005,
     }
     sessions = {2018: 5, 2019: 5, 2020: 5, 2021: 5, 2022: 5, 2023: 5, 2024: 25, 2025: 25}
-    panel = _build_panel_year_effects(year_effects, sessions, bars_per_session=375)
+    panel = _build_panel_year_effects(
+        year_effects, sessions, bars_per_session=375, monthly_years={2024, 2025}
+    )
     lens = Lens(panel)
     feature = lens.feature("return_1")
 
@@ -1752,13 +1894,24 @@ def test_verdict_criterion_7_not_evaluated_with_fewer_than_two_complete_years() 
     assert "FAIL" not in c7_line
 
 
-def test_verdict_criterion_7_excludes_year_with_fewer_than_20_sessions() -> None:
-    """A year with < 20 usable sessions is not 'complete' and must be skipped;
-    the verdict text names the years actually used, not the excluded one."""
+def test_verdict_criterion_7_excludes_partial_year_missing_a_month() -> None:
+    """OBSOLETE-AND-REPLACED (spec: specs/lens_criteria_6_7_repair.md Defect 2).
+    This test used to assert the old `session_counts.get(year, 0) >= 20`
+    threshold directly (itself a hand-chosen constant CLAUDE.md rule 8
+    forbids) -- that threshold no longer exists in the implementation, so
+    asserting it would test dead code. It is replaced with the equivalent
+    NEW behaviour the amendment introduces: a year is "complete" iff it has
+    a session in EACH of its 12 calendar months, with NO session-count
+    threshold at all. Here 2023 gets only 6 sessions, spread across months
+    1-6 only (missing Jul-Dec) via `_monthly_session_dates` -- regardless of
+    how many total sessions it has, a year missing even one calendar month
+    is PARTIAL -- while 2022 and 2024 each get 12 sessions, one per calendar
+    month, so both are genuinely complete and must be the two years used."""
     panel = _build_panel_year_effects(
         {2022: 0.01, 2023: 0.01, 2024: 0.01},
-        sessions_per_year={2022: 30, 2023: 10, 2024: 30},
+        sessions_per_year={2022: 12, 2023: 6, 2024: 12},
         bars_per_session=50,
+        monthly_years={2022, 2023, 2024},
     )
     lens = Lens(panel)
     feature = lens.feature("return_1")
@@ -1768,11 +1921,11 @@ def test_verdict_criterion_7_excludes_year_with_fewer_than_20_sessions() -> None
     )
 
     c7_line = next(r for r in verdict.reasons if r.startswith("7."))
-    # 2023 has only 10 sessions (< 20) and must be excluded: the years actually
-    # used are the two OTHER complete years, 2022 and 2024, not 2023.
-    assert "2022" in c7_line
-    assert "2024" in c7_line
-    assert "2023" not in c7_line
+    # 2023 covers only Jan-Jun and is PARTIAL: the years actually used are the
+    # two OTHER complete years, 2022 and 2024, and the reason line must name
+    # 2023 as an excluded partial year (spec: the field is always emitted).
+    assert "years=2022,2024" in c7_line
+    assert "excluded partial years: 2023" in c7_line
 
 
 def test_verdict_all_seven_criteria_reported_after_one_fails() -> None:
@@ -1802,7 +1955,19 @@ def test_verdict_all_seven_criteria_reported_after_one_fails() -> None:
 
 
 def test_verdict_survived_false_when_only_criterion_7_fails() -> None:
-    """survived is False when criteria 1-6 all PASS and only criterion 7 fails."""
+    """survived is False when criteria 1-6 all PASS and only criterion 7 fails.
+
+    `monthly_years={2024, 2025}` makes those two years "complete" (see the
+    decayed-edge test above for the identical rationale) so criterion 7 is
+    actually FAIL rather than NOT_EVALUATED. Criterion 6 now needs an
+    explicit `strategy_returns` array to PASS at all (never `fwd.values`,
+    specs/lens_criteria_6_7_repair.md Defect 1); `effective_n_trials=2` with
+    a strongly, unambiguously winning series (mean=0.01, sigma=0.001, n=500)
+    saturates `deflated_sharpe` to ~1.0 against
+    `expected_max_sharpe(2, 1.0) ~= 0.52`, so it PASSes independent of the
+    exact `DSR_SIGNIFICANCE` value -- see test_verdict_criterion_6_pass_with_
+    multiple_trials's identical reasoning.
+    """
     year_effects = {
         2018: 0.01,
         2019: 0.01,
@@ -1814,9 +1979,12 @@ def test_verdict_survived_false_when_only_criterion_7_fails() -> None:
         2025: 0.0005,
     }
     sessions = {2018: 5, 2019: 5, 2020: 5, 2021: 5, 2022: 5, 2023: 5, 2024: 25, 2025: 25}
-    panel = _build_panel_year_effects(year_effects, sessions, bars_per_session=375)
+    panel = _build_panel_year_effects(
+        year_effects, sessions, bars_per_session=375, monthly_years={2024, 2025}
+    )
     lens = Lens(panel)
     feature = lens.feature("return_1")
+    strategy_returns = np.random.default_rng(1).normal(0.01, 0.001, size=500)
 
     latency = {0: 1.0, 1: 0.6, 2: 0.55}
     verdict = lens.verdict(
@@ -1824,7 +1992,8 @@ def test_verdict_survived_false_when_only_criterion_7_fails() -> None:
         feature,
         horizon=1,
         latency_profile=latency,
-        effective_n_trials=1,
+        effective_n_trials=2,
+        strategy_returns=strategy_returns,
         method="cross_sectional_rank",
         n_buckets=5,
     )
@@ -1848,6 +2017,13 @@ def test_verdict_criterion_7_fails_on_opposite_sign_to_dominant() -> None:
     is always non-negative by construction. Monkeypatching isolates the criterion
     7 sign-check logic under test from that fixture limitation, while the
     session-completeness gate (self.panel.dates) still comes from a real panel.
+
+    `monthly_years={2022, 2023, 2024}` makes all three years 12-month
+    "complete" (specs/lens_criteria_6_7_repair.md Defect 2), so criterion 7's
+    real `complete_years` computation (against `self.panel.dates`, which the
+    monkeypatch does NOT touch) selects the two most recent, 2023 and 2024 --
+    matching the fake StabilityReport's own by_year keys and this test's
+    assertions on those two years by name.
     """
     panel = _build_panel(
         (2022, 2023, 2024),
@@ -1855,6 +2031,7 @@ def test_verdict_criterion_7_fails_on_opposite_sign_to_dominant() -> None:
         bars_per_session=25,
         effect=0.001,
         seed=200,
+        monthly_years={2022, 2023, 2024},
     )
     lens = Lens(panel)
     feature = lens.feature("return_1")
@@ -1894,13 +2071,19 @@ def test_verdict_criterion_7_fails_when_mean_recent_edge_is_exactly_zero() -> No
     """The two recent years' edges exactly cancel (mean == 0.0): neither the `> 0`
     nor the `< 0` branch of the sign classification fires, so `recent_sign` stays
     "mixed" and criterion 7 FAILs on the sign check -- covers that branch
-    explicitly rather than leaving it an untested fallthrough."""
+    explicitly rather than leaving it an untested fallthrough.
+
+    `monthly_years={2022, 2023, 2024}`: see the identical rationale in
+    test_verdict_criterion_7_fails_on_opposite_sign_to_dominant immediately
+    above -- criterion 7's real completeness check reads `self.panel.dates`,
+    which the `lens.stability` monkeypatch below does not touch."""
     panel = _build_panel(
         (2022, 2023, 2024),
         sessions_per_year=25,
         bars_per_session=25,
         effect=0.001,
         seed=201,
+        monthly_years={2022, 2023, 2024},
     )
     lens = Lens(panel)
     feature = lens.feature("return_1")

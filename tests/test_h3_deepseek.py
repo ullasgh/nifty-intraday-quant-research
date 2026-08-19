@@ -144,16 +144,22 @@ def _yearly_reversal_panel(
 ) -> Panel:
     """Same 3-bar-per-session construction as `_checkpoint_ramp_panel`, but with a
     per-year reversal coefficient `year_k[year]`, one continuous rng stream across the
-    whole panel, weekly sessions starting Jan 15 of each year."""
+    whole panel, sessions spread Jan 1 .. ~Dec 17 of each year (not merely weekly from
+    Jan 15, which never reaches past early July for `sessions_per_year=25` and so can
+    never satisfy criterion 7's amended 12-calendar-month "complete year" rule --
+    specs/lens_criteria_6_7_repair.md Defect 2 -- regardless of which implementation
+    runs)."""
     rng = np.random.default_rng(seed)
     n_symbols = len(symbols)
     bars_by_symbol: dict[str, list[tuple[datetime.date, str, dict[str, float]]]] = {
         s: [] for s in symbols
     }
+    span_days = 350  # Jan 1 .. Dec 17: safely inside the calendar year
+    step_days = span_days // max(sessions_per_year - 1, 1)
     for year in sorted(year_k):
         k = year_k[year]
         for j in range(sessions_per_year):
-            d = datetime.date(year, 1, 15) + datetime.timedelta(days=7 * j)
+            d = datetime.date(year, 1, 1) + datetime.timedelta(days=j * step_days)
             open_0916 = {sym: 100.0 for sym in symbols}
             noise = rng.standard_normal(n_symbols) * noise_scale
             for i, sym in enumerate(symbols):

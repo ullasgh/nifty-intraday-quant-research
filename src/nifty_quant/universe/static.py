@@ -172,7 +172,7 @@ class SurvivorshipReport:
             return f"{base}; all {total} names had data in {worst_year}."
         return (
             f"{base}; {missing} of {total} names had no data in {worst_year}. "
-            f"Returns before {worst_year} are survivorship-inflated."
+            f"Missing names are later listings; this dataset has no delistings."
         )
 
     def to_dict(self) -> dict[str, object]:

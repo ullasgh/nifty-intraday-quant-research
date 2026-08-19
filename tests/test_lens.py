@@ -145,6 +145,7 @@ def _call_verdict(
     *,
     latency_profile: dict[int, float] | None = _PASS_LATENCY,
     effective_n_trials: int = 1,
+    strategy_returns: np.ndarray | None = None,
     seed: int = 0,
     horizon: int = 1,
 ) -> HypothesisVerdict:
@@ -155,6 +156,7 @@ def _call_verdict(
         horizon,
         latency_profile=latency_profile,
         effective_n_trials=effective_n_trials,
+        strategy_returns=strategy_returns,
         method="cross_sectional_rank",
         n_buckets=5,
         n_boot=100,
@@ -726,20 +728,43 @@ def test_verdict_criterion_5_latency_profile(
 
 
 @pytest.mark.parametrize(
-    "trials, expected_token",
+    "seed, mean, expected_token",
     [
-        (1, "PASS"),
-        (100_000, "FAIL"),
+        (1, 0.01, "PASS"),
+        (2, 0.0, "FAIL"),
     ],
     ids=["PASS", "FAIL"],
 )
-def test_verdict_criterion_6_deflated_sharpe(trials: int, expected_token: str) -> None:
-    # effect/sigma chosen so that at trials=1 ALL SIX criteria pass (survived=True), and
-    # raising effective_n_trials to 100_000 flips ONLY criterion 6 (deflated Sharpe must
-    # get harder to clear as the number of hypotheses tested grows). Measured (seed=0):
-    # spread_t=13.783, spread_bps=32.967; trials=1 -> survived=True (edge=32.97 bps vs
-    # 2x hurdle=16.53 bps, sign 8/8 years, criteria 1-5 all PASS); trials=100_000 ->
-    # survived=False (only criterion 6 flips to FAIL, 1-5 unchanged).
+def test_verdict_criterion_6_deflated_sharpe(
+    seed: int, mean: float, expected_token: str
+) -> None:
+    """Criterion 6 now deflates the supplied `strategy_returns`, never
+    `fwd.values` (specs/lens_criteria_6_7_repair.md Defect 1 required
+    behaviour: "If strategy_returns is supplied AND effective_n_trials >= 2,
+    deflate CORRECTLY"). With no strategy_returns the criterion is
+    NOT_EVALUATED (see test_verdict_criterion5_not_evaluated_without_latency_
+    profile's criterion-5 analogue, and tests/test_lens_criteria_repair_a.py),
+    so a PASS/FAIL comparison must be driven by an explicit strategy_returns
+    array with effective_n_trials >= 2, not merely by varying the trial count
+    against fwd.values as the old (buggy) test did.
+
+    effect/sigma are unchanged from the original test's panel, so criteria
+    1-5 still all PASS on their own; criterion 7 is NOT_EVALUATED on
+    _build_panel's January-only 2-session/year date grid regardless of which
+    branch runs (see this module's docstring landmine on `_all_pass_panel`,
+    which applies identically here since `_build_panel` places every session
+    in January), so it never blocks `survived`.
+
+    Measured directly against `deflated_sharpe`/`expected_max_sharpe`
+    (nifty_quant.backtest.metrics, both pre-existing/untouched):
+    `expected_max_sharpe(2, var_trial_sharpes=1.0) ~= 0.5198`.
+    - seed=1, normal(mean=0.01, sigma=0.001, n=500): raw per-period SR ~= 10,
+      so deflated_sharpe(arr, sr0=0.5198) saturates to 1.0 -> PASS under any
+      reasonable significance level.
+    - seed=2, normal(mean=0.0, sigma=0.001, n=500): raw per-period SR ~= -0.05,
+      so deflated_sharpe(arr, sr0=0.5198) is numerically zero -> FAIL under
+      any reasonable significance level.
+    """
     panel = _build_panel(
         _ALL_YEARS,
         sessions_per_year=2,
@@ -748,13 +773,23 @@ def test_verdict_criterion_6_deflated_sharpe(trials: int, expected_token: str) -
         effect=0.005,
         sigma=0.010,
     )
-    verdict = _call_verdict(panel, effective_n_trials=trials)
+    strategy_returns = np.random.default_rng(seed).normal(mean, 0.001, size=500)
+    verdict = _call_verdict(
+        panel, effective_n_trials=2, strategy_returns=strategy_returns
+    )
 
     assert expected_token in verdict.reasons[5]
     assert verdict.survived is (expected_token == "PASS")
 
 
 def test_verdict_reports_all_criteria_even_multiple_fail() -> None:
+    """Criterion 6 must be genuinely evaluated (not merely defaulted) for
+    "PASS" in reasons[5] to hold, since specs/lens_criteria_6_7_repair.md
+    requires strategy_returns to be supplied AND effective_n_trials>=2 before
+    criterion 6 can PASS or FAIL at all (Defect 1). A saturating-positive
+    strategy_returns array (identical construction to
+    test_verdict_criterion_6_deflated_sharpe's PASS case, seed=1, mean=0.01)
+    keeps every other criterion's PASS/FAIL exactly as before."""
     panel = _build_panel(
         (2024,),
         sessions_per_year=2,
@@ -763,7 +798,13 @@ def test_verdict_reports_all_criteria_even_multiple_fail() -> None:
         effect=0.01,
         sigma=0.0005,
     )
-    verdict = _call_verdict(panel, latency_profile=_FAIL_LATENCY, effective_n_trials=1)
+    strategy_returns = np.random.default_rng(1).normal(0.01, 0.001, size=500)
+    verdict = _call_verdict(
+        panel,
+        latency_profile=_FAIL_LATENCY,
+        effective_n_trials=2,
+        strategy_returns=strategy_returns,
+    )
 
     # Moved 6 -> 7 when criterion 7 (recent-years cost gate) was added to the spec.
     assert len(verdict.reasons) == 7

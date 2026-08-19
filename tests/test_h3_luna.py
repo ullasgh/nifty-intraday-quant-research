@@ -121,6 +121,27 @@ def _business_dates(start: datetime.date, count: int) -> list[datetime.date]:
     return dates
 
 
+def _monthly_business_dates(
+    year: int, months: range = range(1, 13), day_of_month: int = 15
+) -> list[datetime.date]:
+    """One business-day session per requested calendar month of `year`
+    (nearest weekday on/after `day_of_month`), chronologically ordered.
+
+    Criterion 7's amended rule (specs/lens_criteria_6_7_repair.md Defect 2)
+    calls a year "complete" iff it has a session in EACH of its 12 calendar
+    months; `_business_dates` walks CONSECUTIVE business days from a single
+    start date, so 22 sessions from Jan 3 never leaves January -- it can
+    never satisfy that rule. This generator is what criterion-7 fixtures
+    need instead whenever a year must come back "complete"."""
+    dates: list[datetime.date] = []
+    for month in months:
+        d = datetime.date(year, month, day_of_month)
+        while d.weekday() >= 5:
+            d += datetime.timedelta(days=1)
+        dates.append(d)
+    return dates
+
+
 def _checkpoint_sessions(
     dates: list[datetime.date],
     *,
@@ -694,11 +715,20 @@ def test_latency_criterion_is_not_evaluated_by_run_h3() -> None:
 
 
 def test_recent_year_cost_gate_is_evaluated_with_three_complete_years() -> None:
+    """`dates` used to be 22 CONSECUTIVE business days per year starting in
+    early January -- roughly one calendar month, never 12 -- so under
+    criterion 7's amended rule (specs/lens_criteria_6_7_repair.md Defect 2:
+    a year is "complete" iff it has a session in EACH of its 12 calendar
+    months) none of 2022/2023/2024 could ever be "complete" regardless of
+    which implementation ran, and this test's own name ("...with three
+    complete years") would be false of its own fixture. `_monthly_business_
+    dates` gives each year one session per calendar month instead, so all
+    three are genuinely complete."""
     symbols = tuple(f"S{ix:02d}" for ix in range(8))
     dates = (
-        _business_dates(datetime.date(2022, 1, 3), 22)
-        + _business_dates(datetime.date(2023, 1, 3), 22)
-        + _business_dates(datetime.date(2024, 1, 2), 22)
+        _monthly_business_dates(2022)
+        + _monthly_business_dates(2023)
+        + _monthly_business_dates(2024)
     )
     panel = _signal_panel(
         dates,
