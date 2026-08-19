@@ -117,17 +117,15 @@ The single construction net-positive in both 2024 and 2025, across all four (til
 
 Mild/full is net-positive in all eight years: 3.14, 1.65, 3.11, 2.14, 2.34, 2.56, 1.92, 0.84 bps/day. It survives on the continuous-coverage universe, so it is not purely a newly-listed-names artifact. No construction in this program has cleared costs in every measured year before.
 
-### Why This Is Not Yet a Result -- The Four Unverified Conditions
+### Why This Is Not Yet a Result -- The Three Remaining Unverified Conditions
 
 State these prominently because they gate the finding:
 
-1. **No 2024-2025-only significance test has been run.** Every t-stat quoted is pooled over the entire window and dominated by larger early-year gross. The weakest surviving case is +0.26 bps/day (aggressive/continuous 2025). Rule 9 applies directly: a small effect-to-SE ratio in a short sub-window is not a confirmed edge without an explicit power check.
+1. **Recent-window significance test HAS been run and result is PARTIAL.** On 2024-01-01..2025-07-31 alone (n=389 sessions, NET series), only mild/full-universe a=0.10 clears: +1.51 bps/day, se=0.55, t=2.75, p=0.0063. This survives Bonferroni at 4 comparisons (0.0125 threshold) but is 1 of 4 related constructions and depends on recently-listed names: continuous-coverage (like-for-like universe excluding the 18 names which IPO'd inside the window) does NOT clear at p=0.077. The plateau check PASSED: turnover glides smoothly from ~0.30 to ~0.011 across a in {0.20...0.01} with no discontinuity, and a=0.10 is not an isolated peak. Every a=1.0 control is decisively NEGATIVE in the same window (-6.44 to -10.82 bps/day, all p<0.002), confirming smoothing does something real relative to daily rebalancing. The construction is not a confirmed recent-window edge but is not ruled out either; its significance is universe-dependent and recently-listed-names-dependent.
 
-2. **a=0.10 is the most extreme point on the pre-registered grid.** Results that appear only at the boundary of a tested range are exactly where over-fitting hides. A plateau-vs-spike check is running.
+2. **No liquidity decomposition has been run on the low-turnover book.** H2's overnight reversal edge concentrates in the least-liquid decile. If this construction inherits that, it is not investable at the sizes tested.
 
-3. **No liquidity decomposition has been run on the low-turnover book.** H2's overnight reversal edge concentrates in the least-liquid decile. If this construction inherits that, it is not investable at the sizes tested.
-
-4. **The holdout (last 12 months) remains locked and unread.** No out-of-sample verification on withheld data.
+3. **The holdout (last 12 months) remains locked and unread.** No out-of-sample verification on withheld data.
 
 **The degenerate corner, recorded honestly:** Hysteresis b=1.00 on the aggressive tilt collapses turnover to ~0.0005-0.0086/day (a buy-once-never-trade book whose few-name concentration makes the no-trade threshold enormous relative to any weight change). Its positive recent numbers reflect almost no rebalancing over 7.5 years and must not be read as validating the hysteresis mechanism.
 
