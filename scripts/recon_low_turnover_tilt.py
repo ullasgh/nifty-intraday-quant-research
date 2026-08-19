@@ -594,7 +594,10 @@ def print_full_year_tables(
 ) -> None:
     """Print full 2018-2025 per-year net_bps tables for all constructions."""
     print(f"\n--- Full per-year net_bps: {tilt} tilt, {universe} universe ---", flush=True)
-    print("construction        param  2018    2019    2020    2021    2022    2023    2024    2025", flush=True)
+    print(
+        "construction        param  2018    2019    2020    2021    2022    2023    2024    2025",
+        flush=True,
+    )
 
     all_years = list(range(2018, 2026))
 
