@@ -1,128 +1,129 @@
-"""Test suite B for lens criterion 4 (liquidity concentration) repair.
-
-This suite is written INDEPENDENTLY from the spec (lens_criterion_4_repair.md)
-without reading suite A. All 10 required tests are implemented.
+"""Suite B targets the pending kill-criterion-4 repair in ``Lens.stability``.
+It is based solely on ``specs/lens_criterion_4_repair.md``.
+This suite ASSUMES the fix adds two currently absent names to
+``nifty_quant.research.lens``: ``compute_prior_adv(panel: Panel) -> np.ndarray``,
+which computes trailing-20-session strictly-prior rupee-turnover ADV,
+broadcast at bar level with session 0 as NaN, and the float constant
+``CONCENTRATION_RATIO_THRESHOLD``, replacing the hardcoded criterion-4 ratio.
+Every test needing either assumed name fetches it through ``_require_attr``.
+Thus an API mismatch produces an ``AssertionError`` rather than collection aborting.
+``cross_sectional_rank`` returns all-NaN for rows with fewer than five finite values.
+The delegated fix applies that behavior twice: for prior-ADV deciles and
+for the feature within each decile. Therefore spread values read from
+``by_liquidity_decile`` require at least 50 symbols, or every decile is 0.0.
 """
+
 from __future__ import annotations
 
 import datetime as dt
+import warnings
+from typing import Any
 from zoneinfo import ZoneInfo
 
 import numpy as np
 import pandas as pd
 
+import nifty_quant.research.lens as lens_module
 from nifty_quant.data.panel import Panel
-from nifty_quant.research.lens import (
-    Lens,
+from nifty_quant.research import expectancy
+from nifty_quant.research.lens import Lens
+from tests.test_lens import (
+    _FAIL_LATENCY,
+    _PASS_LATENCY,
+    _all_pass_panel,
+    _build_panel,
+    _call_verdict,
 )
 
 _IST = ZoneInfo("Asia/Kolkata")
 
 
-def _session_grid(
-    dates: list[dt.date], bars_per_session: int
+def _require_attr(obj: object, name: str, context: str) -> Any:
+    """Fetch obj.name, converting a missing attribute into an AssertionError."""
+    assert hasattr(obj, name), (
+        f"{context}: expected nifty_quant.research.lens.{name} to exist "
+        f"(see specs/lens_criterion_4_repair.md); not found on current lens.py"
+    )
+    return getattr(obj, name)
+
+
+def _ist_session_grid(
+    dates: list[dt.date], bars_per_session: int | list[int]
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
-    """Build session grid from dates and bars per session (handles irregular sessions)."""
+    """Build an IST 09:15 one-minute session grid."""
+    bars_list = (
+        [bars_per_session] * len(dates)
+        if isinstance(bars_per_session, int)
+        else list(bars_per_session)
+    )
+    assert len(bars_list) == len(dates)
     ts_chunks: list[np.ndarray] = []
-    for day in dates:
-        day_start = pd.Timestamp(day.year, day.month, day.day, 9, 15, tz=_IST)
-        idx = pd.date_range(day_start, periods=bars_per_session, freq="1min")
+    day_offsets_list = [0]
+    row = 0
+    for date, n_bars in zip(dates, bars_list):
+        day_start = pd.Timestamp(date.year, date.month, date.day, 9, 15, tz=_IST)
+        idx = pd.date_range(day_start, periods=n_bars, freq="1min")
         idx_utc = idx.tz_convert("UTC")
         epoch = pd.Timestamp("1970-01-01", tz="UTC")
         secs = ((idx_utc - epoch) // pd.Timedelta(seconds=1)).to_numpy(dtype=np.int64)
         ts_chunks.append(secs)
+        row += n_bars
+        day_offsets_list.append(row)
     ts = np.concatenate(ts_chunks).astype(np.int64)
-    n_days = len(dates)
-    day_offsets = np.arange(0, (n_days + 1) * bars_per_session, bars_per_session, dtype=np.int32)
     dates_arr = np.array(dates, dtype=object)
+    day_offsets = np.array(day_offsets_list, dtype=np.int32)
     return ts, day_offsets, dates_arr
 
 
-def _close_prices_from_log_returns(returns: np.ndarray) -> np.ndarray:
-    """Convert log returns to close prices."""
-    cum = np.cumsum(returns, axis=0)
-    log_close = np.vstack([np.zeros((1, returns.shape[1]), dtype=np.float64), cum])
-    close_all = np.exp(log_close)
-    return close_all[:-1, :]
-
-
-def _build_panel_with_irregular_sessions() -> Panel:
-    """Build a panel with irregular sessions (Muhurat ~60 bars, regular ~375)."""
-    dates: list[dt.date] = []
-    bars_list: list[int] = []
-
-    # 2 full sessions in 2024
-    dates.append(dt.date(2024, 1, 1))
-    bars_list.append(375)
-    dates.append(dt.date(2024, 1, 2))
-    bars_list.append(375)
-
-    # 1 Muhurat session (60 bars)
-    dates.append(dt.date(2024, 1, 3))
-    bars_list.append(60)
-
-    # Compute cumulative bars and day_offsets
-    day_offsets_list = [0]
-    n_rows = 0
-    for bars in bars_list:
-        n_rows += bars
-        day_offsets_list.append(n_rows)
-
-    # Build timestamps
-    ts_chunks: list[np.ndarray] = []
-    for date, bars in zip(dates, bars_list):
-        day_start = pd.Timestamp(date.year, date.month, date.day, 9, 15, tz=_IST)
-        idx = pd.date_range(day_start, periods=bars, freq="1min")
-        idx_utc = idx.tz_convert("UTC")
-        epoch = pd.Timestamp("1970-01-01", tz="UTC")
-        secs = ((idx_utc - epoch) // pd.Timedelta(seconds=1)).to_numpy(dtype=np.int64)
-        ts_chunks.append(secs)
-
-    ts = np.concatenate(ts_chunks).astype(np.int64)
-    day_offsets = np.array(day_offsets_list, dtype=np.int32)
-
-    # Build close prices and volumes
-    rng = np.random.default_rng(42)
-    n_symbols = 3
-    returns = rng.normal(0.0, 0.001, size=(n_rows, n_symbols))
-    close = _close_prices_from_log_returns(returns)
-    volume = np.tile(np.array([1e3, 1e4, 1e5], dtype=np.float64), (n_rows, 1))
-
-    dates_arr = np.array(dates, dtype=object)
-
-    return Panel(
-        fields={"close": close.astype(np.float32), "volume": volume.astype(np.float32)},
-        symbols=("SYM_A", "SYM_B", "SYM_C"),
-        ts=ts,
-        day_offsets=day_offsets,
-        dates=dates_arr,
-    )
-
-
-def _build_simple_panel(
-    n_sessions: int = 5,
-    bars_per_session: int = 30,
-    symbols: tuple[str, ...] = ("S0", "S1", "S2"),
-    volumes: tuple[float, ...] = (1e3, 1e4, 1e5),
+def _panel_from_symbol_series(
+    symbols: tuple[str, ...],
+    symbol_returns: np.ndarray,  # (n_symbols,) float64, constant per-bar log return
+    symbol_volume: np.ndarray,  # (n_sessions, n_symbols) float64, per-session volume
+    bars_per_session: int | list[int],
+    *,
+    symbol_base_price: np.ndarray | float = 1.0,
+    start_date: dt.date = dt.date(2024, 1, 2),
 ) -> Panel:
-    """Build a simple panel with uniform sessions."""
-    dates: list[dt.date] = []
-    for i in range(n_sessions):
-        dates.append(dt.date(2024, 1, 1 + i))
+    """Build a synthetic Panel with an exactly hand-computable price path.
 
-    n_rows = n_sessions * bars_per_session
-    ts, day_offsets, dates_arr = _session_grid(dates, bars_per_session)
+    Symbol k's close at global row t is
+    ``symbol_base_price[k] * exp(t * symbol_returns[k])``.  The constant
+    per-bar log return makes horizon-one log and forward returns exactly
+    ``symbol_returns[k]`` at every valid non-boundary row.
 
-    # Build close prices with minimal signal
-    rng = np.random.default_rng(123)
-    returns = rng.normal(0.0, 0.001, size=(n_rows, len(symbols)))
-    close = _close_prices_from_log_returns(returns)
+    Session volume is constant across that session and may vary by session.
+    Prices and volumes are stored as float32, matching production storage.
+    """
+    symbol_returns = np.asarray(symbol_returns, dtype=np.float64)
+    symbol_volume = np.asarray(symbol_volume, dtype=np.float64)
+    n_symbols = len(symbols)
+    n_sessions = symbol_volume.shape[0]
+    assert symbol_returns.shape == (n_symbols,)
+    assert symbol_volume.shape == (n_sessions, n_symbols)
 
-    # Replicate volumes for all symbols
-    volume = np.tile(np.array(volumes, dtype=np.float64), (n_rows, 1))
+    if isinstance(symbol_base_price, (int, float)):
+        base_price = np.full(n_symbols, float(symbol_base_price), dtype=np.float64)
+    else:
+        base_price = np.asarray(symbol_base_price, dtype=np.float64)
+    assert base_price.shape == (n_symbols,)
+
+    dates = [start_date + dt.timedelta(days=i) for i in range(n_sessions)]
+    ts, day_offsets, dates_arr = _ist_session_grid(dates, bars_per_session)
+    n_rows = len(ts)
+
+    row_idx = np.arange(n_rows, dtype=np.float64)
+    close = base_price[None, :] * np.exp(np.outer(row_idx, symbol_returns))
+
+    volume = np.empty((n_rows, n_symbols), dtype=np.float64)
+    for s in range(n_sessions):
+        start, end = int(day_offsets[s]), int(day_offsets[s + 1])
+        volume[start:end, :] = symbol_volume[s, :]
 
     return Panel(
-        fields={"close": close.astype(np.float32), "volume": volume.astype(np.float32)},
+        fields={
+            "close": close.astype(np.float32),
+            "volume": volume.astype(np.float32),
+        },
         symbols=symbols,
         ts=ts,
         day_offsets=day_offsets,
@@ -130,508 +131,740 @@ def _build_simple_panel(
     )
 
 
-# ============================================================================
-# Test 1: Units regression guard
-# ============================================================================
-
-def test_criterion4_units_rupee_turnover_same_decile() -> None:
-    """Test 1: Two symbols with equal rupee turnover but opposite share counts
-    must land in the SAME liquidity decile.
-
-    This is the guard that would have caught the share-count vs rupee-turnover bug.
-    Currently should FAIL (they land at opposite ends with share-count bucketing).
-    After fix should PASS (both in same decile with rupee-turnover bucketing).
+def _reference_liquidity_decile_tables(
+    panel: Panel,
+    feature_values: np.ndarray,
+    day_offsets: np.ndarray,
+    prior_adv: np.ndarray,
+    *,
+    horizon: int = 1,
+    n_liquidity_buckets: int = 10,
+    n_feature_buckets: int = 5,
+) -> dict[int, expectancy.ExpectancyTable]:
+    """Correct-by-construction ORACLE for the 10-liquidity x 5-feature geometry, built
+    ONLY from already-trusted `nifty_quant.research.expectancy` primitives (never from
+    `Lens`) -- this is exactly the "keep the decile loop, call causal_buckets +
+    conditional_expectancy directly" option the spec allows as an alternative to extending
+    `expectancy_by_liquidity_decile` (which cannot express 10x5, since it feeds one
+    `n_buckets` to both the ADV and feature dimensions).
     """
-    # Build panel with 2 symbols: one HIGH price/LOW volume, one LOW price/HIGH volume
-    dates = [dt.date(2024, 1, i) for i in range(1, 6)]
-    n_sessions = len(dates)
-    bars_per_session = 30
+    close = panel.field("close").astype(np.float64)
+    fwd = expectancy.forward_returns(close, day_offsets, horizon)
+    adv_bucketing = expectancy.causal_buckets(
+        prior_adv, day_offsets, n_buckets=n_liquidity_buckets, method="cross_sectional_rank"
+    )
+    tables: dict[int, expectancy.ExpectancyTable] = {}
+    for decile in range(n_liquidity_buckets):
+        mask = adv_bucketing.labels == decile
+        if not np.any(mask):
+            continue
+        feat_masked = np.where(mask, feature_values, np.nan)
+        fwd_masked = np.where(mask, fwd.values, np.nan)
+        n_defined = int(np.sum(np.any(np.isfinite(fwd_masked), axis=1)))
+        fwd_obj = expectancy.ForwardReturns(
+            values=fwd_masked,
+            horizon=horizon,
+            session_bounded=True,
+            n_defined=n_defined,
+            n_nan_tail=int(np.sum(~np.isfinite(fwd_masked))),
+        )
+        tables[decile] = expectancy.conditional_expectancy(
+            feat_masked,
+            fwd_obj,
+            day_offsets,
+            n_buckets=n_feature_buckets,
+            method="cross_sectional_rank",
+            feature_name="reference_feature",
+        )
+    return tables
 
-    ts, day_offsets, dates_arr = _session_grid(dates, bars_per_session)
 
-    # Symbol 0: high price (Rs 50000), low share volume (1 share)
-    # Symbol 1: low price (Rs 1), high share volume (50000 shares)
-    # Both: rupee turnover = Rs 50000 per bar
+def _reference_prior_adv(
+    close: np.ndarray, volume: np.ndarray, day_offsets: np.ndarray
+) -> np.ndarray:
+    """Independent, hand-written reference implementation of the `prior_adv` formula
+    (nifty_quant/data/validate.py:727-738's existing ADV convention, reused here as-is,
+    NOT re-derived differently): per-session TOTAL rupee turnover via `nansum`, then a
+    trailing 20-session STRICTLY PRIOR `nanmean`, session 0 NaN, bar-level broadcast to
+    shape (n_rows, n_symbols). Used in test bodies as the independent "expected" oracle
+    to compare against `compute_prior_adv` (the assumed real implementation, fetched via
+    `_require_attr`) -- NOT the same code path, so the comparison is non-tautological.
+    """
+    close = np.asarray(close, dtype=np.float64)
+    volume = np.asarray(volume, dtype=np.float64)
+    day_offsets = np.asarray(day_offsets, dtype=np.int64)
+    n_rows = close.shape[0]
+    n_symbols = close.shape[1]
+    n_sessions = len(day_offsets) - 1
 
-    n_rows = n_sessions * bars_per_session
+    day_value = np.full((n_sessions, n_symbols), np.nan, dtype=np.float64)
+    adv = np.full((n_sessions, n_symbols), np.nan, dtype=np.float64)
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore", RuntimeWarning)
+        for s in range(n_sessions):
+            start, end = int(day_offsets[s]), int(day_offsets[s + 1])
+            day_value[s, :] = np.nansum(close[start:end] * volume[start:end], axis=0)
 
-    # Create close prices: S0=50000, S1=1
-    close_s0 = np.full((n_rows, 1), 50000.0, dtype=np.float64)
-    close_s1 = np.full((n_rows, 1), 1.0, dtype=np.float64)
-    close = np.hstack([close_s0, close_s1]).astype(np.float32)
+        for s in range(1, n_sessions):
+            lookback_start = max(0, s - 20)
+            adv[s, :] = np.nanmean(day_value[lookback_start:s, :], axis=0)
 
-    # Create volumes: S0=1 share, S1=50000 shares (equal rupee turnover)
-    volume_s0 = np.full((n_rows, 1), 1.0, dtype=np.float64)
-    volume_s1 = np.full((n_rows, 1), 50000.0, dtype=np.float64)
-    volume = np.hstack([volume_s0, volume_s1]).astype(np.float32)
+    out = np.full((n_rows, n_symbols), np.nan, dtype=np.float64)
+    for s in range(n_sessions):
+        start, end = int(day_offsets[s]), int(day_offsets[s + 1])
+        out[start:end, :] = adv[s, :]
+    return out
 
-    panel = Panel(
-        fields={"close": close, "volume": volume},
-        symbols=("high_price_low_volume", "low_price_high_volume"),
-        ts=ts,
-        day_offsets=day_offsets,
-        dates=dates_arr,
+
+def test_units_guard_equal_turnover_lands_in_same_decile() -> None:
+    # B's price/volume were originally (1.0, 1_000_000.0): equal turnover to A, but
+    # ALSO an accidentally-similar RAW SHARE VOLUME to the near-fillers (~1e6), so the
+    # current buggy (share-volume) bucketing put B in the bottom decile too, by
+    # coincidence -- discovered by running this fixture against unfixed src/, per the
+    # task's validation step, not by re-deriving it on paper. B's price is now driven
+    # far lower (0.001) so its RAW SHARE VOLUME (turnover/price = 1e9) sits far ABOVE
+    # every general filler's share volume, landing B at the OPPOSITE end under
+    # share-volume bucketing while its rupee turnover is still exactly equal to A's.
+    symbols = tuple(f"S{i:02d}" for i in range(52))
+
+    symbol_base_price = np.full(52, 10.0, dtype=np.float64)
+    symbol_base_price[0] = 100_000.0
+    symbol_base_price[1] = 0.001
+
+    symbol_volume_by_symbol = np.empty(52, dtype=np.float64)
+    symbol_volume_by_symbol[0] = 10.0
+    symbol_volume_by_symbol[1] = 1_000_000_000.0
+    symbol_volume_by_symbol[2:6] = np.array(
+        [1_000_000.0 + 1000.0 * (i - 2) for i in range(2, 6)],
+        dtype=np.float64,
+    )
+    symbol_volume_by_symbol[6:] = np.linspace(5_000_000.0, 100_000_000.0, 46)
+    symbol_volume = np.tile(symbol_volume_by_symbol, (20, 1))
+
+    symbol_returns = np.zeros(52, dtype=np.float64)
+    symbol_returns[0] = -0.0008
+    symbol_returns[1] = 0.0008
+
+    panel = _panel_from_symbol_series(
+        symbols,
+        symbol_returns,
+        symbol_volume,
+        15,
+        symbol_base_price=symbol_base_price,
     )
 
-    lens = Lens(panel)
+    lens_obj = Lens(panel)
+    feature = lens_obj.feature("return_1")
+    close = panel.field("close").astype(np.float64)
+    volume = panel.field("volume").astype(np.float64)
+    prior_adv_correct = _reference_prior_adv(close, volume, panel.day_offsets)
+    reference = _reference_liquidity_decile_tables(
+        panel,
+        feature.values,
+        panel.day_offsets,
+        prior_adv_correct,
+        horizon=1,
+    )
+    actual = lens_obj.stability(feature, horizon=1).by_liquidity_decile
 
-    # Use built-in return_1 feature for stability analysis
-    stab = lens.stability(lens.feature("return_1"), horizon=1)
-
-    # Under correct (rupee-turnover) bucketing, both symbols should appear
-    # in similar liquidity deciles. Under share-count bucketing, they diverge.
-    # Verify that the liquidity bucketing exists and has sensible structure
-    assert len(stab.by_liquidity_decile) > 0, "Should have liquidity deciles"
-
-    # The key assertion: if using rupee turnover correctly, both symbols
-    # should have similar distributions across deciles (not be at opposite ends)
-    # This is a softer test since we can't directly inspect bucketing without
-    # accessing internal stability_report details
-    decile_spreads = [t.spread_bps for t in stab.by_liquidity_decile.values()]
-    assert len(decile_spreads) > 0, "Should have computed spreads for at least one decile"
-
-
-# ============================================================================
-# Test 2: Causality guard
-# ============================================================================
-
-def test_criterion4_causality_prior_vs_full_sample() -> None:
-    """Test 2: A symbol with tiny turnover early and huge late must bucket
-    by its STRICTLY PRIOR turnover, not full-sample rank.
-
-    This is the guard that would have caught the full-sample lookahead bug.
-    Currently should FAIL (full-sample quantile looks ahead).
-    After fix should PASS (strictly-prior quantile is used).
-    """
-    # Build 4 sessions; symbol 0 has tiny volume in sessions 0-2, huge in session 3
-    dates = [dt.date(2024, 1, i) for i in range(1, 5)]
-    bars_per_session = 20
-    ts, day_offsets, dates_arr = _session_grid(dates, bars_per_session)
-
-    n_rows = 4 * bars_per_session
-
-    # Both symbols start with same close price
-    close = np.full((n_rows, 2), 100.0, dtype=np.float64)
-
-    # Volume profile: symbol 0 has tiny early, huge late
-    volume_s0 = np.concatenate([
-        np.full((3 * bars_per_session,), 10.0, dtype=np.float64),  # Sessions 0-2: tiny
-        np.full((1 * bars_per_session,), 10000.0, dtype=np.float64),  # Session 3: huge
-    ])
-    # Symbol 1: constant volume
-    volume_s1 = np.full((n_rows,), 100.0, dtype=np.float64)
-
-    volume = np.column_stack([volume_s0, volume_s1]).astype(np.float32)
-
-    panel = Panel(
-        fields={"close": close.astype(np.float32), "volume": volume},
-        symbols=("tiny_early_huge_late", "constant"),
-        ts=ts,
-        day_offsets=day_offsets,
-        dates=dates_arr,
+    assert 0 in reference
+    assert np.isfinite(reference[0].spread_bps)
+    assert abs(reference[0].spread_bps) > 5.0
+    assert 0 in actual
+    # This must FAIL against the current (unfixed) lens.py, which buckets by raw share
+    # volume via a full-sample np.quantile instead of rupee turnover via strictly-prior
+    # cross_sectional_rank—an entirely different partition of symbols into deciles.
+    assert np.isclose(
+        actual[0].spread_bps,
+        reference[0].spread_bps,
+        rtol=1e-6,
+        atol=1e-6,
     )
 
-    lens = Lens(panel)
 
-    # Use built-in return_1 feature
-    stab = lens.stability(lens.feature("return_1"), horizon=1)
+def test_causality_guard_strictly_prior_wins_over_full_sample() -> None:
+    # Design note (found by running this fixture, not by hand-derivation alone):
+    # giving T a CONSTANT per-bar return for its whole life cannot discriminate causal
+    # from non-causal bucketing on its own -- conditional_expectancy's bucket MEAN is
+    # unaffected by *how many* of T's rows land in a bucket, only by T's (constant)
+    # VALUE while present. The volume jump is also 20,000x (10 -> 1e6), so the trailing
+    # 20-session average is swamped within ONE session of the jump entering the
+    # window -- there is no multi-session "lag" to exploit here, only the ONE session
+    # (session 10 itself) that `prior_adv[10]` provably excludes by construction
+    # (spec item 4). So the signal is placed ONLY on session 10's bars: T is flat
+    # (return 0.0) everywhere else. Verified empirically: under strictly-prior/causal
+    # bucketing, T is still bottom-decile AT session 10 (prior_adv[10] reflects only
+    # its 10 prior tiny-volume sessions), so decile 0 captures T's session-10 spike;
+    # under the current buggy bucketing (raw share volume, reacts to the value in that
+    # very row), T's session-10 volume is ALREADY the post-jump value, so it is
+    # excluded from the bottom decile at that row and the spike is invisible there.
+    symbols = tuple(f"T{i:02d}" for i in range(55))
+    n_sessions = 30
+    bars_per_session = 15
+    jump_session = 10
+    spike_return = 0.05
 
-    # The key: after fix, symbol 0 should bucket by sessions 0-2 only (tiny),
-    # not by full-sample which includes session 3 (huge).
-    # This means symbol 0 should appear in low-liquidity deciles.
+    symbol_base_price = np.full(55, 10.0, dtype=np.float64)
+    symbol_base_price[0] = 100.0
 
-    # Verify that the bucketing changed based on causality fix
-    # (This is less direct than test 1, but guards against lookahead)
-    assert len(stab.by_liquidity_decile) > 0, "Should have liquidity deciles"
+    symbol_returns = np.zeros(55, dtype=np.float64)  # T's spike is injected below
 
+    symbol_volume = np.empty((n_sessions, 55), dtype=np.float64)
+    symbol_volume[:jump_session, 0] = 50.0  # tiny, below the anchors (500)
+    symbol_volume[jump_session:, 0] = 1_000_000.0  # huge, post-jump
+    symbol_volume[:, 1:6] = 500.0  # 5 anchors: always near the bottom decile
+    symbol_volume[:, 6:] = np.linspace(50_000.0, 2_000_000.0, 49)
 
-# ============================================================================
-# Test 3: Session 0 has no prior turnover -> NaN
-# ============================================================================
-
-def test_criterion4_session0_unbucketed() -> None:
-    """Test 3: Session 0 has no prior turnover -> prior_adv is NaN -> cells unbucketed.
-
-    Not through the verdict, but directly on the computed prior_adv array.
-    """
-    dates = [dt.date(2024, 1, i) for i in range(1, 4)]
-    bars_per_session = 20
-    n_sessions = len(dates)
-
-    ts, day_offsets, dates_arr = _session_grid(dates, bars_per_session)
-    n_rows = n_sessions * bars_per_session
-
-    close = np.full((n_rows, 2), 100.0, dtype=np.float64)
-    volume = np.tile(np.array([1e3, 1e4], dtype=np.float64), (n_rows, 1))
-
-    panel = Panel(
-        fields={"close": close.astype(np.float32), "volume": volume},
-        symbols=("S0", "S1"),
-        ts=ts,
-        day_offsets=day_offsets,
-        dates=dates_arr,
+    panel = _panel_from_symbol_series(
+        symbols,
+        symbol_returns,
+        symbol_volume,
+        bars_per_session,
+        symbol_base_price=symbol_base_price,
     )
 
-    # Compute rupee turnover and prior_adv manually (as the fixed implementation would)
-    volume64 = panel.field("volume").astype(np.float64)
+    # Inject a constant spike_return log-return into T's (column 0) session-10 bars
+    # only, by rebuilding that session's close sub-path from its own starting value.
+    # T's other sessions, and every other symbol, are untouched (flat, return 0.0).
+    close = panel.field("close").copy()
+    start10 = int(panel.day_offsets[jump_session])
+    end10 = int(panel.day_offsets[jump_session + 1])
+    n_bars10 = end10 - start10
+    base_val = float(close[start10, 0])
+    close[start10:end10, 0] = base_val * np.exp(
+        spike_return * np.arange(n_bars10, dtype=np.float64)
+    ).astype(np.float32)
+    panel = Panel(
+        fields={"close": close, "volume": panel.field("volume")},
+        symbols=panel.symbols,
+        ts=panel.ts,
+        day_offsets=panel.day_offsets,
+        dates=panel.dates,
+    )
+
+    lens_obj = Lens(panel)
+    feature = lens_obj.feature("return_1")
     close64 = panel.field("close").astype(np.float64)
-    rupee_turnover = close64 * volume64
-
-    # Compute prior_adv: per-symbol mean rupee turnover over STRICTLY PRIOR sessions
-    prior_adv = np.full_like(rupee_turnover, np.nan, dtype=np.float64)
-
-    for s in range(panel.n_symbols()):
-        for day_idx in range(n_sessions):
-            session_start = day_offsets[day_idx]
-            session_end = day_offsets[day_idx + 1]
-
-            if day_idx == 0:
-                # Session 0: no prior history
-                prior_adv[session_start:session_end, s] = np.nan
-            else:
-                # Sessions 1+: mean of sessions [0, day_idx)
-                prior_bars = session_start  # rows from sessions 0..day_idx-1
-                if prior_bars > 0:
-                    mean_turnover = np.nanmean(rupee_turnover[:session_start, s])
-                    prior_adv[session_start:session_end, s] = mean_turnover
-
-    # Assert: session 0 (rows 0..bars_per_session-1) must be NaN
-    assert np.all(np.isnan(prior_adv[:bars_per_session, :])), (
-        "Session 0 should have NaN prior_adv (no prior history)"
-    )
-
-    # Assert: sessions 1+ have finite values
-    assert np.any(np.isfinite(prior_adv[bars_per_session:, :])), (
-        "Sessions 1+ should have finite prior_adv"
-    )
-
-
-# ============================================================================
-# Test 4: prior_adv for session s excludes session s
-# ============================================================================
-
-def test_criterion4_prior_adv_excludes_current_session() -> None:
-    """Test 4: prior_adv for session s excludes session s itself.
-
-    Direct assertion on the computed array for a hand-checkable fixture.
-    """
-    dates = [dt.date(2024, 1, i) for i in range(1, 4)]
-    bars_per_session = 10
-    n_sessions = len(dates)
-
-    ts, day_offsets, dates_arr = _session_grid(dates, bars_per_session)
-    n_rows = n_sessions * bars_per_session
-
-    # Construct: session 0 has volume=1, session 1 has volume=10, session 2 has volume=100
-    # This makes it easy to verify which sessions are included in the prior mean
-    close = np.full((n_rows, 1), 1.0, dtype=np.float64)
-    volume_values = np.concatenate([
-        np.full((bars_per_session,), 1.0),
-        np.full((bars_per_session,), 10.0),
-        np.full((bars_per_session,), 100.0),
-    ])
-    volume = volume_values.reshape(-1, 1)
-
-    panel = Panel(
-        fields={"close": close.astype(np.float32), "volume": volume.astype(np.float32)},
-        symbols=("S0",),
-        ts=ts,
-        day_offsets=day_offsets,
-        dates=dates_arr,
-    )
-
     volume64 = panel.field("volume").astype(np.float64)
-    close64 = panel.field("close").astype(np.float64)
-    rupee_turnover = close64 * volume64
+    prior_adv_correct = _reference_prior_adv(close64, volume64, panel.day_offsets)
+    reference = _reference_liquidity_decile_tables(
+        panel,
+        feature.values,
+        panel.day_offsets,
+        prior_adv_correct,
+        horizon=1,
+    )
+    actual = lens_obj.stability(feature, horizon=1).by_liquidity_decile
 
-    # Compute prior_adv
-    prior_adv = np.full_like(rupee_turnover, np.nan, dtype=np.float64)
-    for day_idx in range(n_sessions):
-        session_start = day_offsets[day_idx]
-        session_end = day_offsets[day_idx + 1]
+    assert 0 in reference
+    assert np.isfinite(reference[0].spread_bps)
+    assert abs(reference[0].spread_bps) > 100.0
+    assert 0 in actual
+    # This must FAIL against the current (unfixed) lens.py: measured, it reports
+    # by_liquidity_decile[0].spread_bps == 0.0 (T's session-10 spike is invisible to
+    # it), while the reference/causal construction reports ~500 bps -- see the design
+    # note above and the task's validation step.
+    assert np.isclose(
+        actual[0].spread_bps,
+        reference[0].spread_bps,
+        rtol=1e-6,
+        atol=1e-6,
+    )
 
-        if day_idx == 0:
-            prior_adv[session_start:session_end, 0] = np.nan
+
+def test_prior_adv_session_zero_is_nan() -> None:
+    symbols = tuple(f"P{i}" for i in range(6))
+    symbol_volume = np.array(
+        [
+            [100.0, 200.0, 300.0, 400.0, 500.0, 600.0],
+            [110.0, 210.0, 310.0, 410.0, 510.0, 610.0],
+            [120.0, 220.0, 320.0, 420.0, 520.0, 620.0],
+        ]
+    )
+    panel = _panel_from_symbol_series(
+        symbols,
+        np.zeros(6),
+        symbol_volume,
+        bars_per_session=4,
+        symbol_base_price=10.0,
+    )
+    compute_prior_adv = _require_attr(
+        lens_module,
+        "compute_prior_adv",
+        "prior_adv session-0 NaN (spec item 3)",
+    )
+    prior_adv = compute_prior_adv(panel)
+
+    assert bool(
+        np.all(
+            np.isnan(
+                prior_adv[
+                    panel.day_offsets[0] : panel.day_offsets[1],
+                    :,
+                ]
+            )
+        )
+    )
+    assert bool(
+        np.any(
+            np.isfinite(
+                prior_adv[
+                    panel.day_offsets[1] : panel.day_offsets[2],
+                    :,
+                ]
+            )
+        )
+    )
+
+
+def test_prior_adv_excludes_own_session() -> None:
+    symbols = ("Q0", "Q1")
+    symbol_volume = np.array(
+        [
+            [100.0, 200.0],
+            [300.0, 400.0],
+            [10_000_000.0, 20_000_000.0],
+        ]
+    )
+    panel = _panel_from_symbol_series(
+        symbols,
+        np.zeros(2),
+        symbol_volume,
+        bars_per_session=3,
+        symbol_base_price=1.0,
+    )
+    close = panel.field("close").astype(np.float64)
+    volume = panel.field("volume").astype(np.float64)
+    expected_prior_adv = _reference_prior_adv(
+        close,
+        volume,
+        panel.day_offsets,
+    )
+    compute_prior_adv = _require_attr(
+        lens_module,
+        "compute_prior_adv",
+        "prior_adv excludes own session (spec item 4)",
+    )
+    actual_prior_adv = compute_prior_adv(panel)
+
+    start2 = int(panel.day_offsets[2])
+    assert bool(np.all(expected_prior_adv[start2, :] < 1000.0))
+    np.testing.assert_allclose(
+        actual_prior_adv,
+        expected_prior_adv,
+        equal_nan=True,
+    )
+    assert bool(np.all(actual_prior_adv[start2, :] < 1000.0))
+
+
+def test_prior_adv_irregular_sessions_no_fixed_stride() -> None:
+    symbols = ("R0", "R1", "R2")
+    symbol_volume = np.array(
+        [
+            [100.0, 150.0, 200.0],
+            [110.0, 160.0, 210.0],
+            [120.0, 170.0, 220.0],
+        ]
+    )
+    panel = _panel_from_symbol_series(
+        symbols,
+        np.zeros(3),
+        symbol_volume,
+        bars_per_session=[375, 60, 105],
+        symbol_base_price=1.0,
+    )
+    close = panel.field("close").astype(np.float64)
+    volume = panel.field("volume").astype(np.float64)
+    expected_prior_adv = _reference_prior_adv(
+        close,
+        volume,
+        panel.day_offsets,
+    )
+    compute_prior_adv = _require_attr(
+        lens_module,
+        "compute_prior_adv",
+        "prior_adv irregular sessions (spec item 5)",
+    )
+    actual_prior_adv = compute_prior_adv(panel)
+
+    np.testing.assert_allclose(
+        actual_prior_adv,
+        expected_prior_adv,
+        equal_nan=True,
+    )
+
+    start, end = int(panel.day_offsets[2]), int(panel.day_offsets[3])
+    column = actual_prior_adv[start:end, 0]
+    finite_vals = column[np.isfinite(column)]
+    assert finite_vals.size > 0
+    assert bool(np.all(finite_vals == finite_vals[0]))
+
+    start, end = int(panel.day_offsets[1]), int(panel.day_offsets[2])
+    column = actual_prior_adv[start:end, 1]
+    finite_vals = column[np.isfinite(column)]
+    assert finite_vals.size > 0
+    assert bool(np.all(finite_vals == finite_vals[0]))
+
+    lens_obj = Lens(panel)
+    report = lens_obj.stability(lens_obj.feature("return_1"), horizon=1)
+    assert report is not None
+
+
+def test_prior_adv_nan_propagates_never_filled() -> None:
+    symbols = tuple(f"N{i}" for i in range(6))
+    symbol_volume = np.tile(
+        np.array([100.0, 200.0, 300.0, 400.0, 500.0, 600.0]),
+        (4, 1),
+    ) * (1.0 + 0.05 * np.arange(4))[:, None]
+    panel = _panel_from_symbol_series(
+        symbols,
+        np.zeros(6),
+        symbol_volume,
+        bars_per_session=5,
+        symbol_base_price=1.0,
+    )
+
+    close0 = panel.field("close").copy()
+    volume0 = panel.field("volume").copy()
+    baseline_close = panel.field("close").astype(np.float64)
+    baseline_volume = panel.field("volume").astype(np.float64)
+    target_row = int(panel.day_offsets[1])
+    close0[target_row, 2] = np.nan
+    volume0[target_row, 2] = np.nan
+    mutated_panel = Panel(
+        fields={"close": close0, "volume": volume0},
+        symbols=panel.symbols,
+        ts=panel.ts,
+        day_offsets=panel.day_offsets,
+        dates=panel.dates,
+    )
+
+    start1, end1 = int(panel.day_offsets[1]), int(panel.day_offsets[2])
+    baseline_day_value = np.nansum(
+        baseline_close[start1:end1, 2] * baseline_volume[start1:end1, 2]
+    )
+    mutated_close = mutated_panel.field("close").astype(np.float64)
+    mutated_volume = mutated_panel.field("volume").astype(np.float64)
+    mutated_day_value = np.nansum(
+        mutated_close[start1:end1, 2] * mutated_volume[start1:end1, 2]
+    )
+    removed_bar_contribution = (
+        baseline_close[target_row, 2] * baseline_volume[target_row, 2]
+    )
+
+    assert bool(np.isfinite(mutated_day_value))
+    assert bool(
+        np.isclose(
+            mutated_day_value,
+            baseline_day_value - removed_bar_contribution,
+            rtol=1e-5,
+        )
+    )
+
+    close1 = panel.field("close").copy()
+    volume1 = panel.field("volume").copy()
+    start0, end0 = int(panel.day_offsets[0]), int(panel.day_offsets[1])
+    close1[start0:end0, 4] = np.nan
+    volume1[start0:end0, 4] = np.nan
+    mutated_panel_b = Panel(
+        fields={"close": close1, "volume": volume1},
+        symbols=panel.symbols,
+        ts=panel.ts,
+        day_offsets=panel.day_offsets,
+        dates=panel.dates,
+    )
+    compute_prior_adv = _require_attr(
+        lens_module,
+        "compute_prior_adv",
+        "prior_adv NaN propagation (spec item 6)",
+    )
+    prior_adv_b = compute_prior_adv(mutated_panel_b)
+
+    # An ENTIRELY-ABSENT session must yield NaN, not 0.0.
+    #
+    # `np.nansum` over an all-NaN slice returns 0.0, and this assertion originally
+    # pinned that raw numpy behaviour. The spec was amended (commit 42ba072) to FORBID
+    # it: a symbol that did not trade at all on a session is not a zero-turnover name.
+    # Recording it as 0.0 would rank it as maximally illiquid and drop it into decile 0
+    # -- the exact decile whose spread decides criterion 4, and therefore H2 -- instead
+    # of excluding it. That is a rule-6 violation: NaN means "no bar", never zero.
+    #
+    # Note `validate.py`'s `tradable_mask` DOES use a bare nansum, deliberately and
+    # correctly for its own purpose (absent -> 0 ADV -> not tradable). The two uses
+    # legitimately differ; they must not be "harmonised".
+    #
+    # Corrected by the lead as spec author, NOT by an implementer making a test pass:
+    # the contract changed after this suite was authored. Symbol 4's only session in the
+    # trailing window is entirely absent, so its prior_adv is undefined, not zero.
+    assert bool(np.isnan(prior_adv_b[start1, 4]))
+    assert bool(np.isfinite(prior_adv_b[start1, 3]))
+
+
+def test_method_cross_sectional_rank_produces_nonzero_spread() -> None:
+    # N=50 (not 55): with 10 causal_buckets deciles, cross_sectional_rank's percentile-
+    # rank edges land EXACTLY on multiples of 5 only when N=50 (verified empirically:
+    # decile sizes are precisely [5]*10). At N=55 the 6th-lowest-turnover symbol (a
+    # flat filler, return 0.0) leaks into decile 0 alongside the 5 signal members and
+    # ties with the signal member whose return is also 0.0, corrupting the exact
+    # bucket-edge arithmetic this test relies on -- discovered by running this fixture,
+    # not by re-deriving the edge formula on paper, per the task's validation step.
+    symbols = tuple(f"M{i:02d}" for i in range(50))
+    symbol_returns = np.concatenate(
+        [np.linspace(-0.01, 0.01, 5), np.zeros(45, dtype=float)]
+    )
+    symbol_volume = np.tile(
+        np.concatenate(
+            [
+                np.full(5, 1000.0),
+                np.linspace(50_000.0, 5_000_000.0, 45),
+            ]
+        ),
+        (15, 1),
+    )
+    symbol_base_price = np.full(50, 10.0)
+
+    panel = _panel_from_symbol_series(
+        symbols,
+        symbol_returns,
+        symbol_volume,
+        bars_per_session=10,
+        symbol_base_price=symbol_base_price,
+    )
+    lens_obj = Lens(panel)
+    feature = lens_obj.feature("return_1")
+    actual = lens_obj.stability(feature, horizon=1).by_liquidity_decile
+
+    assert 0 in actual
+    assert np.isfinite(actual[0].spread_bps)
+    assert actual[0].spread_bps != 0.0
+    expected_spread_bps = (0.01 - (-0.01)) * 1e4
+    assert np.isclose(
+        actual[0].spread_bps,
+        expected_spread_bps,
+        rtol=1e-6,
+        atol=1e-6,
+    )
+
+
+def test_criterion4_fires_when_ratio_exceeds_threshold_and_bottom_is_argmax() -> None:
+    threshold_for_fixture = _require_attr(
+        lens_module,
+        "CONCENTRATION_RATIO_THRESHOLD",
+        "criterion-4 firing threshold must be a named module constant (spec item 5)",
+    )
+    symbols = tuple(f"K{i:02d}" for i in range(50))
+    spread_targets = {
+        # ratio = spread_targets[0] / m_bps(=5.0) must exceed `threshold`; multiplying
+        # by 5.0 here (not just `threshold * 4.0`) is what actually encodes that ratio
+        # -- an earlier draft omitted this and produced ratio=1.6 < threshold=2.0,
+        # found by running the fixture, not by re-deriving the ratio algebra on paper.
+        0: 5.0 * threshold_for_fixture * 4.0,
+        4: 5.0,
+        8: 5.0,
+    }
+    return_parts = []
+    volume_parts = []
+    for tier in range(10):
+        count = 5  # N=50: 10 tiers x 5 -> clean decile boundaries (verified empirically)
+        if tier in spread_targets:
+            half = spread_targets[tier] / 2.0 / 1e4
+            return_parts.append(np.linspace(-half, half, count))
         else:
-            # Mean of STRICTLY PRIOR sessions (0..day_idx-1)
-            mean_val = np.nanmean(rupee_turnover[:session_start, 0])
-            prior_adv[session_start:session_end, 0] = mean_val
+            return_parts.append(np.zeros(count, dtype=float))
+        volume_parts.append(np.full(count, 10.0 ** (tier + 1)))
 
-    # Verify:
-    # Session 0: NaN (no prior)
-    assert np.all(np.isnan(prior_adv[:bars_per_session, 0]))
+    symbol_returns = np.concatenate(return_parts)
+    symbol_volume = np.tile(np.concatenate(volume_parts), (3, 1))
+    symbol_base_price = np.full(50, 1.0)
 
-    # Session 1: should be ~1.0 (mean of session 0 only, which has volume 1)
-    session1_prior = prior_adv[bars_per_session:2*bars_per_session, 0]
-    assert np.all(np.isfinite(session1_prior))
-    assert np.allclose(session1_prior, 1.0), f"Expected ~1.0, got {session1_prior[0]}"
-
-    # Session 2: should be ~5.5 (mean of sessions 0-1: (1+10)/2 = 5.5)
-    session2_prior = prior_adv[2*bars_per_session:3*bars_per_session, 0]
-    assert np.all(np.isfinite(session2_prior))
-    assert np.allclose(session2_prior, 5.5), f"Expected ~5.5, got {session2_prior[0]}"
-
-
-# ============================================================================
-# Test 5: Irregular-session panel buckets correctly
-# ============================================================================
-
-def test_criterion4_irregular_sessions_bucket_correctly() -> None:
-    """Test 5: An irregular-session panel (~60-bar Muhurat alongside full session)
-    buckets correctly; nothing assumes fixed bars-per-session stride.
-    """
-    panel = _build_panel_with_irregular_sessions()
-
-    lens = Lens(panel)
-
-    # Use built-in return_1 feature
-    stab = lens.stability(lens.feature("return_1"), horizon=1)
-
-    # Should successfully compute stability without crashing on irregular session sizes
-    assert len(stab.by_liquidity_decile) > 0
-
-
-# ============================================================================
-# Test 6: NaN turnover propagates, never forward-filled
-# ============================================================================
-
-def test_criterion4_nan_propagates_no_fill() -> None:
-    """Test 6: NaN turnover (no bar) propagates and is never forward-filled or
-    treated as zero.
-    """
-    dates = [dt.date(2024, 1, i) for i in range(1, 4)]
-    bars_per_session = 20
-    n_sessions = len(dates)
-
-    ts, day_offsets, dates_arr = _session_grid(dates, bars_per_session)
-    n_rows = n_sessions * bars_per_session
-
-    close = np.full((n_rows, 2), 100.0, dtype=np.float64)
-
-    # Symbol 0: has NaN values in bars 5-9 and 25-29
-    volume_s0 = np.full((n_rows,), 1e3, dtype=np.float64)
-    volume_s0[5:10] = np.nan
-    volume_s0[25:30] = np.nan
-
-    volume_s1 = np.full((n_rows,), 1e4, dtype=np.float64)
-    volume = np.column_stack([volume_s0, volume_s1]).astype(np.float32)
-
-    panel = Panel(
-        fields={"close": close.astype(np.float32), "volume": volume},
-        symbols=("S0_with_nans", "S1_clean"),
-        ts=ts,
-        day_offsets=day_offsets,
-        dates=dates_arr,
+    panel = _panel_from_symbol_series(
+        symbols,
+        symbol_returns,
+        symbol_volume,
+        bars_per_session=76,  # 75 "open" bars (555-629) + 1 "mid" bar (630): >= 2
+        # by_time_of_day buckets get populated, avoiding criterion 4's UNRELATED
+        # single-time-of-day-bucket auto-FAIL branch, which would otherwise mask
+        # the liquidity-decile behavior this test targets.
+        symbol_base_price=symbol_base_price,
+    )
+    lens_obj = Lens(panel)
+    feature = lens_obj.feature("return_1")
+    threshold = _require_attr(
+        lens_module,
+        "CONCENTRATION_RATIO_THRESHOLD",
+        "criterion-4 firing threshold must be a named module constant (spec item 5)",
+    )
+    assert threshold > 1.0
+    verdict = lens_obj.verdict(
+        "H_c4",
+        feature,
+        1,
+        latency_profile=None,
+        effective_n_trials=1,
+        method="cross_sectional_rank",
+        n_buckets=5,
+        n_boot=10,
     )
 
-    # Compute rupee turnover
-    volume64 = panel.field("volume").astype(np.float64)
-    close64 = panel.field("close").astype(np.float64)
-    rupee_turnover = close64 * volume64
-
-    # Assert: NaN in volume produces NaN in turnover
-    assert np.all(np.isnan(rupee_turnover[5:10, 0])), "NaN volume should produce NaN turnover"
-    assert np.all(np.isnan(rupee_turnover[25:30, 0])), "NaN volume should produce NaN turnover"
-
-    # Assert: finite bars remain finite
-    assert np.all(np.isfinite(rupee_turnover[0:5, 0])), "Finite bars should stay finite"
-    assert np.all(np.isfinite(rupee_turnover[10:25, 0])), "Finite bars should stay finite"
+    assert verdict.reasons[3].startswith("4.")
+    assert "FAIL" in verdict.reasons[3]
+    assert "concentrated in bottom liquidity decile" in verdict.reasons[3]
 
 
-# ============================================================================
-# Test 7: method="cross_sectional_rank" produces NON-ZERO spreads
-# ============================================================================
+def test_criterion4_does_not_fire_when_ratio_below_threshold() -> None:
+    threshold_for_fixture = _require_attr(
+        lens_module,
+        "CONCENTRATION_RATIO_THRESHOLD",
+        "criterion-4 firing threshold must be a named module constant (spec item 5)",
+    )
+    ratio_below = 1.0 + (threshold_for_fixture - 1.0) * 0.5
+    symbols = tuple(f"K{i:02d}" for i in range(50))
+    spread_targets = {
+        0: 5.0 * ratio_below,
+        4: 5.0,
+        8: 5.0,
+    }
+    return_parts = []
+    volume_parts = []
+    for tier in range(10):
+        count = 5  # N=50: 10 tiers x 5 -> clean decile boundaries (verified empirically)
+        if tier in spread_targets:
+            half = spread_targets[tier] / 2.0 / 1e4
+            return_parts.append(np.linspace(-half, half, count))
+        else:
+            return_parts.append(np.zeros(count, dtype=float))
+        volume_parts.append(np.full(count, 10.0 ** (tier + 1)))
 
-def test_criterion4_cross_sectional_rank_nonzero_spreads() -> None:
-    """Test 7: method="cross_sectional_rank" is actually used. A once-per-session
-    signal must produce NON-ZERO decile spreads. A suite that passes against ten
-    silent 0.0 spreads has tested nothing.
+    symbol_returns = np.concatenate(return_parts)
+    symbol_volume = np.tile(np.concatenate(volume_parts), (3, 1))
+    symbol_base_price = np.full(50, 1.0)
 
-    To trap the expanding_quantile default, we use volume_zscore which is a ratio
-    feature that's computed per-symbol and should show variation by liquidity decile.
-    """
-    # Build a panel with varied volumes across symbols to generate variation
-    dates = [dt.date(2024, 1, i) for i in range(1, 16)]  # 15 sessions for stability
-    bars_per_session = 40
-    n_sessions = len(dates)
-
-    ts, day_offsets, dates_arr = _session_grid(dates, bars_per_session)
-    n_rows = n_sessions * bars_per_session
-
-    # Build close prices
-    rng = np.random.default_rng(777)
-    log_returns = rng.normal(-0.0001, 0.01, size=(n_rows, 3))
-    cum_returns = np.cumsum(log_returns, axis=0)
-    close = np.exp(cum_returns).astype(np.float32)
-
-    # Create varied volume patterns per symbol: S0 low, S1 medium, S2 high
-    # This should show up in liquidity-based bucketing
-    rng2 = np.random.default_rng(888)
-    volume_s0 = rng2.uniform(100, 500, size=(n_rows,))
-    volume_s1 = rng2.uniform(1000, 5000, size=(n_rows,))
-    volume_s2 = rng2.uniform(5000, 50000, size=(n_rows,))
-
-    volume = np.column_stack([volume_s0, volume_s1, volume_s2]).astype(np.float32)
-
-    panel = Panel(
-        fields={"close": close, "volume": volume},
-        symbols=("S0_low_vol", "S1_med_vol", "S2_high_vol"),
-        ts=ts,
-        day_offsets=day_offsets,
-        dates=dates_arr,
+    panel = _panel_from_symbol_series(
+        symbols,
+        symbol_returns,
+        symbol_volume,
+        bars_per_session=76,  # 75 "open" bars (555-629) + 1 "mid" bar (630): >= 2
+        # by_time_of_day buckets get populated, avoiding criterion 4's UNRELATED
+        # single-time-of-day-bucket auto-FAIL branch, which would otherwise mask
+        # the liquidity-decile behavior this test targets.
+        symbol_base_price=symbol_base_price,
+    )
+    lens_obj = Lens(panel)
+    feature = lens_obj.feature("return_1")
+    threshold = _require_attr(
+        lens_module,
+        "CONCENTRATION_RATIO_THRESHOLD",
+        "criterion-4 firing threshold must be a named module constant (spec item 5)",
+    )
+    assert threshold > 1.0
+    verdict = lens_obj.verdict(
+        "H_c4",
+        feature,
+        1,
+        latency_profile=None,
+        effective_n_trials=1,
+        method="cross_sectional_rank",
+        n_buckets=5,
+        n_boot=10,
     )
 
-    lens = Lens(panel)
+    assert verdict.reasons[3].startswith("4.")
+    assert "PASS" in verdict.reasons[3]
 
-    # Use return_1; with cross_sectional_rank bucketing by liquidity,
-    # we should see some decile spreads because symbols have different liquidity profiles
-    stab = lens.stability(lens.feature("return_1"), horizon=1)
 
-    # Assert: we have multiple deciles with data
-    assert len(stab.by_liquidity_decile) >= 2, (
-        "Should have at least 2 liquidity deciles with data for varied volumes"
+def test_criterion4_does_not_fire_when_bottom_is_not_argmax() -> None:
+    threshold_for_fixture = _require_attr(
+        lens_module,
+        "CONCENTRATION_RATIO_THRESHOLD",
+        "criterion-4 firing threshold must be a named module constant (spec item 5)",
+    )
+    symbols = tuple(f"K{i:02d}" for i in range(50))
+    spread_targets = {
+        0: 5.0,
+        4: 5.0 * threshold_for_fixture * 3.0,
+        8: 5.0,
+    }
+    return_parts = []
+    volume_parts = []
+    for tier in range(10):
+        count = 5  # N=50: 10 tiers x 5 -> clean decile boundaries (verified empirically)
+        if tier in spread_targets:
+            half = spread_targets[tier] / 2.0 / 1e4
+            return_parts.append(np.linspace(-half, half, count))
+        else:
+            return_parts.append(np.zeros(count, dtype=float))
+        volume_parts.append(np.full(count, 10.0 ** (tier + 1)))
+
+    symbol_returns = np.concatenate(return_parts)
+    symbol_volume = np.tile(np.concatenate(volume_parts), (3, 1))
+    symbol_base_price = np.full(50, 1.0)
+
+    panel = _panel_from_symbol_series(
+        symbols,
+        symbol_returns,
+        symbol_volume,
+        bars_per_session=76,  # 75 "open" bars (555-629) + 1 "mid" bar (630): >= 2
+        # by_time_of_day buckets get populated, avoiding criterion 4's UNRELATED
+        # single-time-of-day-bucket auto-FAIL branch, which would otherwise mask
+        # the liquidity-decile behavior this test targets.
+        symbol_base_price=symbol_base_price,
+    )
+    lens_obj = Lens(panel)
+    feature = lens_obj.feature("return_1")
+    threshold = _require_attr(
+        lens_module,
+        "CONCENTRATION_RATIO_THRESHOLD",
+        "criterion-4 firing threshold must be a named module constant (spec item 5)",
+    )
+    assert threshold > 1.0
+    verdict = lens_obj.verdict(
+        "H_c4",
+        feature,
+        1,
+        latency_profile=None,
+        effective_n_trials=1,
+        method="cross_sectional_rank",
+        n_buckets=5,
+        n_boot=10,
     )
 
-    # Assert: at least one decile spread is non-zero and finite
-    spreads = [t.spread_bps for t in stab.by_liquidity_decile.values()]
-    nonzero_spreads = [s for s in spreads if s != 0.0 and np.isfinite(s)]
+    assert verdict.reasons[3].startswith("4.")
+    assert "PASS" in verdict.reasons[3]
 
-    # This test catches the expanding_quantile trap: if that method is used instead
-    # of cross_sectional_rank, it will return all 0.0 spreads and fail this assertion.
-    assert len(nonzero_spreads) > 0, (
-        "At least one decile spread must be non-zero and finite. "
-        "If all spreads are 0.0, the method='expanding_quantile' default trap has fired. "
-        "Criterion 4's bucketing must use method='cross_sectional_rank' explicitly."
+
+def test_all_seven_criteria_reported_in_order() -> None:
+    panel = _build_panel(
+        (2024,),
+        sessions_per_year=2,
+        bars_per_session=25,
+        signal_years={2024},
+        effect=0.01,
+        sigma=0.0005,
+    )
+    verdict = _call_verdict(
+        panel,
+        latency_profile=_FAIL_LATENCY,
+        effective_n_trials=1,
     )
 
+    assert len(verdict.reasons) == 7
+    for i, reason in enumerate(verdict.reasons):
+        assert reason.startswith(f"{i + 1}.")
 
-# ============================================================================
-# Test 8: Criterion 4 fires correctly based on threshold
-# ============================================================================
 
-def test_criterion4_fires_on_bottom_argmax_and_ratio() -> None:
-    """Test 8: Criterion 4 fires when:
-    - Bottom decile is the argmax of |spread|, AND
-    - ratio max/median exceeds the module-level CONCENTRATION_THRESHOLD
-
-    Does NOT fire when bottom decile is not argmax, however large the ratio.
-    Does NOT fire when ratio is below threshold.
-    Parameterized on the module constant (not hardcoded 2.0).
-    """
-    # Try to get CONCENTRATION_THRESHOLD from lens module
-    # If it doesn't exist yet in the current code, we'll skip this part
-    try:
-        from nifty_quant.research import lens as lens_module
-        _threshold = lens_module.CONCENTRATION_THRESHOLD
-    except AttributeError:
-        # Constant doesn't exist yet in current code
-        _threshold = 2.0  # Use default for now
-
-    dates = [dt.date(2024, 1, i) for i in range(1, 6)]
-    bars_per_session = 25
-
-    ts, day_offsets, dates_arr = _session_grid(dates, bars_per_session)
-    n_rows = len(dates) * bars_per_session
-
-    close = np.full((n_rows, 3), 100.0, dtype=np.float64)
-    volume = np.tile(np.array([1e3, 1e4, 1e5], dtype=np.float64), (n_rows, 1))
-
-    panel = Panel(
-        fields={"close": close.astype(np.float32), "volume": volume},
-        symbols=("S0", "S1", "S2"),
-        ts=ts,
-        day_offsets=day_offsets,
-        dates=dates_arr,
+def test_verdict_determinism_same_inputs_and_seed() -> None:
+    panel = _all_pass_panel(seed=123)
+    lens_obj = Lens(panel, seed=0)
+    kwargs = dict(
+        latency_profile=_PASS_LATENCY,
+        effective_n_trials=1,
+        method="cross_sectional_rank",
+        n_buckets=5,
+        n_boot=50,
     )
+    first = lens_obj.verdict("H_det", "return_1", 1, **kwargs)
+    second = lens_obj.verdict("H_det", "return_1", 1, **kwargs)
 
-    lens = Lens(panel)
-
-    # Call verdict with return_1 feature
-    verdict = lens.verdict(
-        "H001_test",
-        "return_1",
-        horizon=1,
-        seed=123,
-    )
-
-    # The verdict should contain criterion 4 reasoning
-    c4_line = [r for r in verdict.reasons if r.startswith("4. ")]
-    assert len(c4_line) == 1, "Criterion 4 should be reported"
-
-    # Verify the result is either PASS or FAIL
-    assert "PASS" in c4_line[0] or "FAIL" in c4_line[0], "Criterion 4 should have a result"
-
-
-# ============================================================================
-# Test 9: All SEVEN criteria still reported
-# ============================================================================
-
-def test_criterion4_all_seven_criteria_reported() -> None:
-    """Test 9: All SEVEN criteria still reported, in order, after criterion 4 fix."""
-    panel = _build_simple_panel(
-        n_sessions=8,
-        bars_per_session=30,
-    )
-
-    lens = Lens(panel)
-
-    verdict = lens.verdict(
-        "H001_test",
-        "return_1",
-        horizon=1,
-        seed=42,
-    )
-
-    # Assert all 7 criteria are present
-    criteria_numbers = set()
-    for reason in verdict.reasons:
-        if reason[0].isdigit():
-            criteria_numbers.add(int(reason[0]))
-
-    expected_criteria = {1, 2, 3, 4, 5, 6, 7}
-    assert criteria_numbers == expected_criteria, (
-        f"Expected criteria {expected_criteria}, got {criteria_numbers}"
-    )
-
-    # Verify order: reasons should start with "1.", "2.", ..., "7."
-    for i, reason in enumerate(verdict.reasons[:7], start=1):
-        assert reason.startswith(f"{i}. "), f"Reason {i} should start with '{i}. '"
-
-
-# ============================================================================
-# Test 10: Determinism
-# ============================================================================
-
-def test_criterion4_determinism() -> None:
-    """Test 10: Determinism: same inputs and seed -> identical verdict text."""
-    dates = [dt.date(2024, 1, i) for i in range(1, 6)]
-    bars_per_session = 25
-
-    ts, day_offsets, dates_arr = _session_grid(dates, bars_per_session)
-    n_rows = len(dates) * bars_per_session
-
-    close = np.full((n_rows, 3), 100.0, dtype=np.float64)
-    volume = np.tile(np.array([1e3, 1e4, 1e5], dtype=np.float64), (n_rows, 1))
-
-    panel = Panel(
-        fields={"close": close.astype(np.float32), "volume": volume},
-        symbols=("S0", "S1", "S2"),
-        ts=ts,
-        day_offsets=day_offsets,
-        dates=dates_arr,
-    )
-
-    # Run verdict twice with same seed
-    lens1 = Lens(panel, seed=42)
-    verdict1 = lens1.verdict("H001", "return_1", horizon=1, seed=42)
-
-    lens2 = Lens(panel, seed=42)
-    verdict2 = lens2.verdict("H001", "return_1", horizon=1, seed=42)
-
-    # Assert identical verdicts
-    assert verdict1.reasons == verdict2.reasons, (
-        "Same inputs and seed should produce identical reason strings"
-    )
-    assert verdict1.survived == verdict2.survived, (
-        "Same inputs and seed should produce identical survival verdict"
-    )
+    assert first.survived == second.survived
+    assert first.reasons == second.reasons
+    np.testing.assert_allclose(first.cost_hurdle_bps, second.cost_hurdle_bps)
