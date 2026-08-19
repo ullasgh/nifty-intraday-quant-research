@@ -65,9 +65,24 @@ gross, where realised market impact would dwarf a 0.09 bps margin, and the cost 
 not price impact beyond the participation cap.
 
 **And the decay is decisive at every size.** 2024 = -5.45 and 2025 = -2.41 fail every gate in
-the table above. Since the universe is a fixed current-day list, the EARLY years are the
-survivorship-inflated ones -- so 2024-2025 are the least-biased data available and they are the
-weakest years. This is precisely the signature that killed H2 and H4.
+the table above, and they are the weakest years in the sample.
+
+**CORRECTION (2026-08-19).** This paragraph previously justified weighting the recent years by
+asserting that "the universe is a fixed current-day list, so the EARLY years are the
+survivorship-inflated ones and 2024-2025 are the least-biased data available." That argument
+was never measured, and when it finally was (`scripts/recon_survivorship.py`) it was REFUTED:
+rebuilding the universe as all 149 names versus the 129 with continuous 2018-2025 coverage
+gives deltas that run BACKWARD to the claim -- tiny and wrong-signed early (2018 +1.54, 2019
++0.57 bps) and LARGEST recently (2023 +7.52, 2024 +7.94).
+
+Two facts replace it. Survivorship is UNMEASURABLE from this dataset: zero of the 149 names
+delist inside the window, because delisted names were never downloaded. And what those deltas
+actually capture is NEW LISTINGS -- 18 names IPO'd inside the window -- which ADD signal in
+recent years rather than inflating early ones.
+
+The conclusion is unchanged and does not depend on the refuted argument: the recent years
+matter because they are the most recent evidence of what the effect does now. The reasoning
+that turned out to be wrong has been removed rather than quietly left in place.
 
 ## The four-quadrant variant is inconclusive, not merely small
 
