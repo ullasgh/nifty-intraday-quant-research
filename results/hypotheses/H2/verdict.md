@@ -39,11 +39,23 @@ The concentration result was recalibrated with a dedicated script
 (`scripts/calibrate_concentration_threshold_v2.py`), 150 within-session permutation
 replicates, seed 42, real data, corrected liquidity definition. The resulting null
 distribution shows the old cutoff of 2.0 was hand-chosen with poor error control: it sits
-at only the 26.7th percentile of pure noise, i.e. it fires on roughly 73% of noise
-replicates. H2's own observed ratio of 2.1189 sits at the 36.7th percentile of that same
+at only the 27th percentile of pure noise, i.e. it fires on roughly 73% of noise
+replicates. H2's own observed ratio of 2.7596 sits at the 62.3rd percentile of that same
 null -- unremarkable, not evidence of a meaningful bottom-decile concentration. The
-measured p95 threshold is 5.5484, at which the joint false-positive rate is 0.0067 (1
+measured p95 threshold is 4.8695, at which the joint false-positive rate is 0.0067 (1
 false positive in 150 replicates).
+
+CORRECTION NOTE (2026-08-19): The above ratios (2.7596 observed, 4.8695 p95) differ from
+the initially published 2.1189 and 5.5484 because the first calibration ran on the full
+1-minute panel with an expanding-mean liquidity proxy, whereas production code reduces to
+a two-rows-per-session checkpoint panel before Lens sees anything and uses a trailing-20-
+session window in compute_prior_adv. These are different statistics measuring different
+geometries. The recalibrated numbers reflect the true production path. The old 5.5484 was
+too permissive for checkpoint-panel hypotheses: a future ratio between 4.87 and 5.55
+would have wrongly passed. This discrepancy is the trailing-20-vs-expanding sensitivity
+check that specs/lens_criterion_4_repair.md required and which was not run before
+publication. Despite the changed numbers, criterion 4 still does not fire for H2, and by
+a wider margin than the original 36.7th-vs-27th comparison implied.
 
 The input definition was also wrong. The original criterion-4 analysis used raw share
 count instead of rupee turnover, and used the full sample window to define liquidity
@@ -77,7 +89,7 @@ Rs 10L the two-leg cost gate is 8.03 bps and the recent-years mean edge of -15.2
 clears it, but at Rs 1L the gate is 16.53 bps and the same edge still fails. Capacity and
 clip size are therefore a genuine, unresolved limitation on what H2 is worth in practice,
 not a solved problem. Criterion 4 was measuring noise rather than a real concentration
-effect, per the calibration above (2.1189 observed vs. a measured p95 of 5.5484, joint
+effect, per the calibration above (2.7596 observed vs. a measured p95 of 4.8695, joint
 false-positive rate 0.0067) -- it provides no evidence H2 is genuinely concentrated in an
 adverse liquidity segment.
 

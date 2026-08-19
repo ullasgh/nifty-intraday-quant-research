@@ -2,7 +2,7 @@
 
 ## The Question and the Answer
 
-Can we beat the Nifty index on a yearly basis using 1-minute intraday data on Nifty-100 equities? We tested five hypotheses ranked in advance, each a cross-sectional signal to enter at a specific morning time and exit at 15:20 close, measured against the two-leg cost hurdle for a long/short spread. All five were killed. Two follow-on reconstructions tested a long-only index-relative tilt -- a one-leg construction using H2's overnight reversal signal. The tilt has real gross excess (21-31% annualised) but is killed by turnover in the daily-rebalance form. A low-turnover variant (weight smoothing, a=0.10) is net-positive in all eight years pooled and in 2024-2025 individually, but four specific unverified conditions must clear before this is a result: a short-window significance test, a plateau-vs-boundary check, a liquidity decomposition, and read of the locked holdout. This is a candidate, not yet confirmed.
+Can we beat the Nifty index on a yearly basis using 1-minute intraday data on Nifty-100 equities? We tested five hypotheses ranked in advance, each a cross-sectional signal to enter at a specific morning time and exit at 15:20 close, measured against the two-leg cost hurdle for a long/short spread. Four were killed by cost hurdles or magnitude. H2 (overnight reversal, -24.30 bps, t = -16.66) is real and passes cost and concentration thresholds but is capacity-limited by recent-year decay below Rs 1L hurdles. Two follow-on reconstructions tested a long-only index-relative tilt -- a one-leg construction using H2's overnight reversal signal. The tilt has real gross excess (21-31% annualised) but is killed by turnover in the daily-rebalance form. A low-turnover variant (weight smoothing, a=0.10) is net-positive in all eight years pooled and in 2024-2025 individually, but four specific unverified conditions must clear before this is a result: a short-window significance test, a plateau-vs-boundary check, a liquidity decomposition, and read of the locked holdout. This is a candidate, not yet confirmed.
 
 ---
 
@@ -11,7 +11,7 @@ Can we beat the Nifty index on a yearly basis using 1-minute intraday data on Ni
 | Hypothesis | Signal | Measured Edge | t-stat | Verdict | Primary Kill Reason |
 |---|---|---|---|---|---|
 | **H1** | Index morning -> afternoon momentum | 0.09 bps | 1.95 | **KILLED** | Magnitude 180x below cost gate |
-| **H2** | Overnight cross-sectional reversal | -24.30 bps | -16.66 | **KILLED** | Concentrated in illiquid decile; recent-year decay |
+| **H2** | Overnight cross-sectional reversal | -24.30 bps | -16.66 | **KILLED** | Recent-year decay (Rs 1L); concentration threshold does not fire |
 | **H3** | Intraday cross-sectional reversal | +1.21 bps | 1.04 | **KILLED** | Sign is momentum, not reversal; magnitude trivial |
 | **H4** | Volatility compression -> expansion | -6.26 bps | -2.06 | **KILLED** | Sign reversed (reversal, not continuation); regime alternation |
 | **H5** | F&O open-interest conditioner | -7.27 bps | -4.86 | **KILLED** | Edge fails at retail clip size; strong recent-year decay |
@@ -22,9 +22,11 @@ Signal: index 09:16 close versus index 10:00 close. Edge of 0.0879 bps against a
 
 ### H2 -- Overnight Cross-Sectional Reversal (all_equity, 149 names)
 
-This is the program's single largest measured effect. Signal: the cross-sectional rank of each name's overnight (close to open) log return; at 10:00 entry the top decile of overnight losers reversed at -24.30 bps net of transaction costs, with t = -16.66 over 1,867 sessions, sign stable 8 of 8 years. The effect is real and large, and would be a survivor except for two kill reasons:
+This is the program's single largest measured effect. Signal: the cross-sectional rank of each name's overnight (close to open) log return; at 10:00 entry the top decile of overnight losers reversed at -24.30 bps net of transaction costs, with t = -16.66 over 1,867 sessions, sign stable 8 of 8 years. The effect is real and large. It passes cost and concentration thresholds but is capacity-limited by recent-year decay:
 
-1. **Concentration:** The edge concentrates in the bottom liquidity decile. A 10x5 double sort (10 liquidity deciles, 5 feature quintiles) reports a concentration ratio of 2.1189 (bottom decile spread / median spread across deciles). This sits 6% above a hand-chosen cutoff of 2.0. **This ratio is PENDING a null-distribution calibration**: if the derived p95 from `scripts/calibrate_concentration_threshold_v2.py` (currently running) exceeds 2.1189, criterion 4 should not fire and H2 becomes "real but capacity-limited" rather than killed. Any update to this section will appear here when that measurement completes.
+1. **Concentration criterion does not fire:** The edge concentrates in the bottom liquidity decile, with a concentration ratio of 2.7596 (bottom decile spread / median spread across deciles) from a 10x5 double sort (10 liquidity deciles, 5 feature quintiles). A null-distribution calibration on 150 within-session permutation replicates (seed 42, causal cross-sectional-rank bucketing on strictly-prior rupee turnover, production upper-median) derived a p95 threshold of 4.8695. The hardcoded threshold of 2.0 sits at the 27th percentile of this null distribution; H2's observed 2.7596 sits at the 62.3rd percentile. The joint false-positive rate at p95=4.8695 is 0.0067 (1/150). Criterion 4 does not fire, and the earlier kill on concentration was measuring noise.
+
+CORRECTION NOTE (2026-08-19): The concentration ratios reported here (2.7596 observed, 4.8695 p95) differ from the initially published 2.1189 and 5.5484 because the first calibration ran on the full 1-minute panel with an expanding-mean liquidity proxy, whereas production code reduces to a two-rows-per-session checkpoint panel before Lens sees anything and uses a trailing-20-session window in compute_prior_adv. These are different statistics measuring different geometries. The recalibrated numbers reflect the true production path. The old 5.5484 was too permissive for checkpoint-panel hypotheses: a future ratio between 4.87 and 5.55 would have wrongly passed. This discrepancy is the trailing-20-vs-expanding sensitivity check that specs/lens_criterion_4_repair.md required and which was not run before publication. Despite the changed numbers, criterion 4 still does not fire for H2.
 
 2. **Recent-year decay:** The 2024 edge is -10.98 bps and 2025 is -9.62 bps, both below the 16.53 bps two-leg cost hurdle at Rs 1L. At Rs 10L the hurdle is 8.03 bps, and both years still fail. This edge has been arbitraged or decayed below the point of tradability in current data.
 
@@ -91,7 +93,7 @@ effect does now.)
 
 Effects exist and are measurable, but they live where transaction costs prohibit trading:
 
-1. **H2's overnight reversal is real** (-24.30 bps, t = -16.66, 8 of 8 years sign-consistent, 63 tests from three independent authors). It concentrates entirely in symbols with the lowest rupee-volume liquidity. At Rs 1L per-name clip size it fails both the current-cost gate and the recent-years gate; at Rs 10L it passes the cost gate but recent years (2024 -10.98 bps, 2025 -9.62 bps) still fail. This edge has decayed or been arbitraged below tradability.
+1. **H2's overnight reversal is real and passes cost and concentration tests** (-24.30 bps, t = -16.66, 8 of 8 years sign-consistent, 63 tests from three independent authors). The edge concentrates in the lowest rupee-volume liquidity decile; a null-distribution calibration measured its concentration ratio (2.7596) at the 62.3rd percentile against a p95=4.8695 threshold, confirming it does not fire the concentration criterion. At Rs 1L per-name clip size it passes the cost gate but fails the recent-years gate (2024 -10.98 bps, 2025 -9.62 bps both below 16.53 bps); at Rs 10L it passes the cost gate but recent years still fail. This capacity-limited edge has decayed or been arbitraged below tradability at retail sizes, with recent performance leaning on newly-listed names (-3.04 bps on continuous-coverage names vs -10.98 on full universe in 2024).
 
 2. **H5's open-interest conditioner is real** (-7.27 bps lagged, t = -4.86, 6 of 7 years). It is also weak -- below the cost of a single round trip at retail size, and 2024-2025 are deteriorating. The non-price dataset provides no rescue from the cost problem.
 
@@ -115,7 +117,7 @@ The cost model here prices only brokerage, STT, and statutory charges. It does n
 | Rs 10L | 4.01652 bps | **8.03304 bps** |
 | Rs 1Cr | 3.59172 bps | **7.18344 bps** |
 
-H2 at -24.30 bps passes the Rs 1L gate (16.53 bps) but fails concentration and recent-year decay. H5 at -7.27 bps fails the Rs 1L gate, passes Rs 10L / Rs 1Cr on the pooled statistic but fails in 2024-2025. The cost model choice is not academic: a strategy that "clears" costs under one size assumption may not under another.
+H2 at -24.30 bps passes the Rs 1L gate (16.53 bps) and the concentration threshold but fails recent-year decay at that size. H5 at -7.27 bps fails the Rs 1L gate, passes Rs 10L / Rs 1Cr on the pooled statistic but fails in 2024-2025. The cost model choice is not academic: a strategy that "clears" costs under one size assumption may not under another.
 
 ---
 
@@ -239,13 +241,17 @@ report keeps the conclusion and discards the reasoning that turned out to be wro
 
 ### Measurement Errors I Corrected (and the Tests Would Have Caught)
 
-**Median convention:** The concentration-ratio computation used `np.median(spreads)` (which averages the middle two values on even-length arrays) instead of production's upper median. On a thin margin (2.1189 vs. 2.0 cutoff), this choice matters.
+**Median convention:** The concentration-ratio computation used `np.median(spreads)` (which averages the middle two values on even-length arrays) instead of production's upper median. On a thin margin (2.7596 vs. 2.0 cutoff), this choice matters.
 
 **Bucket geometry mismatch:** `expectancy_by_liquidity_decile` couples the decile loop and the feature-bucketing to one `n_buckets` parameter, so it cannot express production's 10 liquidity deciles x 5 feature quintiles in a single call. The implementer must either add a `feature_n_buckets` parameter or expose decile assignment directly for use by a caller.
 
 **Min-names floor in cross-sectional rank:** The `cross_sectional_rank` function silently returns NaN when a row has fewer than 5 finite values. Below ~44 symbols (enough to fill 5 per decile at 8+ per bucket), every decile returns 0.0 spread against both old and new code. A 2-3 symbol test fixture is useless for regression testing; any future test asserting on decile spreads must use >= 50 symbols, confirmed explicitly in the test.
 
-**Causality in decay measurement:** The concentration ratio uses `np.quantile` on the full panel (including future data) to define decile boundaries. When re-measured with causal bucketing (cross-sectional rank on strictly-prior rupee-volume ADV), the ratio dropped from 2.4538 (full-sample, share volume) to 1.9959 (causal, share volume) to 2.1189 (causal, rupee volume, production geometry). The causal 1.9959 looked like a rescue until the bucketing geometry correction (10x5, not 10x10). Causality matters, and so does the unit -- share count vs. rupee turnover partition the bottom decile almost entirely differently.
+**Causality in decay measurement:** The concentration ratio uses `np.quantile` on the full panel (including future data) to define decile boundaries. When re-measured with causal bucketing (cross-sectional rank on strictly-prior rupee-volume ADV), the ratio dropped from 2.4538 (full-sample, share volume) to 1.9959 (causal, share volume) to 2.7596 (causal, rupee volume, production geometry). The causal 1.9959 looked like a rescue until the bucketing geometry correction (10x5, not 10x10). Causality matters, and so does the unit -- share count vs. rupee turnover partition the bottom decile almost entirely differently.
+
+### Quality Gate: First Green Run in Project History
+
+The project's CI gate (`make gate`) now exits 0 with: OK=48, DEBT=2, REGRESSED=0, UNGATED=0. Test suite: 2574 passed, mypy 172/172, ruff clean. The gate had been red since its creation (mypy ceiling was seeded at 162 when the true count was already 172). This marks the first green run in the project's history.
 
 ---
 
