@@ -30,14 +30,14 @@ from zoneinfo import ZoneInfo
 import numpy as np
 import pandas as pd
 import pytest
+from nifty_quant.research.tilt import TiltConfig, run_tilt
+from typer.testing import CliRunner
 
 from nifty_quant.calendar import TradingCalendar
 from nifty_quant.cli import app
 from nifty_quant.data.panel import Panel
 from nifty_quant.execution.costs import NSEIntradayEquityCosts
 from nifty_quant.research.splits import HoldoutLock
-from nifty_quant.research.tilt import TiltConfig, TiltResult, TiltYearRow, run_tilt
-from typer.testing import CliRunner
 
 _IST = ZoneInfo("Asia/Kolkata")
 _N_SYMBOLS = 5

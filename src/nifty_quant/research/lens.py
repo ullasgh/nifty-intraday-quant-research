@@ -18,12 +18,34 @@ from nifty_quant.execution.costs import NSEIntradayEquityCosts
 from nifty_quant.features import core as core_features
 from nifty_quant.research import expectancy
 
-# TODO(rule-8): unmeasured placeholder. `scripts/calibrate_concentration_threshold_v2.py`
-# is deriving the real value from a measured null distribution (500 within-session
-# permutation replicates at this module's exact 10-liquidity-decile x 5-feature-quintile
-# geometry, using the same upper-median convention as below). 2.0 numerically
-# reproduces today's inline literal and is a reasoned-not-measured stand-in only.
-CONCENTRATION_RATIO_THRESHOLD: float = 2.0
+# Derived from a measured null distribution, per CLAUDE.md rule 8.
+#
+# 300 within-session permutation replicates (seed 42) run on the TRUE PRODUCTION CODE PATH:
+# Lens.stability() called on the two-rows-per-session CHECKPOINT panel that run_h2/run_h3
+# actually build, using the real compute_prior_adv (trailing-20-session mean of per-session
+# SUMMED rupee turnover). Null construction: one column permutation per session applied
+# identically to every row in it, which destroys the symbol-liquidity association while
+# preserving intraday autocorrelation, the per-row cross-sectional distribution and real
+# decile sizes. Measured bottom-is-argmax rate under the null 10.7%, consistent with the
+# ~10% expected by chance across 10 deciles.
+#
+#     n=300:  p50 2.4290   p75 3.4406   p90 4.2849   p95 4.8695   p99 6.7422
+#
+# CORRECTED 2026-08-19. A first calibration gave 5.5484, but it ran on the FULL 1-minute
+# panel with an expanding-mean liquidity proxy -- neither of which is what production does.
+# Lens never sees the raw panel for these hypotheses, and compute_prior_adv uses a trailing
+# 20-session window, not an expanding one. 5.5484 was therefore too PERMISSIVE for exactly
+# the checkpoint-panel hypotheses this constant governs: a future ratio between ~4.87 and
+# ~5.55 would have wrongly passed. Caught by a verifier re-measuring on the real path.
+#
+# The old hand-chosen 2.0 sat at roughly the 27th percentile of this null -- it fired on
+# most of pure noise, which is why it was not merely imprecise but wrong. (Echoes rule 8's
+# origin: threshold 0.35 shipped on reasoning alone and produced 8,217 false positives.)
+#
+# H2's true observed ratio on this path is 2.7596 (NOT the 2.1189 first published, which
+# used the expanding-mean proxy), sitting at the 62.3rd percentile -- so criterion 4 does
+# not fire for H2, by a wider margin than the original comparison implied.
+CONCENTRATION_RATIO_THRESHOLD: float = 4.8695
 # Alias: some callers/tests refer to this by the spec's example name.
 CONCENTRATION_THRESHOLD: float = CONCENTRATION_RATIO_THRESHOLD
 
@@ -780,7 +802,10 @@ class Lens:
                         if len(sorted_edges) > 1:
                             max_edge = sorted_edges[-1]
                             median_edge = sorted_edges[len(sorted_edges) // 2]
-                            if median_edge > 0 and max_edge > median_edge * CONCENTRATION_RATIO_THRESHOLD:
+                            if (
+                                median_edge > 0
+                                and max_edge > median_edge * CONCENTRATION_RATIO_THRESHOLD
+                            ):
                                 c4_result = "FAIL"
                                 concentration_reasons.append(_tod_reason)
 
