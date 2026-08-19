@@ -62,7 +62,7 @@ mean (258,023 observations, 1,847 sessions):
    not a tradable edge under any holding rule, and it is not the "concentrated in the earliest
    year" signature this verdict previously claimed.
 
-## Reproduction failure — the process finding, which outlives the result
+## Reproduction failure -- the process finding, which outlives the result
 
 The numbers first published here (-0.34 / -1.08 / -5.12 bps; 2018 -18.8, 2024 **+1.3**,
 2025 -2.9; 145 symbols, 258,204 obs) came from a throwaway script that was never committed. It is

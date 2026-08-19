@@ -1375,6 +1375,82 @@ def sweep(
         _fail(f"sweep failed: {exc}")
 
 
+@app.command()
+def tilt(
+    start: str = typer.Option(..., "--start"),
+    end: str = typer.Option(..., "--end"),
+    entry: str = typer.Option("09:16", "--entry"),
+    exit_time: str = typer.Option("15:20", "--exit"),
+    capital: float = typer.Option(1_000_000.0, "--capital"),
+    tilt_type: str = typer.Option("mild", "--tilt"),
+    smoothing: float = typer.Option(0.10, "--smoothing"),
+    rebalance_every: int = typer.Option(1, "--rebalance-every"),
+    universe_name: str = typer.Option("all_equity", "--universe"),
+    continuous_only: bool = typer.Option(
+        False, "--continuous-only", help="Restrict to symbols with coverage"
+    ),
+    seed: int = typer.Option(0, "--seed"),
+) -> None:
+    """Run a parameterised tilt backtest."""
+    start_d = _parse_date(start, "--start")
+    end_d = _parse_date(end, "--end")
+    if start_d > end_d:
+        _fail(f"--start {start_d} is after --end {end_d}")
+
+    if tilt_type not in ("mild", "aggressive"):
+        _fail(
+            f"Invalid --tilt value {tilt_type!r}. "
+            f"Valid options: mild, aggressive"
+        )
+
+    try:
+        from nifty_quant.data.panel import PanelSpec, load_panel
+        from nifty_quant.research.tilt import TiltConfig, run_tilt
+        from nifty_quant.universe.static import load_universe
+
+        universe = load_universe(universe_name)
+        typer.echo(f"Universe: {universe_name} ({len(universe.symbols)} symbols)")
+
+        spec = PanelSpec(
+            freq="1",
+            fields=("open", "high", "low", "close", "volume"),
+            symbols=universe.symbols,
+            start=start_d,
+            end=end_d,
+        )
+        panel = load_panel(spec)
+
+        config = TiltConfig(
+            start=start_d,
+            end=end_d,
+            entry_hhmm=entry,
+            exit_hhmm=exit_time,
+            capital=capital,
+            tilt=tilt_type,
+            smoothing=smoothing,
+            rebalance_every=rebalance_every,
+            universe=universe_name,
+            continuous_only=continuous_only,
+            seed=seed,
+        )
+
+        result = run_tilt(panel, config)
+        typer.echo("")
+        typer.echo(result.to_table())
+        typer.echo("")
+
+        if result.warnings:
+            typer.echo("Warnings:")
+            for w in result.warnings:
+                typer.echo(f"  {w}")
+            typer.echo("")
+
+    except ValueError as exc:
+        _fail(str(exc))
+    except Exception as exc:
+        _fail(f"Error running tilt: {exc}")
+
+
 cache_app = typer.Typer()
 
 

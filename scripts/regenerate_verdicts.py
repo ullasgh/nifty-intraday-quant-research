@@ -38,43 +38,88 @@ FIELDS = ("open", "high", "low", "close", "volume")
 def extract_handwritten_sections(filepath: Path) -> dict[str, str]:
     """Extract hand-written sections from existing verdict file.
 
-    Preserves sections that are clearly not auto-generated so they can be
-    re-emitted under a marked region in the regenerated file.
+    Preserves ALL content after the <!-- HAND-WRITTEN, PRESERVED --> marker,
+    including prose that appears before any ## headers.
 
-    Returns a dict mapping section names to their content.
+    Returns a dict with a single key '__all_preserved__' containing the
+    complete preserved content.
     """
     if not filepath.exists():
         return {}
 
     content = filepath.read_text()
-    sections = {}
 
-    # Look for common hand-written sections in hypothesis verdicts.
-    # These are identified by section headers that don't appear in auto-generated output.
-    handwritten_markers = [
-        "Reconnaissance cross-check",
-        "Why this was built after the answer was known",
-        "Conclusion",
-    ]
+    # Look for the preserved marker
+    marker = "<!-- HAND-WRITTEN, PRESERVED -->"
+    marker_idx = content.find(marker)
+    if marker_idx == -1:
+        return {}
 
-    for marker in handwritten_markers:
-        if marker in content:
-            # Find the section starting with this marker
-            start_idx = content.find(f"## {marker}")
-            if start_idx == -1:
-                continue
+    # Extract everything after the marker (preserve character count check)
+    preserved_start = marker_idx + len(marker)
+    preserved_content = content[preserved_start:].strip()
 
-            # Find the next section header or end of file
-            remaining = content[start_idx:]
-            next_section = remaining.find("\n## ", 3)  # Skip the current marker
-            if next_section != -1:
-                section_content = remaining[:next_section]
-            else:
-                section_content = remaining
+    if not preserved_content:
+        return {}
 
-            sections[marker] = section_content.strip()
+    return {"__all_preserved__": preserved_content}
 
-    return sections
+
+def _verify_preserved_content_not_lost(
+    original_filepath: Path, new_output: str
+) -> None:
+    """Verify that hand-written content was not lost during regeneration.
+
+    Raises ValueError if preserved content shrank significantly, preventing
+    silent data loss. This is a fail-loud guard for a previously silent bug.
+
+    Args:
+        original_filepath: Path to the original file (before regeneration)
+        new_output: The newly assembled output string
+
+    Raises:
+        ValueError: If preserved content appears to have been lost.
+    """
+    if not original_filepath.exists():
+        # No original file, nothing to lose
+        return
+
+    original_content = original_filepath.read_text()
+    marker = "<!-- HAND-WRITTEN, PRESERVED -->"
+    original_marker_idx = original_content.find(marker)
+
+    if original_marker_idx == -1:
+        # Original had no preserved section, so nothing to verify
+        return
+
+    # Get original preserved content length
+    original_preserved_start = original_marker_idx + len(marker)
+    original_preserved = original_content[original_preserved_start:].strip()
+    original_char_count = len(original_preserved)
+
+    # Check new output for preserved content
+    new_marker_idx = new_output.find(marker)
+    if new_marker_idx == -1:
+        # Preserved marker was removed!
+        raise ValueError(
+            f"SILENT DATA LOSS DETECTED in {original_filepath.name}: "
+            f"preserved marker removed. Original had {original_char_count} "
+            f"characters of preserved prose."
+        )
+
+    new_preserved_start = new_marker_idx + len(marker)
+    new_preserved = new_output[new_preserved_start:].strip()
+    new_char_count = len(new_preserved)
+
+    # Allow small shrinkage due to whitespace normalization (up to 10 chars or 1%)
+    threshold = max(10, original_char_count * 0.01)
+    if new_char_count < original_char_count - threshold:
+        delta = original_char_count - new_char_count
+        raise ValueError(
+            f"SILENT DATA LOSS DETECTED in {original_filepath.name}: "
+            f"preserved content shrank by {delta} characters "
+            f"({original_char_count} -> {new_char_count})."
+        )
 
 
 def generate_markdown(hypothesis_id: str, result) -> str:  # noqa: ANN001
@@ -192,6 +237,9 @@ def regenerate_h2(panel, dry_run: bool = True) -> str:
         for section_name, content in handwritten.items():
             output += f"{content}\n\n"
 
+    # Verify no content was lost during regeneration
+    _verify_preserved_content_not_lost(existing_path, output)
+
     if not dry_run:
         output_path = Path("results/hypotheses/H2/verdict.md")
         output_path.parent.mkdir(parents=True, exist_ok=True)
@@ -240,6 +288,9 @@ def regenerate_h3(panel, dry_run: bool = True) -> str:
         output += "<!-- HAND-WRITTEN, PRESERVED -->\n\n"
         for section_name, content in handwritten.items():
             output += f"{content}\n\n"
+
+    # Verify no content was lost during regeneration
+    _verify_preserved_content_not_lost(existing_path, output)
 
     if not dry_run:
         output_path = Path("results/hypotheses/H3/verdict.md")

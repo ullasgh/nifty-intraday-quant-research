@@ -115,5 +115,13 @@ arguable -- it should be formalised then.
 
 ## Conclusion
 
-Killed on magnitude and on decay. This closes Phase 3 at **five hypotheses tested, five
-killed**, and the last of them was the only non-price family in the program.
+Killed on magnitude and on decay. This closes Phase 3 at five hypotheses tested, and H5
+was the only non-price family among them.
+
+**Superseded framing, corrected 2026-08-19.** This paragraph previously read "five
+hypotheses tested, five killed". That is no longer accurate. H2's kill collapsed under
+measurement: its concentration criterion was firing on a hand-chosen threshold that sat
+near the 27th percentile of a measured null, and its recent-years failure was an artifact
+of a hardcoded Rs 1L clip which it clears at Rs 10L. FOUR hypotheses are killed outright;
+H2's verdict is INCOMPLETE, resting on one clip-size-dependent criterion with two others
+NOT_EVALUATED. Nothing about H5's own result changes.

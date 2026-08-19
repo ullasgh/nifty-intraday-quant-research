@@ -18,6 +18,78 @@ uv run nq backtest --strategy volume_breakout \
 
 Run `uv run nq --help` for the full command list (`symbols`, `build-panel`, `validate`, `strategies`, `backtest`, `walkforward`, `sweep`, `cache info` / `cache gc`).
 
+## The `nq tilt` Strategy
+
+**Status: CANDIDATE, not validated.** This strategy is net-positive in all eight measured years (~5.8% annualised net excess) and survives excluding the bottom half of the universe by liquidity. However, its statistical significance in the recent window (2024-2025) is PARTIAL: only the mild/full-universe combination clears on that window alone (t=2.75, p=0.006), and that result depends on recently-listed names. The continuous-coverage version does not reach significance (p=0.077). The holdout test window has not been touched.
+
+### What it does
+
+`nq tilt` backtests a long-only, index-relative tilt strategy based on NSE intraday overnight returns. The signal ranks symbols by their overnight (prior session close to market open) return, cross-sectionally demeaned. Two tilt modes are available:
+
+- **mild**: clipped rank; top half of overnight gainers are excluded (zero weight), weight increases toward the biggest overnight loser.
+- **aggressive**: bottom quintile by overnight return, equal-weighted.
+
+The strategy is benchmarked against equal-weight holdings of the same universe; reported returns are excess over that benchmark. Weights are smoothed to reduce turnover. The entire book is long-only — no shorts, weights are non-negative and sum to 1.
+
+### Usage
+
+```bash
+nq tilt --start 2024-01-01 --end 2025-07-31 \
+        --entry 09:16 --exit 15:20 \
+        --capital 1000000 --tilt mild --smoothing 0.10
+```
+
+### Flags
+
+- `--start DATE` (required): backtest window start (YYYY-MM-DD).
+- `--end DATE` (required): backtest window end (YYYY-MM-DD). Must not fall within the locked holdout window; the command will raise an error if it does, protecting that data from being spent.
+- `--entry HH:MM` (default: `09:16`): entry checkpoint, resolved by time label in the session. Sessions missing this checkpoint are dropped and counted in warnings. Earliest sensible entry is 09:16 (to avoid pre-open call-auction leakage).
+- `--exit HH:MM` (default: `15:20`): exit checkpoint, resolved by time label. Sessions missing this checkpoint are dropped and counted in warnings.
+- `--capital RUPEES` (default: `1000000`): total book notional in rupees. This sets the per-name position size and dramatically affects costs; see below.
+- `--tilt TILT_MODE` (default: `mild`): weighting scheme; must be `mild` or `aggressive`.
+- `--smoothing ALPHA` (default: `0.10`): exponential smoothing factor, 0 < alpha <= 1. At alpha=1.0, the book rebalances daily to the target weights; smaller alpha keeps the book on prior weights longer, reducing turnover. The formula is w_t = (1 - alpha) * w_{t-1} + alpha * target_t.
+- `--rebalance-every SESSIONS` (default: `1`): number of sessions to hold the book between recomputes. On held sessions, the book drifts with prices; turnover during those periods is drift only, not rebalancing.
+- `--universe UNIVERSE_NAME` (default: `all_equity`): equity universe config; valid values: `all_equity`, and others defined in `configs/universe/`.
+- `--continuous-only` (flag, default: off): restrict analysis to symbols with price data covering the entire backtest window. Symbols missing bars anywhere in the window are excluded.
+- `--seed SEED` (default: `0`): random seed for reproducibility.
+
+### Why capital matters
+
+**Cost is size-dependent and this is the single biggest lever on profitability.** NSE intraday (MIS) round-trip costs vary sharply with position notional:
+
+    Capital (per-name clip)    Round-trip cost
+    Rs 1,00,000 (Rs 1L)        8.26452 bps
+    Rs 10,00,000 (Rs 10L)      4.01652 bps
+    Rs 1,00,00,000 (Rs 1Cr)    3.59172 bps
+
+The flow is: capital -> per-name clip size = capital / typical number held -> round-trip cost at that clip -> total cost per session = round-trip cost * mean daily turnover. Raising capital from 1L to 10L roughly HALVES the cost per unit of turnover. Cost is charged only on TURNOVER, not on notional — a book that does not trade pays nothing.
+
+This is ONE-LEG cost (long-only), not two-leg. The strategy buys and sells once; the `round_trip_bps` figure is applied once per unit of turnover, not multiplied by 2.
+
+### Reading the output table
+
+The command prints a table with one row per year plus an ALL row (total across all years):
+
+    Tilt backtest  mild / smoothing 0.10 / capital Rs 10,00,000
+    Universe all_equity (149 names)   2024-01-01 .. 2025-07-31   389 sessions
+    Clip per name Rs 66,667   round-trip 4.55 bps   breakeven turnover 1.23
+
+    year   sessions   gross_bps   turnover   cost_bps   net_bps   ann_net%
+    2024        246        4.12      0.110       0.50      3.62      9.13
+    2025        143        3.05      0.108       0.49      2.56      6.45
+    ------------------------------------------------------------------
+    ALL         389        3.73      0.109       0.50      3.23      8.14
+
+Column meanings:
+
+- **year**: calendar year. ALL row spans the entire backtest window.
+- **sessions**: count of trading days included.
+- **gross_bps**: mean daily index-relative excess return before costs, in basis points. This is the signal strength, independent of capital or turnover.
+- **turnover**: mean daily sum of absolute weight changes. At smoothing=1.0 (daily rebalance) this is the portfolio's churn rate; smaller smoothing reduces it.
+- **cost_bps**: mean daily cost, in basis points. Calculated as round_trip_bps(clip) * turnover.
+- **net_bps**: gross_bps minus cost_bps. **This is the number that matters.** Gross alone is misleading; costs can easily consume all the signal. A row with gross_bps > 0 but net_bps < 0 is not tradeable.
+- **ann_net%**: net_bps annualised as a percentage, using the year's own session count.
+
 ## Architecture
 
 ### nifty_quant/data/

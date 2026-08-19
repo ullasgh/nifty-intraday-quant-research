@@ -19,7 +19,7 @@
 - 6. Deflated Sharpe criterion: NOT_EVALUATED (strategy_returns not supplied, trials=1)
 - 7. Recent-years cost gate criterion: FAIL (years=2023,2024; edges=7.27,6.57 bps; mean=6.92 bps; 2x hurdle=16.53 bps; dominant_sign='+'; excluded partial years: 2025)
 - Observed direction: POSITIVE top-minus-bottom spread (1.2124 bps) -- this is MOMENTUM, not reversal. Do not report this as a confirmed reversal.
-- UNIVERSE h3_panel WITH NO AS-OF DATE; 149 names; 15 of 149 names had no data in 2018. Returns before 2018 are survivorship-inflated.
+- UNIVERSE h3_panel WITH NO AS-OF DATE; 149 names; 15 of 149 names had no data in 2018. Missing names are later listings; this dataset has no delistings.
 
 ## Context
 
