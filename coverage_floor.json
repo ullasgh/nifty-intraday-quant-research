@@ -68,6 +68,7 @@
     "src/nifty_quant/research/hypotheses/__init__.py": 100,
     "src/nifty_quant/research/hypotheses/h1_market_intraday_momentum.py": 100,
     "src/nifty_quant/research/hypotheses/h2_overnight_reversal.py": 100,
+    "src/nifty_quant/research/hypotheses/h3_intraday_xsec_reversal.py": 100,
     "src/nifty_quant/research/lens.py": 100,
     "src/nifty_quant/research/registry.py": 98,
     "src/nifty_quant/research/splits.py": 100,
@@ -86,6 +87,5 @@
     "src/nifty_quant/universe/filters.py": 97,
     "src/nifty_quant/universe/sectors.py": 100,
     "src/nifty_quant/universe/static.py": 100
-  },
-  "src/nifty_quant/research/hypotheses/h3_intraday_xsec_reversal.py": 100
+  }
 }
