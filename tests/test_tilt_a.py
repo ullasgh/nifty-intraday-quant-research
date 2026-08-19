@@ -30,7 +30,6 @@ from zoneinfo import ZoneInfo
 import numpy as np
 import pandas as pd
 import pytest
-from nifty_quant.research.tilt import TiltConfig, run_tilt
 from typer.testing import CliRunner
 
 from nifty_quant.calendar import TradingCalendar
@@ -38,6 +37,7 @@ from nifty_quant.cli import app
 from nifty_quant.data.panel import Panel
 from nifty_quant.execution.costs import NSEIntradayEquityCosts
 from nifty_quant.research.splits import HoldoutLock
+from nifty_quant.research.tilt import TiltConfig, run_tilt
 
 _IST = ZoneInfo("Asia/Kolkata")
 _N_SYMBOLS = 5
@@ -182,7 +182,11 @@ def test_one_leg_cost_identity() -> None:
     # A 2x (long/short-spread) cost convention fails the first assertion directly; it is the
     # single most important test in this file per the spec.
     for row in (*result.per_year, result.total):
-        assert row.cost_bps == pytest.approx(result.round_trip_bps * row.turnover, rel=1e-9, abs=1e-12)
+        assert row.cost_bps == pytest.approx(
+            result.round_trip_bps * row.turnover,
+            rel=1e-9,
+            abs=1e-12,
+        )
 
     assert result.round_trip_bps == pytest.approx(
         NSEIntradayEquityCosts().round_trip_bps(result.clip_per_name), rel=1e-6

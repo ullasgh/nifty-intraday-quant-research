@@ -73,6 +73,7 @@
     "src/nifty_quant/research/registry.py": 98,
     "src/nifty_quant/research/splits.py": 100,
     "src/nifty_quant/research/sweep.py": 100,
+    "src/nifty_quant/research/tilt.py": 100,
     "src/nifty_quant/settings.py": 100,
     "src/nifty_quant/strategy/__init__.py": 100,
     "src/nifty_quant/strategy/base.py": 100,

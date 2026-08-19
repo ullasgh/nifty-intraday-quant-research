@@ -16,6 +16,8 @@ import numpy as np
 import pandas as pd
 import pytest
 
+from nifty_quant.data.panel import Panel
+
 # NOTE (lead, at review): this file originally carried a fallback that loaded a
 # scratchpad reference implementation into sys.modules whenever
 # `nifty_quant.research.tilt` was missing. That made the suite PASS against a copy of
@@ -27,8 +29,6 @@ from nifty_quant.research.tilt import (
     TiltConfig,
     run_tilt,
 )
-
-from nifty_quant.data.panel import Panel
 
 # Panel builder helpers (adapted from test_lens_criteria_repair_b.py pattern)
 _N_SYMBOLS = 10
@@ -149,8 +149,10 @@ def test_capital_changes_cost_not_gross() -> None:
         f"Gross changed with capital: {result_1l.total.gross_bps} vs {result_10l.total.gross_bps}"
 
     # Round-trip bps should fall as clip size increases
-    assert result_10l.round_trip_bps < result_1l.round_trip_bps, \
-        f"Round-trip cost should fall with capital: {result_1l.round_trip_bps} vs {result_10l.round_trip_bps}"
+    assert result_10l.round_trip_bps < result_1l.round_trip_bps, (
+        f"Round-trip cost should fall with capital: "
+        f"{result_1l.round_trip_bps} vs {result_10l.round_trip_bps}"
+    )
 
     # Cost should fall
     assert result_10l.total.cost_bps < result_1l.total.cost_bps, \
@@ -219,7 +221,11 @@ def test_custom_times_honored() -> None:
     result_custom = run_tilt(panel, config_custom)
 
     # The gross_bps should differ because the price window differs
-    assert not np.isclose(result_default.total.gross_bps, result_custom.total.gross_bps, rtol=1e-3), \
+    assert not np.isclose(
+        result_default.total.gross_bps,
+        result_custom.total.gross_bps,
+        rtol=1e-3,
+    ), \
         "Custom times should produce different results"
 
     # Verify that the decoy bar one minute off is not read
@@ -280,8 +286,10 @@ def test_missing_checkpoint_drops_session() -> None:
     # The Muhurat session (60 bars) should be skipped
     # Per-year sessions should not include it
     total_sessions_in_dates = 4
-    assert result.total.n_sessions < total_sessions_in_dates, \
-        f"Expected < {total_sessions_in_dates} sessions (Muhurat dropped), got {result.total.n_sessions}"
+    assert result.total.n_sessions < total_sessions_in_dates, (
+        f"Expected < {total_sessions_in_dates} sessions (Muhurat dropped), "
+        f"got {result.total.n_sessions}"
+    )
 
     # Check that a warning mentions the skipped session
     any("skip" in w.lower() or "muhurat" in w.lower() or "15:20" in w for w in result.warnings)
@@ -340,8 +348,10 @@ def test_smoothing_reduces_turnover() -> None:
     result_smooth = run_tilt(panel, config_smooth)
 
     # Smoothing should reduce turnover
-    assert result_smooth.total.turnover < result_daily.total.turnover, \
-        f"Smoothing should reduce turnover: {result_smooth.total.turnover} >= {result_daily.total.turnover}"
+    assert result_smooth.total.turnover < result_daily.total.turnover, (
+        f"Smoothing should reduce turnover: "
+        f"{result_smooth.total.turnover} >= {result_daily.total.turnover}"
+    )
 
 
 def test_weights_long_only_normalized() -> None:
