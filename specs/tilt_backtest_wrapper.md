@@ -56,6 +56,13 @@ class TiltResult:
     breakeven_turnover: float          # gross_bps / round_trip_bps; inf if gross <= 0
     n_symbols: int
     warnings: tuple[str, ...]
+    # AMENDED 2026-08-19: weight invariants were untestable through the original public API,
+    # which exposed only per-year aggregates. A test author flagged that required test 7
+    # ("weights never negative, sum to 1") could not be asserted at all. These three
+    # diagnostics make it checkable without exposing the full per-session weight matrix.
+    min_weight_seen: float          # minimum weight over all sessions; must be >= 0.0
+    max_weight_sum_deviation: float # max |sum(weights) - 1.0| over all sessions
+    max_n_held: int                 # largest number of non-zero holdings in any session
     def to_table(self) -> str: ...     # the "neat table"
     def explain(self) -> str: ...      # provenance: config, universe, holdout statement
 
@@ -101,8 +108,22 @@ here. Getting this wrong doubles the cost and inverts the conclusion.
    A session lacking either checkpoint DROPS OUT and is counted in `warnings` — never filled,
    never approximated by a neighbouring bar. NEVER assume 375 bars/session.
 2. **Signal is H2's overnight return**, known at the entry checkpoint, cross-sectionally
-   demeaned. Reuse `build_overnight_feature` and `_build_checkpoint_panel` from
-   `h2_overnight_reversal.py`; do NOT reimplement.
+   demeaned. Reuse `build_overnight_feature` from `h2_overnight_reversal.py`.
+
+   **AMENDED 2026-08-19 — do NOT reuse `_build_checkpoint_panel`.** The original wording said
+   to, and that CONTRADICTED the configurable-times requirement: that helper hardcodes h2's own
+   `_ENTRY_HHMM`/`_EXIT_HHMM` and takes no time parameters, so it can never honour
+   `--entry`/`--exit`. Found by a test author before implementation, which is what the dual
+   suites are for.
+
+   Instead `tilt.py` builds its OWN two-rows-per-session checkpoint reduction, parameterised by
+   `entry_hhmm` and `exit_hhmm`. **Model it closely on `_build_checkpoint_panel`** — read that
+   function and preserve its semantics exactly: resolve BOTH labels via `minute_of_day()`, store
+   the entry-side value in the reduced panel's `close` field so a `horizon=1` close-to-close
+   return on the reduced panel is the true intraday return, and DROP any session missing either
+   label rather than substituting a neighbouring bar. That reduction is not optional: without it
+   a `horizon=1` return measures ONE MINUTE on a real many-bar session, which is exactly how H2
+   once reported -0.001 bps against a true -24.58.
 3. **Weights are long-only**: non-negative, summing to 1, no shorts. `mild` = clipped-rank
    (zero on the top half by overnight return, rising toward the biggest loser); `aggressive` =
    bottom quintile equal-weighted.
@@ -114,8 +135,14 @@ here. Getting this wrong doubles the cost and inverts the conclusion.
 6. **A session with fewer than 5 valid names is SKIPPED** and counted — `cross_sectional_rank`
    returns all-NaN below `min_names=5`, so anything less produces silent zeros.
 7. **The holdout is protected.** If `end` falls inside the locked holdout window, RAISE with a
-   message naming the boundary. This tool must not be the way the holdout gets spent by
-   accident.
+   message naming the boundary and containing the word "holdout". This tool must not be the way
+   the holdout gets spent by accident.
+
+   **AMENDED 2026-08-19 — the boundary is GLOBAL, not panel-relative.** A test author asked
+   which it was; panel-relative would make the tail of EVERY legitimate query look like the
+   holdout, defeating the tool's purpose. Take the boundary from
+   `nifty_quant.research.splits.HoldoutLock` (read it), independent of the panel passed in.
+   Tests assert the word "holdout" appears in the message, not an exact date format.
 8. Degenerate windows (no usable session, one symbol, `start > end`) raise `ValueError` naming
    the problem — never return a table of zeros.
 
@@ -156,8 +183,10 @@ Two INDEPENDENT suites: `tests/test_tilt_a.py`, `tests/test_tilt_b.py`.
    partition sessions exactly once (sum of `n_sessions` equals the total).
 6. **Smoothing reduces turnover**: `a=0.10` gives materially lower turnover than `a=1.0` on the
    same panel; `a=1.0` reproduces the daily-rebalance case.
-7. **Weights are long-only and normalised**: never negative, sum to 1 within tolerance, on
-   every session.
+7. **Weights are long-only and normalised**, asserted via the diagnostics on `TiltResult`:
+   `min_weight_seen >= 0.0` and `max_weight_sum_deviation` within float tolerance of 0, on a
+   panel with at least 5 valid names. (Turnover <= 2.0 is a necessary but NOT sufficient
+   consequence and is not a substitute for these.)
 8. **Holdout protection**: an `end` inside the locked window RAISES, with the boundary in the
    message.
 9. **Degenerate inputs raise** with a message identifying the problem (`start > end`, no usable
