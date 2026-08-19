@@ -2,7 +2,7 @@
 
 ## The Question and the Answer
 
-Can we beat the Nifty index on a yearly basis using 1-minute intraday data on Nifty-100 equities? We tested five hypotheses ranked in advance, each a cross-sectional signal to enter at a specific morning time and exit at 15:20 close, measured against the two-leg cost hurdle for a long/short spread. All five were killed. The largest real effect (overnight reversal, -24.30 bps, t = -16.66) concentrates in the bottom liquidity decile and has already decayed below tradability. Nothing intraday and liquid clears costs.
+Can we beat the Nifty index on a yearly basis using 1-minute intraday data on Nifty-100 equities? We tested five hypotheses ranked in advance, each a cross-sectional signal to enter at a specific morning time and exit at 15:20 close, measured against the two-leg cost hurdle for a long/short spread. All five were killed. Two follow-on reconstructions tested a long-only index-relative tilt -- a one-leg construction using H2's overnight reversal signal. The tilt has real gross excess (21-31% annualised) but is killed by turnover in the daily-rebalance form. A low-turnover variant (weight smoothing, a=0.10) is net-positive in all eight years pooled and in 2024-2025 individually, but four specific unverified conditions must clear before this is a result: a short-window significance test, a plateau-vs-boundary check, a liquidity decomposition, and read of the locked holdout. This is a candidate, not yet confirmed.
 
 ---
 
@@ -24,7 +24,7 @@ Signal: index 09:16 close versus index 10:00 close. Edge of 0.0879 bps against a
 
 This is the program's single largest measured effect. Signal: the cross-sectional rank of each name's overnight (close to open) log return; at 10:00 entry the top decile of overnight losers reversed at -24.30 bps net of transaction costs, with t = -16.66 over 1,867 sessions, sign stable 8 of 8 years. The effect is real and large, and would be a survivor except for two kill reasons:
 
-1. **Concentration:** The edge concentrates in the bottom liquidity decile. A 10x5 double sort (10 liquidity deciles, 5 feature quintiles) reports a concentration ratio of 2.1189 (bottom decile spread ÷ median spread across deciles). This sits 6% above a hand-chosen cutoff of 2.0. **This ratio is PENDING a null-distribution calibration**: if the derived p95 from `scripts/calibrate_concentration_threshold_v2.py` (currently running) exceeds 2.1189, criterion 4 should not fire and H2 becomes "real but capacity-limited" rather than killed. Any update to this section will appear here when that measurement completes.
+1. **Concentration:** The edge concentrates in the bottom liquidity decile. A 10x5 double sort (10 liquidity deciles, 5 feature quintiles) reports a concentration ratio of 2.1189 (bottom decile spread / median spread across deciles). This sits 6% above a hand-chosen cutoff of 2.0. **This ratio is PENDING a null-distribution calibration**: if the derived p95 from `scripts/calibrate_concentration_threshold_v2.py` (currently running) exceeds 2.1189, criterion 4 should not fire and H2 becomes "real but capacity-limited" rather than killed. Any update to this section will appear here when that measurement completes.
 
 2. **Recent-year decay:** The 2024 edge is -10.98 bps and 2025 is -9.62 bps, both below the 16.53 bps two-leg cost hurdle at Rs 1L. At Rs 10L the hurdle is 8.03 bps, and both years still fail. This edge has been arbitraged or decayed below the point of tradability in current data.
 
@@ -129,13 +129,69 @@ H2 at -24.30 bps passes the Rs 1L gate (16.53 bps) but fails concentration and r
 
 **H4's "concentrated in 2018" claim:** Recon numbers were unreproducible (34 bucketing conventions swept; the published 2024 +1.3 is unreachable, true range -5.3 to -17.4 bps). The real pattern is a regime alternation (negative 2018-2020, positive 2021-2023, negative again 2024-2025), not a skill decay or concentration story.
 
-### Still Open (Not Tested)
+**Long-only index-relative tilt, daily-rebalance form:** Tested on H2's overnight reversal signal. Construction halves the two-leg hurdle to ~8.26 bps at Rs 1L and starts from the index return rather than zero. Real gross index-relative excess of 21-31% annualised, but entirely consumed by turnover: the cross-sectional overnight-return rank reshuffles the portfolio 125-150% every session. Net is flat to negative in recent years across all combinations. The binding constraint is structural turnover from daily rebalancing, not the cost hurdle. This axis is closed.
 
-**Long-only index-relative tilt:** Every hypothesis here is a zero-net-exposure long/short spread, paying a two-leg cost hurdle (16.53 bps at Rs 1L) and starting from zero return. A one-leg long-only tilt relative to the Nifty-100 index:
-- Halves the hurdle to ~8.26 bps at Rs 1L (and ~4.02 at Rs 10L)
-- Starts from the index return, not flat -- the strategy only needs to beat the index, not generate absolute return from nothing
+### Still Open (Unverified Conditions on the Low-Turnover Candidate)
 
-H2's overnight reversal signal (-24.30 bps, the largest real effect) could be reframed as an index-weighted portfolio tilted toward overnight losers (overweight, never short). This is not covered by the "five market-neutral spreads failed" conclusion. Measurement is underway as Phase 4.
+**The low-turnover variant (weight smoothing, a=0.10)** passes the pooled test and survives 2024-2025 in every combination, but four specific conditions remain unverified:
+
+1. **2024-2025-only significance:** Current t-stats are pooled over the full 2018-2025 window and dominated by early-year gross. No short-window power test has been run on the weak recent years.
+
+2. **Grid boundary:** a=0.10 is the most extreme point on the pre-registered grid. A plateau-vs-spike check is running to rule out over-fitting at the edge of the search space.
+
+3. **Liquidity decomposition:** H2 edge concentrates in the least-liquid decile. The low-turnover book has not been decomposed by liquidity bucket; if it inherits that concentration, it is not investable at the sizes tested.
+
+4. **Holdout (last 12 months):** The out-of-sample verification set remains locked and unread.
+
+---
+
+## The Tilt Findings -- A Candidate That Clears Costs (With Unverified Conditions)
+
+### Long-Only Index-Relative Tilt: Real Gross Excess, Killed by Turnover
+
+A one-leg long-only tilt uses H2's overnight reversal signal, known at 09:16, to overweight losers in an equal-weight Nifty-100 portfolio. Mild tilt = clipped-rank weights (zero on the top half, rising toward the biggest overnight loser). Aggressive = bottom quintile equal-weighted. Entry 09:16 open, exit 15:20 close. Cost charged only on turnover (one leg, not two).
+
+The gross excess is real and large:
+
+| Variant | Gross (bps/day) | Annualised | Turnover/day | NET (bps/day) | t-stat |
+|---|---|---|---|---|---|
+| Mild / Full | 10.03 | 25.27% | 1.2573 | -0.36 | 11.92 |
+| Aggressive / Full | 12.49 | 31.46% | 1.5026 | +0.07 | 10.96 |
+| Mild / Continuous | 8.60 | 21.67% | 1.2624 | -1.83 | 10.37 |
+| Aggressive / Continuous | 10.66 | 26.86% | 1.5085 | -1.81 | 9.49 |
+
+21-31% annualised index-relative excess at t up to 11.9, across 1,856 sessions. Entirely consumed by turnover. The portfolio rotates 125-150% every day because a cross-sectional overnight-return rank reshuffles the loser bucket almost completely session to session. Pooled net is between -1.83 and +0.07 bps/day (indistinguishable from zero) and clearly negative in recent years across all combinations (2024 range: -6.02 to -11.43 bps/day; 2025 range: -7.14 to -10.25 bps/day).
+
+**Why this kill differs from the other five:** It is not the cost hurdle. Halving the hurdle (from two legs to one) changed nothing, because the binding constraint is not the leg count -- it is the construction itself. A daily-rebalanced cross-sectional rank has structural turnover near a full book rotation.
+
+### Low-Turnover Tilt: Net-Positive in Every Year
+
+The tilt was killed by turnover, not by the cost gate itself. Testing lower-turnover constructions on the same signal: periodic rebalance (k in {1,2,3,5,10}) and weight smoothing (a in {1.0, 0.5, 0.25, 0.1}, where w_t = a*w_t-1 + (1-a)*target_t). Pre-registered grids only; control (k=1, a=1.0) reproduces the daily baseline to two decimals.
+
+The single construction net-positive in both 2024 and 2025, across all four (tilt, universe) combinations, is smoothing a=0.10 -- turnover cut roughly 9-11x:
+
+| Combo | Pooled NET (bps/day) | Annualised | t-stat | 2024 | 2025 |
+|---|---|---|---|---|---|
+| Mild / Full | 2.29 | 5.77% | 12.60 | +1.92 | +0.84 |
+| Mild / Continuous | 1.92 | 4.83% | 11.55 | +1.13 | +0.51 |
+| Aggressive / Full | 2.40 | 6.05% | 10.89 | +1.57 | +0.56 |
+| Aggressive / Continuous | 1.97 | 4.97% | 9.98 | +0.55 | +0.26 |
+
+Mild/full is net-positive in all eight years: 3.14, 1.65, 3.11, 2.14, 2.34, 2.56, 1.92, 0.84 bps/day. It survives on the continuous-coverage universe, so it is not purely a newly-listed-names artifact. No construction in this program has cleared costs in every measured year before.
+
+### Why This Is Not Yet a Result -- The Four Unverified Conditions
+
+State these prominently because they gate the finding:
+
+1. **No 2024-2025-only significance test has been run.** Every t-stat quoted is pooled over the entire window and dominated by larger early-year gross. The weakest surviving case is +0.26 bps/day (aggressive/continuous 2025). Rule 9 applies directly: a small effect-to-SE ratio in a short sub-window is not a confirmed edge without an explicit power check.
+
+2. **a=0.10 is the most extreme point on the pre-registered grid.** Results that appear only at the boundary of a tested range are exactly where over-fitting hides. A plateau-vs-spike check is running.
+
+3. **No liquidity decomposition has been run on the low-turnover book.** H2's overnight reversal edge concentrates in the least-liquid decile. If this construction inherits that, it is not investable at the sizes tested.
+
+4. **The holdout (last 12 months) remains locked and unread.** No out-of-sample verification on withheld data.
+
+**The degenerate corner, recorded honestly:** Hysteresis b=1.00 on the aggressive tilt collapses turnover to ~0.0005-0.0086/day (a buy-once-never-trade book whose few-name concentration makes the no-trade threshold enormous relative to any weight change). Its positive recent numbers reflect almost no rebalancing over 7.5 years and must not be read as validating the hysteresis mechanism.
 
 ---
 
@@ -187,7 +243,7 @@ report keeps the conclusion and discards the reasoning that turned out to be wro
 
 **Bucket geometry mismatch:** `expectancy_by_liquidity_decile` couples the decile loop and the feature-bucketing to one `n_buckets` parameter, so it cannot express production's 10 liquidity deciles x 5 feature quintiles in a single call. The implementer must either add a `feature_n_buckets` parameter or expose decile assignment directly for use by a caller.
 
-**Min-names floor in cross-sectional rank:** The `cross_sectional_rank` function silently returns NaN when a row has fewer than 5 finite values. Below ~44 symbols (enough to fill 5 per decile at 8+ per bucket), every decile returns 0.0 spread against both old and new code. A 2-3 symbol test fixture is useless for regression testing; any future test asserting on decile spreads must use ≥ 50 symbols, confirmed explicitly in the test.
+**Min-names floor in cross-sectional rank:** The `cross_sectional_rank` function silently returns NaN when a row has fewer than 5 finite values. Below ~44 symbols (enough to fill 5 per decile at 8+ per bucket), every decile returns 0.0 spread against both old and new code. A 2-3 symbol test fixture is useless for regression testing; any future test asserting on decile spreads must use >= 50 symbols, confirmed explicitly in the test.
 
 **Causality in decay measurement:** The concentration ratio uses `np.quantile` on the full panel (including future data) to define decile boundaries. When re-measured with causal bucketing (cross-sectional rank on strictly-prior rupee-volume ADV), the ratio dropped from 2.4538 (full-sample, share volume) to 1.9959 (causal, share volume) to 2.1189 (causal, rupee volume, production geometry). The causal 1.9959 looked like a rescue until the bucketing geometry correction (10x5, not 10x10). Causality matters, and so does the unit -- share count vs. rupee turnover partition the bottom decile almost entirely differently.
 
@@ -195,11 +251,13 @@ report keeps the conclusion and discards the reasoning that turned out to be wro
 
 ## Conclusion
 
-We set out to beat the Nifty-100 index on a yearly basis using 1-minute intraday price and volume data. Five hypotheses, ranked in advance and tested under independent dual-suite verification and reconstruction-based oracle audit, were killed. The largest real effect (overnight reversal, -24.30 bps, t = -16.66) is real and stable across 8 years, but concentrates in the least-liquid quintile where transaction costs are prohibitive and the edge has decayed in recent data. Nothing intraday and liquid clears a two-leg round-trip cost hurdle at the sizes tested. The most useful output is not the negative result itself but the method:
+We set out to beat the Nifty-100 index on a yearly basis using 1-minute intraday price and volume data. Five hypotheses, ranked in advance and tested under independent dual-suite verification and reconstruction-based oracle audit, were killed by cost hurdles or magnitude. Two post-hoc reconstructions tested a long-only index-relative tilt using the largest real effect (overnight reversal, -24.30 bps, t = -16.66). The daily-rebalance form is killed by structural turnover, not the cost gate: the cross-sectional rank reshuffles 125-150% daily. A low-turnover variant (weight smoothing, a=0.10) is net-positive in all eight measured years pooled, and specifically in 2024-2025. This is a candidate, not yet confirmed: four unverified conditions (short-window power test, boundary plateau check, liquidity decomposition, holdout verification) gate the finding.
+
+The methodological output remains valuable regardless:
 
 1. **Reconnaissance-first testing.** Independent code paths find errors that test suites miss.
 2. **Dual independent specs + blind suites.** Different readings of a spec catch ambiguities.
 3. **Explicit lookahead audit.** Deliberate side-by-side comparison of leaky vs. correct timings.
 4. **Recent years as ground truth.** Pooled statistics on this dataset overstate tradability.
 
-The highest-value untested axis remains: **long-only index-relative tilts** (one-leg hurdle, starting from index return), reframed as tilting an index-weighted portfolio toward the signals with real effects (H2's overnight reversal). That measurement is underway. All code, test suites, and reconstruction scripts are committed to the repository and reproducible on demand.
+All code, test suites, and reconstruction scripts are committed to the repository and reproducible on demand. The four pending conditions listed above are the next open questions.
