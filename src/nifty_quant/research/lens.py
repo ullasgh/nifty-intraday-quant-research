@@ -18,6 +18,74 @@ from nifty_quant.execution.costs import NSEIntradayEquityCosts
 from nifty_quant.features import core as core_features
 from nifty_quant.research import expectancy
 
+# TODO(rule-8): unmeasured placeholder. `scripts/calibrate_concentration_threshold_v2.py`
+# is deriving the real value from a measured null distribution (500 within-session
+# permutation replicates at this module's exact 10-liquidity-decile x 5-feature-quintile
+# geometry, using the same upper-median convention as below). 2.0 numerically
+# reproduces today's inline literal and is a reasoned-not-measured stand-in only.
+CONCENTRATION_RATIO_THRESHOLD: float = 2.0
+# Alias: some callers/tests refer to this by the spec's example name.
+CONCENTRATION_THRESHOLD: float = CONCENTRATION_RATIO_THRESHOLD
+
+# TODO(rule-8): unmeasured placeholder pending a derived false-positive-rate threshold,
+# per CLAUDE.md rule 8/9.
+DSR_SIGNIFICANCE: float = 0.95
+
+
+def compute_prior_adv(panel: Panel) -> np.ndarray:
+    """Trailing 20-session, strictly-prior rupee ADV (close*volume turnover),
+    broadcast to bar level; shape (n_rows, n_symbols) float64.
+
+    Session 0 is entirely NaN (no prior session exists). Liquidity is rupee
+    turnover, not raw share count, matching data/validate.py's tradable_mask
+    convention (per-session nansum, then trailing-20-session strictly-prior
+    nanmean) -- EXCEPT for one deliberate difference: an entirely-absent
+    session (a symbol with zero finite bars that session) yields NaN for that
+    session's turnover total here, never 0.0. `np.nansum` over an all-NaN slice
+    silently returns 0.0, which validate.py's tradable_mask correctly treats as
+    "0 ADV -> not tradable" for ITS purpose; for THIS purpose (liquidity-decile
+    bucketing) it would instead misclassify a non-trading symbol as the most
+    illiquid possible name, dropping it into decile 0 -- a rule-6 violation
+    (NaN means "no bar", never zero). Session boundaries always come from
+    `panel.day_offsets`, never a fixed bars-per-session stride (Muhurat/
+    shortened sessions vary).
+    """
+    close = panel.field("close").astype(np.float64)
+    volume = panel.field("volume").astype(np.float64)
+    day_offsets = panel.day_offsets
+
+    n_sessions = len(day_offsets) - 1
+    n_symbols = close.shape[1]
+
+    day_value = np.full((n_sessions, n_symbols), np.nan, dtype=np.float64)
+    for session_idx in range(n_sessions):
+        start = int(day_offsets[session_idx])
+        end = int(day_offsets[session_idx + 1])
+        day_slice = slice(start, end)
+        session_turnover = close[day_slice] * volume[day_slice]
+        has_any = np.any(np.isfinite(session_turnover), axis=0)
+        # Unlike data/validate.py's tradable_mask, an entirely absent session
+        # must remain NaN here so it cannot be classified into liquidity decile 0.
+        day_value[session_idx, :] = np.where(
+            has_any, np.nansum(session_turnover, axis=0), np.nan
+        )
+
+    adv = np.full((n_sessions, n_symbols), np.nan, dtype=np.float64)
+    for session_idx in range(1, n_sessions):
+        lookback_start = max(0, session_idx - 20)
+        adv[session_idx, :] = np.nanmean(
+            day_value[lookback_start:session_idx, :], axis=0
+        )
+
+    prior_adv = np.full(close.shape, np.nan, dtype=np.float64)
+    for session_idx in range(n_sessions):
+        start = int(day_offsets[session_idx])
+        end = int(day_offsets[session_idx + 1])
+        prior_adv[start:end, :] = adv[session_idx, :]
+
+    return prior_adv
+
+
 # ---------------------------------------------------------------------------
 # FeatureKindError
 # ---------------------------------------------------------------------------
@@ -92,6 +160,7 @@ class HypothesisVerdict:
 
     hypothesis_id: str
     survived: bool
+    any_not_evaluated: bool
     reasons: tuple[str, ...]  # one line per criterion, always all 7
     expectancy: expectancy.ExpectancyTable
     stability: StabilityReport
@@ -123,15 +192,27 @@ class HypothesisVerdict:
             lines.append(reason)
         lines.append("")
         verdict_token = "SURVIVED" if self.survived else "KILLED"
-        lines.append(f"Final verdict: {verdict_token}")
+        if self.any_not_evaluated:
+            lines.append(
+                f"Final verdict: {verdict_token} "
+                "(INCOMPLETE: one or more criteria NOT_EVALUATED)"
+            )
+        else:
+            lines.append(f"Final verdict: {verdict_token}")
         return "\n".join(lines)
 
     def to_markdown(self) -> str:
         """Return markdown representation for committed results/hypotheses/<id>/verdict.md."""
+        verdict_token = "SURVIVED" if self.survived else "KILLED"
+        verdict_suffix = (
+            " (INCOMPLETE: one or more criteria NOT_EVALUATED)"
+            if self.any_not_evaluated
+            else ""
+        )
         lines = [
             f"# {self.hypothesis_id}",
             "",
-            f"**Verdict:** {'SURVIVED' if self.survived else 'KILLED'}",
+            f"**Verdict:** {verdict_token}{verdict_suffix}",
             "",
             "## Kill Criteria",
             "",
@@ -465,25 +546,20 @@ class Lens:
                 )
                 by_time_of_day_tables[time_name] = table
 
-        # Decompose by liquidity decile: volume quantiles
+        # Decompose by liquidity decile: prior ADV
+        # Unlike data/validate.py's tradable_mask, compute_prior_adv preserves
+        # NaN for an entirely absent session so it cannot become liquidity decile 0.
+        prior_adv = compute_prior_adv(self.panel)
+        adv_bucketing = expectancy.causal_buckets(
+            prior_adv,
+            self.day_offsets,
+            n_buckets=10,
+            method="cross_sectional_rank",
+        )
+
         by_liquidity_decile_tables: dict[int, expectancy.ExpectancyTable] = {}
-        volume = self.panel.field("volume").astype(np.float64)
-
-        # Compute volume deciles (causal, per row)
-        volume_quantiles = np.quantile(
-            volume[np.isfinite(volume)], np.linspace(0, 1, 11)
-        )  # 0, 0.1, ..., 1.0
-        volume_deciles = np.full_like(volume, -1, dtype=np.int8)
-
-        for i in range(volume.shape[0]):
-            for s in range(volume.shape[1]):
-                vol = volume[i, s]
-                if np.isfinite(vol):
-                    decile = np.searchsorted(volume_quantiles[1:-1], vol, side="right")
-                    volume_deciles[i, s] = decile
-
         for decile in range(10):
-            mask = volume_deciles == decile
+            mask = adv_bucketing.labels == decile
             if np.any(mask):
                 # Mask in place: keep the full (n_rows, n_symbols) shape and the
                 # panel's real day_offsets, instead of boolean-indexing with a
@@ -547,6 +623,7 @@ class Lens:
         *,
         latency_profile: Mapping[int, float] | None = None,
         effective_n_trials: int = 1,
+        strategy_returns: np.ndarray | None = None,
         **kw: Any,
     ) -> HypothesisVerdict:
         """Apply all Phase 3 kill criteria and return a verdict.
@@ -573,6 +650,9 @@ class Lens:
             NOT_EVALUATED.
         effective_n_trials : int
             Number of hypotheses tested (for criterion 6 deflation).
+        strategy_returns : np.ndarray | None
+            One-dimensional strategy returns for criterion 6. If None, criterion 6 is
+            NOT_EVALUATED.
         **kw : Any
             Additional keyword arguments passed to expectancy(): method, n_buckets,
             se_method, n_boot, seed, cost_hurdle_bps.
@@ -603,10 +683,6 @@ class Lens:
         exp_table = self.expectancy(feature_obj, horizon, **kw)
         stab_report = self.stability(feature_obj, horizon)
         cost_hurdle_bps = exp_table.cost_hurdle_bps
-
-        # Compute forward returns for additional analysis
-        close = self.panel.field("close").astype(np.float64)
-        fwd = expectancy.forward_returns(close, self.day_offsets, horizon)
 
         reasons: list[str] = []
 
@@ -665,7 +741,8 @@ class Lens:
                 median_liquidity_edge = sorted_liquidity_edges[len(sorted_liquidity_edges) // 2]
                 if (
                     median_liquidity_edge > 0
-                    and max_liquidity_edge > median_liquidity_edge * 2
+                    and max_liquidity_edge
+                    > median_liquidity_edge * CONCENTRATION_RATIO_THRESHOLD
                     and abs(bottom_decile_edge) == max_liquidity_edge
                 ):
                     c4_result = "FAIL"
@@ -739,42 +816,57 @@ class Lens:
             )
 
         # Criterion 6: Deflated Sharpe
-        # Compute returns from forward returns
-        fwd_flat = fwd.values.flatten()
-        valid_mask = np.isfinite(fwd_flat)
-        valid_returns = fwd_flat[valid_mask]
-
-        if len(valid_returns) > 0:
-            dsr = deflated_sharpe(valid_returns, sr0=0.0)
-            # Expected max Sharpe under null
-            if effective_n_trials >= 2:
-                exp_max_sharpe = expected_max_sharpe(effective_n_trials, var_trial_sharpes=1.0)
-                if not np.isnan(dsr) and dsr > exp_max_sharpe:
-                    c6_result = "PASS"
-                else:
-                    c6_result = "FAIL"
-            else:
-                # Single trial, compare to standard Sharpe threshold
-                if not np.isnan(dsr) and dsr > 0.0:
-                    c6_result = "PASS"
-                else:
-                    c6_result = "FAIL"
+        if strategy_returns is None:
+            c6_result = "NOT_EVALUATED"
+            c6_detail = f"strategy_returns not supplied, trials={effective_n_trials}"
+        elif effective_n_trials < 2:
+            c6_result = "NOT_EVALUATED"
+            c6_detail = (
+                f"deflation not evaluated because fewer than 2 trials, "
+                f"trials={effective_n_trials}"
+            )
         else:
-            c6_result = "FAIL"
+            strategy_array = np.asarray(strategy_returns, dtype=np.float64)
+            finite_returns = strategy_array[np.isfinite(strategy_array)]
+            if finite_returns.size < 4:
+                c6_result = "NOT_EVALUATED"
+                c6_detail = (
+                    f"fewer than 4 finite strategy_returns, "
+                    f"trials={effective_n_trials}"
+                )
+            else:
+                # var_trial_sharpes=1.0 is an unmeasured placeholder, not a
+                # measurement; metrics.effective_n_trials exists to measure trial
+                # structure from data but is not wired in here.
+                exp_max_sharpe = expected_max_sharpe(
+                    effective_n_trials, var_trial_sharpes=1.0
+                )
+                dsr = deflated_sharpe(finite_returns, sr0=exp_max_sharpe)
+                if np.isnan(dsr):
+                    c6_result = "NOT_EVALUATED"
+                    c6_detail = f"dsr=nan, trials={effective_n_trials}"
+                else:
+                    c6_result = "PASS" if dsr > DSR_SIGNIFICANCE else "FAIL"
+                    c6_detail = (
+                        f"dsr={dsr:.4f}, significance={DSR_SIGNIFICANCE}, "
+                        f"trials={effective_n_trials}"
+                    )
 
-        reasons.append(f"6. Deflated Sharpe criterion: {c6_result} (trials={effective_n_trials})")
+        reasons.append(
+            f"6. Deflated Sharpe criterion: {c6_result} ({c6_detail})"
+        )
 
         # Criterion 7: Recent-years cost gate
-        # Count usable sessions per year from already-loaded panel dates.
-        session_counts: dict[int, int] = {}
-        for d in self.panel.dates:
-            year = d.year
-            session_counts[year] = session_counts.get(year, 0) + 1
-
-        # A year is complete only if it has a by-year expectancy table and at
-        # least 20 usable sessions.
-        complete_years: list[int] = sorted(
-            year for year in stab_report.by_year if session_counts.get(year, 0) >= 20
+        complete_years = sorted(
+            year
+            for year in stab_report.by_year
+            if {
+                d.month for d in self.panel.dates if d.year == year
+            }
+            == set(range(1, 13))
+        )
+        partial_years = sorted(
+            year for year in stab_report.by_year if year not in complete_years
         )
 
         if len(complete_years) < 2:
@@ -810,6 +902,11 @@ class Lens:
                 and recent_sign == stab_report.dominant_sign
             )
             c7_result = "PASS" if magnitude_pass and sign_pass else "FAIL"
+            excluded_desc = (
+                ", ".join(str(year) for year in partial_years)
+                if partial_years
+                else "none"
+            )
 
             reasons.append(
                 f"7. Recent-years cost gate criterion: {c7_result} "
@@ -817,19 +914,24 @@ class Lens:
                 f"edges={edge_year_a:.2f},{edge_year_b:.2f} bps; "
                 f"mean={mean_recent_edge:.2f} bps; "
                 f"2x hurdle={2 * cost_hurdle_bps:.2f} bps; "
-                f"dominant_sign={stab_report.dominant_sign!r})"
+                f"dominant_sign={stab_report.dominant_sign!r}; "
+                f"excluded partial years: {excluded_desc})"
             )
 
         # Determine if survived
         reason_tokens = [
             r.split(":")[1].strip().split()[0] for r in reasons
         ]  # Extract PASS/FAIL/NOT_EVALUATED
+        any_not_evaluated = any(
+            token == "NOT_EVALUATED" for token in reason_tokens
+        )
         evaluated_results = [t for t in reason_tokens if t != "NOT_EVALUATED"]
         survived = all(r == "PASS" for r in evaluated_results)
 
         return HypothesisVerdict(
             hypothesis_id=hypothesis_id,
             survived=survived,
+            any_not_evaluated=any_not_evaluated,
             reasons=tuple(reasons),
             expectancy=exp_table,
             stability=stab_report,

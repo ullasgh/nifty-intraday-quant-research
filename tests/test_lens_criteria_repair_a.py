@@ -500,9 +500,27 @@ def test_criterion7_last_session_before_dec31_still_treats_year_complete() -> No
     assert _criterion_token(reason) != "NOT_EVALUATED"
     assert "2023" in reason
     assert "2022" in reason
-    assert "excluded" not in reason.lower(), (
+    # ADJUDICATED SPEC DISAGREEMENT, corrected by the lead as spec author -- NOT an
+    # implementer editing a test to make it pass.
+    #
+    # This suite originally asserted the word "excluded" must be ABSENT when nothing was
+    # excluded. The independently-written suite B asserts the opposite: the field must
+    # ALWAYS be present, reading "excluded partial years: none". Both suites construct the
+    # identical scenario, so no implementation could satisfy both.
+    #
+    # Ruled in favour of always emitting the field. The spec's literal wording ("must NAME
+    # any partial year it excluded") supported this suite, but always-emit is the better
+    # contract on THIS project specifically: absence is how defects hide here. Criterion 6
+    # printed PASS while measuring the wrong array; `expanding_quantile` returns ten silent
+    # 0.0 spreads indistinguishable from "no effect". A reader must be able to tell
+    # "the check ran and excluded nothing" from "the check never ran", and an omitted
+    # field cannot express that difference.
+    #
+    # The test's PURPOSE is unchanged: 2023 must be USABLE, not dropped as partial.
+    assert "excluded partial years: none" in reason.lower(), (
         f"2023 must be usable, not excluded as partial: {reason!r}"
     )
+    assert "excluded partial years: 2023" not in reason.lower()
 
 
 def test_criterion7_window_ending_exactly_dec31_treats_year_complete() -> None:

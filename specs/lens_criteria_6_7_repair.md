@@ -168,8 +168,21 @@ mistaken for an inconsistency.
 - Years failing this test are PARTIAL and must be excluded from `complete_years`.
 - If fewer than two complete years remain, criterion 7 reports `NOT_EVALUATED` (existing
   behaviour) — never a silent PASS.
-- The reason string must NAME any partial year it excluded, e.g.
-  `(excluded partial years: 2025)`. A reader must be able to see that 2025 was dropped and why;
+- The reason string must ALWAYS carry the field, naming any partial year it excluded and
+  reading `excluded partial years: none` when it excluded nothing — e.g.
+  `(excluded partial years: 2025)` or `(excluded partial years: none)`.
+
+  **ADJUDICATED 2026-08-19** after the two independent suites disagreed and no implementation
+  could satisfy both: suite A asserted the word must be ABSENT when nothing was excluded, suite
+  B that the field must ALWAYS appear. Ruled for always-emit. The earlier wording of this bullet
+  supported suite A, but always-emit is the better contract ON THIS PROJECT: absence is how
+  defects hide here — criterion 6 printed PASS while deflating the wrong array, and
+  `expanding_quantile` returns ten silent `0.0` spreads indistinguishable from "no effect". A
+  reader must be able to distinguish "the check ran and excluded nothing" from "the check never
+  ran", and an omitted field cannot express that difference. Suite A's single conflicting
+  assertion was corrected by the lead as spec author, with the reasoning recorded in the file.
+
+  A reader must be able to see that 2025 was dropped and why;
   silently changing which years are used would replace one misreport with another.
 
 ### Consequence, which is intended
