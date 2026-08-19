@@ -2222,50 +2222,83 @@ def test_reweight_rescales_when_absent_symbols_mask_weight() -> None:
     assert result.n_symbols_absent >= 1
 
 
-def test_pending_orders_collision_same_fill_row() -> None:
-    """When fill_row already in pending_orders, update in_flight (line 564).
+def test_pending_orders_collision_same_fill_row_executes_as_sum() -> None:
+    """LEAD RENAME + STRENGTHEN (was `..._collision_same_fill_row`; spec
+    `order_lifecycle.md` section B item 1-2). Two problems with the original: (1) its
+    docstring described the OLD overwrite contract ("subtracts old pending before
+    adding new to avoid double-accumulation"), which the spec explicitly forbids --
+    queueing for an already-scheduled fill row APPENDS, and the fill row executes the
+    SUM of everything queued for it; (2) its own construction never actually produced
+    a nonzero collision -- two decisions one minute apart at a FIXED latency target
+    two DIFFERENT (monotonically increasing) fill rows, and both requested the same
+    0.05 weight, so the second order sized out to ~0 regardless of overwrite-vs-sum,
+    making `forced_eod_liquidation_days == 0` unable to discriminate anything.
 
-    Construct: multiple decisions targeting same fill_row via latency or
-    collision. When fill_row already scheduled, line 564 subtracts old
-    pending before adding new to avoid double-accumulation.
+    Replaced with the one collision that is actually reachable per AMENDMENT 2 item 1:
+    an ENTRY from a decision scheduled just before square-off, and the EOD_EXIT the
+    square-off block queues for the pre-existing position, both landing on the same
+    fill row. If the engine still overwrote, the executed quantity would equal only
+    the LATER-queued order (-5000, the EOD_EXIT); appended and summed, it must equal
+    their SUM (3000 + -5000 = -2000).
     """
     panel = make_panel(flat_close(100.0))
 
-    class HighLatencyRebalanceStrategy(Strategy):
-        name = "high_latency_rebalance"
+    class ChangingWeightStrategy(Strategy):
+        """First decision (10:00) opens 0.05; second decision (15:18) requests 0.08."""
+
+        name = "changing_weight"
 
         class Params(BaseModel):
             pass
 
         def __init__(self, params):
             super().__init__(params)
-            self._step = 0
+            self._decision_calls = 0
 
         def data_request(self) -> DataRequest:
-            # Multiple decision times close together might align fill_rows
-            return DataRequest(decision_times=("10:00", "10:01"))
+            return DataRequest(decision_times=("10:00", "15:18"))
 
         def precompute(self, panel: Panel) -> dict:
             return {}
 
+        def on_session_start(self, session_date) -> None:
+            self._decision_calls = 0
+
         def on_decision(
             self, view: MarketView, signals, state: PortfolioState
         ) -> TargetPortfolio | None:
-            self._step += 1
-            # Rebalance to target same position
-            return TargetPortfolio(weights=np.array([0.05, 0.0, 0.0], dtype=np.float64))
+            weight = 0.05 if self._decision_calls == 0 else 0.08
+            self._decision_calls += 1
+            weights = np.zeros(len(view.symbols), dtype=np.float64)
+            weights[0] = weight
+            return TargetPortfolio(weights=weights)
 
-    strategy = HighLatencyRebalanceStrategy(HighLatencyRebalanceStrategy.Params())
+    strategy = ChangingWeightStrategy(ChangingWeightStrategy.Params())
     config = BacktestConfig(
-        decision_latency_bars=5,  # Latency to increase fill_row collision
+        # "15:18" decision (row 363) + latency 2 -> fill_row = 366; square-off's
+        # default 15:20 (row 365) also queues its EOD_EXIT for fill_row = 366.
+        decision_latency_bars=2,
         fill_model=FillModel(slippage=ZeroSlippage()),
         cost_model=ZeroCost(),
     )
 
     result = run_backtest(strategy, panel, config)
 
-    # Positions should not compound (regression guard)
+    collision_row = 366
+    collision_ts = int(panel.ts[collision_row])
+    collision = result.trades[
+        (result.trades["ts"] == collision_ts) & (result.trades["symbol"] == "AAA")
+    ].reset_index(drop=True)
+
+    # entry_shares (0.05 * 1e7 / 100 = 5000) is the position held when square-off
+    # queues its EOD_EXIT for -5000. target_shares (0.08 * 1e7 / 100 = 8000) minus
+    # the already-held 5000 is the ENTRY order of +3000. Summed: -2000.
+    assert len(collision) == 1
+    assert float(collision.iloc[0]["qty"]) == pytest.approx(-2000.0, abs=1e-10)
+    assert not bool(collision.iloc[0]["is_buy"])
+
     assert result.forced_eod_liquidation_days == 0
+    assert result.positions[-1, 0] == 0.0
 
 
 def test_square_off_direct_fill_when_row_is_session_end() -> None:

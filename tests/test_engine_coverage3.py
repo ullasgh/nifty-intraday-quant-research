@@ -46,6 +46,7 @@ import pytest
 from pydantic import BaseModel
 
 from nifty_quant.backtest.engine import BacktestConfig, run_backtest
+from nifty_quant.backtest.orders import OrderIntent
 from nifty_quant.data.panel import Panel
 from nifty_quant.execution.fills import FillModel, FillResult, ZeroSlippage
 from nifty_quant.strategy.base import DataRequest, Strategy, TargetPortfolio
@@ -413,9 +414,22 @@ def test_intrabar_short_stop_nonfinite_open():
 
 
 def test_square_off_dropped_when_position_opens_on_last_row():
-    """TEST 7a: square-off intent dropped (not queued) when a position opens on the LAST row.
+    """TEST 7a (LEAD REWRITE, justified by `specs/order_lifecycle.md` section D): the
+    original premise -- a decision opening a position at/after square-off, which then
+    needed its own square-off intent dropped -- is now categorically disallowed. The
+    decision block is gated: `t < square_off_row_for_day[day_idx]` must hold before
+    `strategy.on_decision` is even called, so no ENTRY can ever be queued at or after
+    the square-off row in the first place; there is nothing left to "drop".
 
-    (branch 587->595)
+    Hand-traced: square_off_time is set 3 minutes after the 09:15 session open, and
+    with day 0 running only 6 rows (all before the literal 15:20 default), that clamps
+    `square_off_row_for_day[0] == 3` exactly. The scripted entry's cursor ts is
+    `ts[3]`, so its decision would fire at row `t=4` (cursor of decision row t is
+    `t-1`) -- which is `>= 3`, so it is gated off before `on_decision` is ever called.
+    The corrected contract is therefore: no ENTRY is queued at or after the
+    square-off row, and the session ends flat with nothing to liquidate at all.
+
+    (originally: branch 587->595)
     """
     ts, day_offsets, dates_arr = _make_grid([6, 4])
     n_rows = len(ts)
@@ -444,19 +458,21 @@ def test_square_off_dropped_when_position_opens_on_last_row():
 
     result = run_backtest(strategy, panel, config)
 
-    assert result.forced_eod_liquidation_days == 1
+    # No ENTRY ever queued: the scripted decision's cursor ts (ts[3]) fires at
+    # decision row t=4, which is >= square_off_row_for_day[0]==3, so the decision
+    # block gate (spec item D) suppresses the call to `on_decision` entirely.
+    entry_trades = result.trades[
+        result.trades["intent"] == OrderIntent.ENTRY.value
+    ]
+    assert len(entry_trades) == 0
+    assert result.n_trades == 0
+
+    # Nothing to liquidate: the book was never opened, so there is nothing for
+    # square-off or the terminal safety net to do.
+    assert result.forced_eod_liquidation_days == 0
     assert result.positions[5, 0] == 0.0
 
-    aaa_trades = result.trades[result.trades["symbol"] == "AAA"]
-    sell_trades = aaa_trades[aaa_trades["qty"] < 0]
-    assert len(sell_trades) == 1
-    row = sell_trades.iloc[0]
-    assert row["ts"] == panel.ts[5]
-    assert row["charges"] == pytest.approx(0.001 * row["notional"] + 15.93)
-
-    # Nothing carried into day 2: if the square-off intent had wrongly been queued for
-    # fill_row=6 (day 2's first row) instead of being dropped, this would either double-sell
-    # (AAA already flat from the forced liquidation at row 5) or otherwise disturb day 2.
+    # Nothing carried into day 2 either.
     assert result.positions[6, 0] == 0.0
 
 

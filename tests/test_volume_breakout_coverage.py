@@ -570,3 +570,17 @@ def test_square_off_time_forces_exit() -> None:
     for day_idx in range(result.positions.shape[0]):
         # After 10:00, positions should be zero
         assert np.all(result.positions[day_idx] == 0.0)
+
+
+def test_target_vol_ann_removed_it_was_dead_and_read_by_nothing() -> None:
+    """specs/portfolio_vol_target.md section E: `target_vol_ann` was validated,
+    hashed into the config hash, and written into the meta dict, but read by
+    nothing (VolumeBreakoutStrategy sizes with sign/sigma clipped to max_weight
+    and gross, never referencing it). Dead-code removal, lead-adjudicated."""
+    from pydantic import ValidationError
+
+    with pytest.raises(ValidationError):
+        VolumeBreakoutParams(target_vol_ann=0.15)
+
+    params = VolumeBreakoutParams(use_hurst=False)
+    assert not hasattr(params, "target_vol_ann")

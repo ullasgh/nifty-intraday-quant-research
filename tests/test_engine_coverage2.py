@@ -9,11 +9,19 @@ from zoneinfo import ZoneInfo
 
 import numpy as np
 import pandas as pd
+import pytest
 from pydantic import BaseModel
 
 from nifty_quant.backtest.engine import BacktestConfig, run_backtest
+from nifty_quant.backtest.orders import OrderIntent
 from nifty_quant.data.panel import Panel
-from nifty_quant.execution.costs import NSEIntradayEquityCosts
+from nifty_quant.execution.costs import (
+    CompositeCostModel,
+    FillBatch,
+    NSEDeliveryEquityCosts,
+    NSEIntradayEquityCosts,
+    ZeroCost,
+)
 from nifty_quant.execution.fills import FillModel, ZeroSlippage
 from nifty_quant.strategy.base import (
     DataRequest,
@@ -459,56 +467,83 @@ def test_stop_order_with_non_finite_open_uses_stop_price() -> None:
     assert isinstance(result.trades, pd.DataFrame)
 
 
-def test_pending_order_fill_row_collision_overwrites() -> None:
-    """Verify that when a fill_row already has a pending order, the new order
-    overwrites the old one (after subtracting the old from in_flight).
+def test_pending_order_fill_row_collision_executes_as_sum() -> None:
+    """LEAD RENAME + STRENGTHEN (was `..._collision_overwrites`; spec `order_lifecycle.md`
+    section B item 1-2). The OLD name and docstring described cancel-and-replace
+    overwrite semantics, which the spec explicitly rejects: queueing an order for a
+    fill row that already has entries APPENDS, and at the fill row all queued orders
+    are combined by summation into one net fill batch. The name now matches the
+    implemented behaviour, and this test discriminates overwrite from sum (the
+    original `trades.shape[0] > 0` assertion could not tell the two apart -- both
+    produce a nonempty trades frame).
 
-    Per engine code line 563-565: if fill_row in pending_orders, subtract
-    pending_orders[fill_row] from in_flight first, then set the new order.
+    Two orders are engineered onto the SAME fill row (the only reachable collision
+    per AMENDMENT 2 item 1: an ENTRY from a decision just before square-off, and the
+    EOD_EXIT the square-off block queues for the pre-existing position). If the
+    engine still overwrote, the executed quantity would equal only the LATER-queued
+    order (-5000, the EOD_EXIT); appended and summed, it must equal their SUM
+    (3000 + -5000 = -2000).
     """
 
-    class MultiTradeStrategy(Strategy):
-        """Issue multiple orders that all try to fill at the same future row."""
+    class ChangingWeightStrategy(Strategy):
+        """First decision (10:00) opens 0.05; second decision (15:18) requests 0.08."""
 
-        name = "multi_trade"
+        name = "changing_weight"
 
         class Params(BaseModel):
             pass
 
+        def __init__(self, params) -> None:
+            super().__init__(params)
+            self._decision_calls = 0
+
         def data_request(self) -> DataRequest:
-            return DataRequest(fields=("open", "high", "low", "close", "volume"))
+            return DataRequest(decision_times=("10:00", "15:18"))
 
         def precompute(self, panel) -> dict:
             return {}
 
-        def on_decision(self, view, signals, state) -> TargetPortfolio | None:
-            if len(view.symbols) < 2:
-                return None
+        def on_session_start(self, session_date) -> None:
+            self._decision_calls = 0
 
+        def on_decision(self, view, signals, state) -> TargetPortfolio | None:
+            weight = 0.05 if self._decision_calls == 0 else 0.08
+            self._decision_calls += 1
             weights = np.zeros(len(view.symbols), dtype=np.float64)
-            # Vary weights to force different order sizes on each decision
-            weights[0] = 0.05 * (1 + (state.ts % 10) / 100)
-            weights[1] = -0.03 * (1 + (state.ts % 5) / 100)
+            weights[0] = weight
             return TargetPortfolio(weights=weights)
 
     np.random.seed(46)
     ts, day_offsets, dates_arr = _session_grid()
     panel = _make_panel_flat(ts, day_offsets, dates_arr)
 
-    strategy = MultiTradeStrategy(params=MultiTradeStrategy.Params())
+    strategy = ChangingWeightStrategy(params=ChangingWeightStrategy.Params())
     config = BacktestConfig(
         capital=1e7,
-        decision_latency_bars=2,  # Both decisions will target fill_row = t+3
+        # "15:18" decision (row 363) + latency 2 -> fill_row = 366; square-off's
+        # default 15:20 (row 365) also queues its EOD_EXIT for fill_row = 366.
+        decision_latency_bars=2,
         cost_model=NSEIntradayEquityCosts(),
         fill_model=FillModel(slippage=ZeroSlippage()),
     )
 
     result = run_backtest(strategy, panel, config)
 
-    # If collision handling is correct, the second order should overwrite
-    # and positions should be correct at the end
-    assert isinstance(result.trades, pd.DataFrame)
-    assert result.trades.shape[0] > 0
+    collision_row = int(day_offsets[0]) + 366
+    collision_ts = int(ts[collision_row])
+    collision = result.trades[
+        (result.trades["ts"] == collision_ts) & (result.trades["symbol"] == "AAA")
+    ].reset_index(drop=True)
+
+    # entry_shares (0.05 * 1e7 / 100 = 5000) is the position held when square-off
+    # queues its EOD_EXIT for -5000. target_shares (0.08 * 1e7 / 100 = 8000) minus
+    # the already-held 5000 is the ENTRY order of +3000. Summed: -2000.
+    assert len(collision) == 1
+    assert float(collision.iloc[0]["qty"]) == pytest.approx(-2000.0, abs=1e-10)
+    assert not bool(collision.iloc[0]["is_buy"])
+
+    assert result.forced_eod_liquidation_days == 0
+    assert result.positions[-1, 0] == 0.0
 
 
 def test_square_off_queued_direct_fill_on_last_row() -> None:
@@ -561,14 +596,32 @@ def test_square_off_queued_direct_fill_on_last_row() -> None:
 
 
 def test_eod_liquidation_uses_delivery_costs() -> None:
-    """Verify that forced EOD liquidation at session end charges NSEDeliveryEquityCosts.
+    """Verify corrected square-off/forced-EOD semantics and composed forced-EOD costs.
 
-    Per engine code lines 595-604: if positions are not zero at session end,
-    force-liquidate at close[t] using NSEDeliveryEquityCosts, not the config's cost_model.
+    LEAD REWRITE (justified by `specs/order_lifecycle.md` sections C, D, E). The
+    original test encoded the OLD buggy interaction: with `decision_times=None`
+    every row was a decision row, so the un-gated decision block re-entered a
+    position after square-off (defect 2 / spec item D) and the one-shot
+    `square_off_queued` latch (defect 1 / spec item C) refused to re-queue
+    liquidation for the remainder, forcing FORCED_EOD on nearly every day. Both
+    defects are fixed: the decision block no longer calls the strategy at or past
+    the square-off row (item D), and the square-off block re-arms every row until
+    flat or the session ends (item C). With ample liquidity and an early
+    `square_off_time`, liquidation now completes cleanly via retried `EOD_EXIT`
+    fills and `forced_eod_liquidation_days == 0`.
+
+    This also covers spec item E: forced-EOD costs are COMPOSED
+    (`config.cost_model` + `NSEDeliveryEquityCosts()`), not substituted -- at HEAD
+    the forced leg paid delivery-only charges (zero brokerage/exchange/SEBI/IPFT/
+    stamp/GST). Part B below constructs a genuinely-unfinishable square-off (thin
+    volume through the session's last row) to exercise an actual FORCED_EOD leg and
+    verifies its charges equal the composed model's charges component-wise, for
+    both the default cost model and a non-default one (`ZeroCost`, per AMENDMENT 1
+    item 3), proving the composition is generic rather than a hardcoded pair.
     """
 
     class HoldTillEodStrategy(Strategy):
-        """Hold position until forcibly liquidated at EOD."""
+        """Hold position until square-off liquidates it."""
 
         name = "hold_till_eod"
 
@@ -585,16 +638,17 @@ def test_eod_liquidation_uses_delivery_costs() -> None:
             if len(view.symbols) == 0:
                 return None
             weights = np.zeros(len(view.symbols), dtype=np.float64)
-            # Always hold long to the very end
+            # Always hold long
             weights[0] = 0.05
             return TargetPortfolio(weights=weights)
 
+    # --- Part A: corrected semantics -- ample liquidity, early square-off. ---
     np.random.seed(48)
     ts, day_offsets, dates_arr = _session_grid()
     panel = _make_panel_flat(ts, day_offsets, dates_arr)
 
     strategy = HoldTillEodStrategy(params=HoldTillEodStrategy.Params())
-    # Set square_off_time very early so forced EOD liquidation is triggered
+    # Set square_off_time very early so plenty of the session remains for retries.
     config = BacktestConfig(
         capital=1e7,
         square_off_time="09:20",  # Way too early (row 5)
@@ -604,10 +658,64 @@ def test_eod_liquidation_uses_delivery_costs() -> None:
 
     result = run_backtest(strategy, panel, config)
 
-    # Verify forced liquidation occurred
-    assert result.forced_eod_liquidation_days >= N_DAYS - 1  # At least most days
-    # All positions must be zero by end
+    assert result.forced_eod_liquidation_days == 0
     assert result.positions[-1, 0] == 0.0
+    eod_exits = result.trades[result.trades["intent"] == OrderIntent.EOD_EXIT.value]
+    forced = result.trades[result.trades["intent"] == OrderIntent.FORCED_EOD.value]
+    assert len(eod_exits) > 0
+    assert len(forced) == 0
+
+    # --- Part B: genuinely-unfinishable square-off, to exercise a real FORCED_EOD
+    # leg and verify the composed cost model, for both a default and a non-default
+    # `config.cost_model`. ---
+    for cost_model in (NSEIntradayEquityCosts(), ZeroCost()):
+        thin_ts, thin_day_offsets, thin_dates = _session_grid()
+        thin_panel = _make_panel_flat(thin_ts, thin_day_offsets, thin_dates)
+        # Thin volume across the entire square-off window (default square_off_time
+        # "15:20" -> row 365) through the session's last row on day 0 only, so
+        # retrying cannot finish liquidating in time and the terminal safety net
+        # (spec item C.5) fires.
+        day0_start = int(thin_day_offsets[0])
+        day0_end = int(thin_day_offsets[1])
+        thin_panel.field("volume")[day0_start + 365 : day0_end, 0] = 1.0
+
+        forced_strategy = HoldTillEodStrategy(params=HoldTillEodStrategy.Params())
+        forced_config = BacktestConfig(
+            capital=1e7,
+            cost_model=cost_model,
+            fill_model=FillModel(slippage=ZeroSlippage()),
+        )
+        forced_result = run_backtest(forced_strategy, thin_panel, forced_config)
+
+        assert forced_result.forced_eod_liquidation_days >= 1
+        forced_trades = forced_result.trades[
+            forced_result.trades["intent"] == OrderIntent.FORCED_EOD.value
+        ]
+        assert len(forced_trades) >= 1
+        forced_trade = forced_trades.iloc[0]
+
+        qty = float(forced_trade["qty"])
+        price = float(forced_trade["price"])
+        batch = FillBatch(
+            notional=np.asarray([abs(qty) * price], dtype=np.float64),
+            is_buy=np.asarray([bool(forced_trade["is_buy"])], dtype=bool),
+        )
+        composite = CompositeCostModel(models=(cost_model, NSEDeliveryEquityCosts()))
+        expected = composite.charges(batch).sum()
+        blotter_charges = float(forced_trade["charges"])
+
+        assert blotter_charges == pytest.approx(expected.total, rel=1e-9)
+        if isinstance(cost_model, NSEIntradayEquityCosts):
+            # Default cost model: brokerage and GST on the forced leg must be
+            # non-zero (they were zero at HEAD, which passed delivery-only costs).
+            assert expected.brokerage > 0.0
+            assert expected.gst > 0.0
+        else:
+            # ZeroCost composed with the delivery supplement: the forced leg must
+            # charge EXACTLY the delivery supplement and nothing else -- proof the
+            # composition is generic, not a hardcoded NSEIntradayEquityCosts pair.
+            delivery_only = NSEDeliveryEquityCosts().charges(batch).sum()
+            assert expected.total == pytest.approx(delivery_only.total, rel=1e-9)
 
 
 def test_square_off_queued_not_on_last_row() -> None:

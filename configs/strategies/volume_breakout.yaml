@@ -16,9 +16,6 @@ params:
   min_hold_bars: 5
   cooldown_bars: 0
   square_off_time: "15:20"
-  stop_loss_pct: 0.01
-  target_pct: 0.02
-  target_vol_ann: 0.15
   sigma_floor: 1.0e-5
   max_weight: 0.10
   gross: 1.0

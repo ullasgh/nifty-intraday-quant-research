@@ -4,13 +4,17 @@ Before the fix, `walkforward` pooled `_daily_returns`-aggregated (per trading da
 return series together with RAW per-decision-row `res.turnover`, so `pooled_turnover` and
 `pooled_gross`/`pooled_net` had different lengths. `breakeven_cost_bps(pooled_gross,
 pooled_turnover)` then raised `ValueError: gross_returns and turnover must have the same
-length`, and the command crashed on any real (unstubbed) `_daily_returns`/`_daily_turnover`
-run. It was masked in the rest of the suite only because `tests/test_cli_tradable.py`
-monkeypatches `cli._daily_returns` to a fixed-length stub.
+length`, and the command crashed on any real (unstubbed) day-aggregation run. It was masked
+in the rest of the suite only because `tests/test_cli_tradable.py` monkeypatched
+`cli._daily_returns` to a fixed-length stub.
 
-These tests exercise the REAL `_daily_returns`/`_daily_turnover` reconstruction end to end
-(only `run_backtest` is stubbed with a deterministic, correctly-sized fake result), so they
-would fail against the pre-fix code.
+Post-migration (specs/daily_results.md): `_daily_returns`/`_daily_turnover` are deleted along
+with the per-row reconstruction they did. `cli.py` now reads `BacktestResult.daily` --
+`DailyResult.returns`/`.gross_returns`/`.turnover` are always the same length by construction
+(one entry per session, populated together by `build_daily`), which is exactly the invariant
+this file was guarding. These tests exercise the REAL `result.daily.*` fields end to end (only
+`run_backtest` is stubbed, with `_fake_result` populating `daily` via the real `build_daily`),
+so they would still fail if `cli.py` regressed to pooling two independently-derived series.
 """
 
 from __future__ import annotations
@@ -26,8 +30,9 @@ import pandas as pd
 import pytest
 from typer.testing import CliRunner
 
+from nifty_quant.backtest.daily import build_daily
 from nifty_quant.backtest.engine import BacktestResult
-from nifty_quant.cli import _daily_returns, _daily_turnover, app
+from nifty_quant.cli import app
 from nifty_quant.data.panel import Panel
 from nifty_quant.universe.static import Universe
 
@@ -72,19 +77,59 @@ def _make_panel(
     return Panel(fields, symbols, ts, day_offsets, np.asarray(session_dates, dtype=object))
 
 
-def _fake_result(n_rows: int, seed: int = 0) -> BacktestResult:
+def _row_day_index(panel: Panel) -> np.ndarray:
+    """Per-row day index, computed exactly as `engine.py`'s `day_index` local."""
+    n_rows = panel.n_rows()
+    return (
+        np.searchsorted(panel.day_offsets, np.arange(n_rows, dtype=np.int64), side="right")
+        - 1
+    )
+
+
+def _session_dates_epoch(panel: Panel) -> np.ndarray:
+    """`panel.dates` as int64 UTC-midnight epoch seconds, matching `engine.py`'s
+    `session_dates_epoch` local (spec AMENDMENT 1 item 2)."""
+    return np.asarray(
+        [
+            int(
+                datetime(
+                    session_date.year,
+                    session_date.month,
+                    session_date.day,
+                    tzinfo=timezone.utc,
+                ).timestamp()
+            )
+            for session_date in panel.dates
+        ],
+        dtype=np.int64,
+    )
+
+
+def _fake_result(n_rows: int, panel: Panel, seed: int = 0) -> BacktestResult:
     """Deterministic fake `BacktestResult` correctly sized to `panel.n_rows()`.
 
-    Unlike `tests/test_cli_tradable.py`'s fixed-length stub, this always matches the real
-    per-decision-row reconstruction, so the real (unstubbed) `_daily_returns`/
-    `_daily_turnover` in `cli.py` can run against it without a length mismatch.
+    ``daily`` is populated with the real `build_daily`, on the same per-row day index /
+    session dates the engine itself derives, so the real (unstubbed) day-aggregated
+    fields `cli.py` reads (`result.daily.returns`/`.gross_returns`/`.turnover`) are
+    exercised end to end rather than a fixed-length stub.
     """
     rng = np.random.default_rng(seed)
     gross = rng.normal(loc=0.0006, scale=0.004, size=n_rows).astype(np.float64)
     turnover = np.full(n_rows, 1.0, dtype=np.float64)
     returns = (gross - 0.0002 * turnover).astype(np.float64)
+    initial_capital = 1e7
+    equity_curve = np.cumprod(1.0 + returns) * initial_capital
+    daily = build_daily(
+        _row_day_index(panel),
+        equity_curve,
+        returns,
+        gross,
+        turnover,
+        _session_dates_epoch(panel),
+        initial_capital=initial_capital,
+    )
     return BacktestResult(
-        equity_curve=np.cumprod(1.0 + returns) * 1e7,
+        equity_curve=equity_curve,
         returns=returns,
         positions=np.zeros((n_rows, 1)),
         trades=pd.DataFrame({"symbol": [], "side": [], "qty": [], "price": []}),
@@ -95,15 +140,16 @@ def _fake_result(n_rows: int, seed: int = 0) -> BacktestResult:
         rejected_order_rate=0.0,
         unfilled_notional_pct=0.0,
         forced_eod_liquidation_days=0,
-        initial_capital=1e7,
+        initial_capital=initial_capital,
         ruined=False,
         ruin_index=-1,
+        daily=daily,
     )
 
 
 def _capturing_run_backtest(calls: list[dict[str, Any]]) -> Callable[..., BacktestResult]:
     def _stub(strat: Any, panel: Panel, config: Any, **kwargs: Any) -> BacktestResult:
-        result = _fake_result(panel.n_rows())
+        result = _fake_result(panel.n_rows(), panel)
         calls.append({"panel": panel, "result": result})
         return result
 
@@ -152,11 +198,12 @@ def _run_walkforward_cli(
     panel: Panel,
     all_dates: list[date],
 ) -> tuple[Any, list[dict[str, Any]]]:
-    """Invoke `nq walkforward` for real, with REAL `_daily_returns`/`_daily_turnover`.
+    """Invoke `nq walkforward` for real, with REAL `result.daily.*` fields (populated by
+    `_fake_result` via the real `build_daily`, not a fixed-length monkeypatch stub).
 
     Only `run_backtest`, `load_panel`, `load_universe`, `TradingCalendar.from_index_bars`,
     and `settings.RESULTS_ROOT` are stubbed -- everything else, including the day-basis
-    reconstruction under test, runs unmodified.
+    pooling under test, runs unmodified.
     """
     import nifty_quant.backtest.engine as engine_mod
     import nifty_quant.calendar as calendar_mod
@@ -202,17 +249,35 @@ def _split_calls(calls: list[dict[str, Any]], full_panel: Panel) -> list[dict[st
 def test_daily_turnover_sums_within_session_while_daily_returns_compound() -> None:
     """Unit-level: turnover sums per day, returns compound per day, on the same day basis.
 
-    Two sessions (3 bars, 4 bars); decision_times=None reconstructs rows 1..6 plus the
-    duplicated final row 6, mapping rows {1,2} to day 0 and {3,4,5,6,6} to day 1. Expected
-    values below are computed independently of `aggregate_returns_by_group`/`_daily_turnover`
-    by hand, so this is not a tautological restatement of the implementation.
+    Exercises `build_daily` directly -- the CLI no longer reconstructs a day index from
+    decision times outside the engine; the day index is a required input the caller
+    supplies, exactly as the real engine supplies it (`engine.py`'s `day_idx`). Rows
+    {0, 1} are assigned to day 0 and rows {2, 3, 4, 5, 6} to day 1: an arbitrary but fixed
+    grouping, chosen only so the hand-computed expected values below match what this test
+    asserted before the migration (it previously relied on the old
+    `_decision_and_final_rows` reconstruction happening to produce that same {2, 5} split
+    for a 3-bar/4-bar two-session panel with `decision_times=None`). Expected values are
+    computed independently of `aggregate_returns_by_group`, so this is not a tautological
+    restatement of the implementation.
     """
     panel = _make_panel([date(2024, 1, 2), date(2024, 1, 3)], [3, 4])
     returns = np.array([0.01, 0.02, 0.03, -0.01, 0.005, 0.0, 0.02], dtype=np.float64)
+    gross_returns = returns.copy()
     turnover = np.array([0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7], dtype=np.float64)
+    row_day_index = np.array([0, 0, 1, 1, 1, 1, 1], dtype=np.int64)
+    equity = np.cumprod(1.0 + returns) * 1e7
 
-    daily_ret = _daily_returns(returns, panel, None)
-    daily_to = _daily_turnover(turnover, panel, None)
+    daily = build_daily(
+        row_day_index,
+        equity,
+        returns,
+        gross_returns,
+        turnover,
+        _session_dates_epoch(panel),
+        initial_capital=1e7,
+    )
+    daily_ret = daily.returns
+    daily_to = daily.turnover
 
     assert daily_ret.shape == daily_to.shape == (2,)
 
@@ -237,8 +302,8 @@ def test_walkforward_exits_zero_with_real_daily_returns_on_multi_session_panel(
     tmp_path: Path,
 ) -> None:
     """The core regression check: pre-fix, this crashes with a length-mismatch ValueError
-    from `breakeven_cost_bps(pooled_gross, pooled_turnover)` as soon as `_daily_returns` is
-    NOT stubbed to a fixed length -- i.e. on any real data.
+    from `breakeven_cost_bps(pooled_gross, pooled_turnover)` as soon as the day-aggregated
+    series are NOT stubbed to a fixed length -- i.e. on any real data.
     """
     all_dates = _all_dates_280()
     panel = _make_panel(all_dates, [2] * len(all_dates))
@@ -254,10 +319,18 @@ def test_pooled_gross_and_pooled_turnover_have_equal_length(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
 ) -> None:
-    """Reconstructs, independently of `walkforward`'s internals, what each split's daily
-    return and daily turnover series would be, and asserts they are always equal length --
-    which is exactly the invariant `pooled_gross`/`pooled_turnover` need to hold after
-    concatenation for `breakeven_cost_bps` to not crash.
+    """Asserts each split's `result.daily.returns`/`.turnover` are equal length -- exactly
+    the invariant `pooled_gross`/`pooled_turnover` need to hold after concatenation for
+    `breakeven_cost_bps` to not crash -- and that the pooled total the CLI reports matches
+    the sum of the per-split daily lengths.
+
+    Before the migration this reconstructed each split's daily series independently (via
+    `_daily_returns`/`_daily_turnover`) and could therefore actually observe two disagreeing
+    reconstructions. Now `DailyResult.returns` and `.turnover` are always the same length
+    by construction (both are populated together, one entry per session, by the single
+    `build_daily` call) -- the per-split shape check below is therefore a structural
+    invariant rather than an incidental one, but the pooled-total check against the CLI's
+    own printed output remains a real end-to-end assertion on `cli.py`'s pooling.
     """
     all_dates = _all_dates_280()
     panel = _make_panel(all_dates, [2] * len(all_dates))
@@ -270,10 +343,8 @@ def test_pooled_gross_and_pooled_turnover_have_equal_length(
 
     total_days = 0
     for call in split_calls:
-        split_panel = call["panel"]
-        split_result = call["result"]
-        split_daily_net = _daily_returns(split_result.returns, split_panel, None)
-        split_daily_turnover = _daily_turnover(split_result.turnover, split_panel, None)
+        split_daily_net = call["result"].daily.returns
+        split_daily_turnover = call["result"].daily.turnover
         assert split_daily_net.shape == split_daily_turnover.shape
         total_days += split_daily_net.size
 
@@ -299,9 +370,7 @@ def test_pooled_mean_turnover_is_reported_on_daily_basis(
     split_calls = _split_calls(calls, panel)
     assert len(split_calls) >= 2
 
-    daily_turnovers = [
-        _daily_turnover(call["result"].turnover, call["panel"], None) for call in split_calls
-    ]
+    daily_turnovers = [call["result"].daily.turnover for call in split_calls]
     expected_pooled_turnover = np.concatenate(daily_turnovers)
     expected_mean = float(np.mean(expected_pooled_turnover))
 
@@ -332,12 +401,9 @@ def test_multi_split_pooling_concatenates_correctly(
     split_calls = _split_calls(calls, panel)
     assert len(split_calls) >= 2, "need multiple splits to test pooling concatenation"
 
-    per_split_daily_net_sizes = [
-        _daily_returns(call["result"].returns, call["panel"], None).size for call in split_calls
-    ]
+    per_split_daily_net_sizes = [call["result"].daily.returns.size for call in split_calls]
     per_split_daily_turnover_sizes = [
-        _daily_turnover(call["result"].turnover, call["panel"], None).size
-        for call in split_calls
+        call["result"].daily.turnover.size for call in split_calls
     ]
     assert per_split_daily_net_sizes == per_split_daily_turnover_sizes
 

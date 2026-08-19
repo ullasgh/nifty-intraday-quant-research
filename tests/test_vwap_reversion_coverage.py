@@ -108,3 +108,15 @@ def test_session_start_time_boundary_at_556_minutes() -> None:
     with pytest.raises(ValidationError) as exc_info:
         VwapReversionParams(session_start_time="09:15")
     assert "session_start_time must be after 09:15" in str(exc_info.value)
+
+
+def test_target_vol_ann_removed_it_was_dead_and_read_by_nothing() -> None:
+    """specs/portfolio_vol_target.md section E: `target_vol_ann` was validated,
+    hashed into the config hash, and written into the meta dict, but read by
+    nothing (VwapReversionStrategy sizes with sign/sigma clipped to max_weight
+    and gross, never referencing it). Dead-code removal, lead-adjudicated."""
+    with pytest.raises(ValidationError):
+        VwapReversionParams(target_vol_ann=0.15)
+
+    params = VwapReversionParams()
+    assert not hasattr(params, "target_vol_ann")

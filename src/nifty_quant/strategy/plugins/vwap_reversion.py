@@ -37,7 +37,6 @@ class VwapReversionParams(BaseModel):
     vol_window: int = 30
     min_bars_since_open: int = 15
     square_off_time: str = "15:20"
-    target_vol_ann: float = 0.15
     sigma_floor: float = 1e-5
     max_weight: float = 0.10
     gross: float = 1.0
@@ -231,6 +230,5 @@ class VwapReversionStrategy(Strategy):
             "gross": float(np.sum(np.abs(weights))),
             "long_count": float(np.sum(weights > 0)),
             "short_count": float(np.sum(weights < 0)),
-            "target_vol_ann": float(p.target_vol_ann),
         }
         return TargetPortfolio(weights=weights, meta=meta)

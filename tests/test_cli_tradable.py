@@ -9,6 +9,7 @@ import pandas as pd
 import pytest
 from typer.testing import CliRunner
 
+from nifty_quant.backtest.daily import DailyResult
 from nifty_quant.backtest.engine import BacktestResult
 from nifty_quant.cli import _tradable_mask_summary, app
 from nifty_quant.data.panel import Panel
@@ -80,8 +81,23 @@ def _fake_result(n=3):
     gross = rng.normal(-0.001, 0.005, size=n)
     turnover = np.full(n, 1.0)
     returns = gross - 0.0005 * turnover
+    equity_curve = np.cumprod(1.0 + returns) * 1e7
+    # `result.daily` is what the CLI now reads for its printed Sharpe/turnover
+    # figures and for the `returns.parquet` artifact (it no longer calls a
+    # `_daily_returns`/`_daily_turnover` reconstruction helper). This test suite
+    # only asserts on tradable-mask plumbing, not on these numeric values, so a
+    # trivial one-row-per-decision-row `DailyResult` is enough to keep the CLI's
+    # code paths that read `result.daily.*` from raising.
+    daily = DailyResult(
+        dates=np.arange(n, dtype=np.int64),
+        equity=equity_curve,
+        returns=returns,
+        gross_returns=gross,
+        turnover=turnover,
+        n_days=n,
+    )
     return BacktestResult(
-        equity_curve=np.cumprod(1.0 + returns) * 1e7,
+        equity_curve=equity_curve,
         returns=returns,
         positions=np.zeros((n, 1)),
         trades=pd.DataFrame({"symbol": [], "side": [], "qty": [], "price": []}),
@@ -93,6 +109,7 @@ def _fake_result(n=3):
         unfilled_notional_pct=0.0,
         forced_eod_liquidation_days=0,
         initial_capital=1e7,
+        daily=daily,
     )
 
 
@@ -155,7 +172,6 @@ def _patch_common(
     monkeypatch: pytest.MonkeyPatch, tmp_path, panel, calls
 ) -> None:
     import nifty_quant.backtest.engine as engine_mod
-    import nifty_quant.cli as cli_mod
     import nifty_quant.data.panel as panel_mod
     import nifty_quant.settings as settings_mod
     import nifty_quant.universe.static as universe_mod
@@ -168,21 +184,6 @@ def _patch_common(
     )
     monkeypatch.setattr(
         engine_mod, "run_backtest", _capturing_run_backtest(calls)
-    )
-    monkeypatch.setattr(
-        cli_mod,
-        "_daily_returns",
-        lambda *args, **kwargs: np.array([0.001, -0.0007, 0.0004]),
-    )
-    # `_daily_turnover` must be stubbed alongside `_daily_returns` for the same reason
-    # (see module docstring / cli.py DEFECT 1 fix): `walkforward` now pools day-aggregated
-    # turnover on the same basis as day-aggregated returns, so both need a fixed-length
-    # stub of matching length to bypass the real (and here irrelevant) row reconstruction
-    # against this test's fixed 3-row `_fake_result`.
-    monkeypatch.setattr(
-        cli_mod,
-        "_daily_turnover",
-        lambda *args, **kwargs: np.array([0.5, 0.6, 0.4]),
     )
     monkeypatch.setattr(settings_mod, "RESULTS_ROOT", tmp_path)
 

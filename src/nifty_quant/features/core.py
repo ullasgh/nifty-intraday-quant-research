@@ -342,6 +342,100 @@ def parkinson_volatility(
     return np.sqrt(mean_log_range_sq / (4.0 * np.log(2.0)))
 
 
+def annualization_factor(day_offsets: np.ndarray, *, sessions_per_year: int = 252) -> float:
+    """sqrt(sessions_per_year * median_bars_per_session).
+
+    Bars per session is the MEDIAN of np.diff(day_offsets) over every session
+    present -- median, not mean, so a 60-bar Muhurat session or a 105-bar
+    shortened/disaster-recovery session does not drag the estimate (rule 5: never
+    assume a fixed 375-bar session stride). No `window` parameter and no trailing
+    slice: bars-per-session is a CALENDAR property, not a price property, so
+    deriving it from the whole panel introduces no lookahead -- knowing a future
+    session was a 60-bar Muhurat session tells you nothing about any return
+    (specs/portfolio_vol_target.md, amendment 3).
+
+    For N sessions, day_offsets carries N+1 entries (N starts plus the final end).
+    Raises ValueError on a ZERO-session panel (len(day_offsets) < 2) rather than
+    returning NaN: a NaN annualization factor would propagate silently into every
+    downstream sigma, weight and share count, surfacing as an empty book rather
+    than as an error (amendment 4 addendum).
+    """
+    offsets = np.asarray(day_offsets)
+    if offsets.ndim != 1:
+        raise ValueError("day_offsets must be 1-D")
+    session_lengths = np.diff(offsets)
+    if session_lengths.size == 0:
+        raise ValueError(
+            "annualization_factor: day_offsets has zero sessions "
+            f"(shape={offsets.shape}); at least a start and an end are required"
+        )
+    bars_per_session = float(np.median(session_lengths))
+    return float(np.sqrt(sessions_per_year * bars_per_session))
+
+
+@finite_output(allow_nan=True)
+def ewma_volatility_ann(
+    close: np.ndarray,
+    day_offsets: np.ndarray,
+    *,
+    halflife: float,
+    sessions_per_year: int = 252,
+) -> np.ndarray:
+    """Causal, session-bounded EWMA volatility of 1-bar log returns, annualized.
+
+    `halflife` (in bars) is a REQUIRED, un-defaulted parameter (rule 8): it is a
+    genuine research choice governing how price history is weighted, and Phase E
+    measures which value best predicts realised forward volatility
+    (specs/portfolio_vol_target.md, amendments 1 and 3). A caller must pass one
+    explicitly -- there is no silently-picked default, and passing `halflife=None`
+    raises just as omitting it does.
+
+    Returns are session-bounded via `log_returns` (the first bar of every session
+    is NaN -- no overnight/cross-session return is ever formed, so no overnight gap
+    poisons the vol estimate). The EWMA VARIANCE STATE is NOT reset at session
+    boundaries: at a session's first bar there is no new return to observe, so the
+    running estimate simply carries its prior level forward rather than restarting
+    from an uninformative zero, which would otherwise force every session to "warm
+    up" from scratch. Squared log returns update the state with decay
+    `alpha = 1 - 0.5 ** (1 / halflife)`.
+
+    Annualized via `annualization_factor(day_offsets, sessions_per_year=...)` --
+    the median bars-per-session over the whole panel; see that function's
+    docstring for why no trailing window is needed here.
+    """
+    if halflife is None:
+        raise ValueError("halflife is required and cannot be None")
+    if not np.isfinite(halflife) or halflife <= 0:
+        raise ValueError("halflife must be a finite positive number")
+
+    close64 = _as_float64_2d(close, "close")
+    offsets = np.asarray(day_offsets)
+    check_day_offsets(offsets, close64.shape[0])
+
+    returns = log_returns(close64, day_offsets=offsets)
+    alpha = 1.0 - 0.5 ** (1.0 / halflife)
+
+    r2 = returns * returns
+    n_rows, n_cols = r2.shape
+    var = np.full((n_rows, n_cols), np.nan, dtype=np.float64)
+    state = np.full(n_cols, np.nan, dtype=np.float64)
+    for t in range(n_rows):
+        row = r2[t]
+        has_obs = np.isfinite(row)
+        state_valid = np.isfinite(state)
+        updated = alpha * row + (1.0 - alpha) * state
+        state = np.where(
+            has_obs & state_valid,
+            updated,
+            np.where(has_obs & ~state_valid, row, state),
+        )
+        var[t] = state
+
+    sigma_bar = np.sqrt(var)
+    factor = annualization_factor(offsets, sessions_per_year=sessions_per_year)
+    return sigma_bar * factor
+
+
 @panel_contract(ndim=2, dtype_out=np.float64)
 @finite_output(allow_nan=True)
 def cross_sectional_zscore(

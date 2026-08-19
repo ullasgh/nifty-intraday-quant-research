@@ -2,10 +2,52 @@
 
 Companion to ``tests/test_cli.py`` and ``tests/test_cli_tradable.py``; targets the
 remaining lines/branches those two files don't exercise (error paths, cache
-commands, the daily-return/turnover/timestamp reconstruction helpers' edge
-cases, and the ``build_panel``/``validate``/``strategies``/``sweep`` command
-bodies). Never touches real ``data/`` -- every loader that would otherwise read
-real market data is monkeypatched.
+commands, the ``BacktestResult.daily`` (``build_daily``) edge cases the CLI now
+reads instead of its own reconstruction, and the
+``build_panel``/``validate``/``strategies``/``sweep`` command bodies). Never
+touches real ``data/`` -- every loader that would otherwise read real market
+data is monkeypatched.
+
+MIGRATION NOTE (specs/daily_results.md): ``_daily_returns``, ``_daily_turnover``,
+``_daily_return_ts`` and ``_decision_and_final_rows`` were deleted from ``cli.py``
+-- they RECONSTRUCTED, from outside the engine, information the engine already
+had. Their behaviour now lives in ``nifty_quant.backtest.daily.build_daily`` /
+``BacktestResult.daily``. Two tests (`test_daily_returns_empty_returns`,
+`test_daily_turnover_empty_turnover`) asserted a behaviour (a decision-less
+session's row is *omitted*) that spec AMENDMENT 1 section D explicitly
+overturns as a correction, not a refactor side effect; those are updated to
+assert the new, spec-mandated value for the same scenario, not softened --
+see each docstring for the exact spec citation.
+
+LEAD DECISION (retired, not deleted silently): six tests were left permanently
+red by a prior migration pass because they tested mechanics the spec deleted
+rather than ported -- the decision_times row-selection algorithm
+(``_decision_and_final_rows``) and ``_daily_return_ts``'s zero-padding
+fallback for missing dates. A permanently-red test blocks ``make gate``
+forever with no successor to ever turn it green, so the lead removed them
+(not the original migration agent, who was right to leave them red rather
+than delete unilaterally). Removed, with what covers the surviving behaviour:
+  - ``test_decision_and_final_rows_decision_times_nonempty`` /
+    ``_empty_tuple``: decision_times row selection is now exercised
+    end-to-end (real engine, not a reconstructed helper) by
+    ``tests/test_daily_results_a.py::test_1_daily_returns_match_old_reconstruction``
+    and its siblings, which independently reproduce the old selection rule and
+    cross-check it against ``result.daily``.
+  - ``test_daily_return_ts_row_indices_empty_branch`` /
+    ``_fallback_no_padding``: exercised an internal branch of a function that
+    no longer exists (``_daily_return_ts`` was deleted, not ported); the
+    branch is impossible to reach by construction under the new API, so there
+    is nothing left to assert.
+  - ``test_daily_return_ts_fallback_padding_empty_dates`` /
+    ``_final_empty_dates_returns_zeros``: asserted the OLD, now-overturned
+    behaviour (zero-padding an empty ``panel.dates`` to a caller-requested
+    length). The new, spec-mandated behaviour -- empty ``dates`` in, empty
+    ``DailyResult`` out (``n_days=0``, every array size 0) -- is covered by
+    ``tests/test_daily_results_b.py::test_item_8_empty_panel_empty_returns``
+    and by ``build_daily``'s own empty-input tests in this file
+    (``test_daily_returns_empty_panel_nonempty_returns``,
+    ``test_daily_turnover_empty_panel_nonempty_turnover``,
+    ``test_daily_return_ts_n_days_zero``).
 """
 
 from __future__ import annotations
@@ -19,15 +61,9 @@ import pandas as pd
 import pytest
 from typer.testing import CliRunner
 
+from nifty_quant.backtest.daily import DailyResult, build_daily
 from nifty_quant.backtest.engine import BacktestResult
-from nifty_quant.cli import (
-    _daily_return_ts,
-    _daily_returns,
-    _daily_turnover,
-    _decision_and_final_rows,
-    _parse_date,
-    app,
-)
+from nifty_quant.cli import _parse_date, app
 from nifty_quant.data.panel import Panel
 from nifty_quant.universe.static import Universe
 
@@ -57,12 +93,41 @@ def _make_panel(
     )
 
 
+def _row_day_index(panel: Panel) -> np.ndarray:
+    """Per-row day index, computed exactly as `engine.py`'s `day_index` local."""
+    n_rows = panel.ts.shape[0]
+    return (
+        np.searchsorted(panel.day_offsets, np.arange(n_rows, dtype=np.int64), side="right")
+        - 1
+    )
+
+
+def _session_dates_epoch(panel: Panel) -> np.ndarray:
+    """`panel.dates` as int64 UTC-midnight epoch seconds (spec AMENDMENT 1 item 2)."""
+    if panel.dates.size == 0:
+        return np.empty(0, dtype=np.int64)
+    return np.asarray(
+        [
+            int(
+                datetime.datetime(
+                    d.year, d.month, d.day, tzinfo=datetime.timezone.utc
+                ).timestamp()
+            )
+            for d in panel.dates
+        ],
+        dtype=np.int64,
+    )
+
+
 def test_parse_date_invalid() -> None:
     with pytest.raises(Exception):
         _parse_date("not-a-date", "--start")
 
 
-def test_decision_and_final_rows_empty_panel() -> None:
+def test_build_daily_empty_panel_no_raise() -> None:
+    """Replaces `test_decision_and_final_rows_empty_panel`: an empty panel (no sessions
+    at all) must produce an empty `DailyResult` without raising -- spec required test 8.
+    """
     panel = Panel(
         fields={},
         symbols=(),
@@ -70,28 +135,44 @@ def test_decision_and_final_rows_empty_panel() -> None:
         day_offsets=np.array([0], dtype=np.int64),
         dates=np.empty(0, dtype=object),
     )
-    result = _decision_and_final_rows(panel, None)
-    assert result.size == 0
-
-
-def test_decision_and_final_rows_decision_times_nonempty() -> None:
-    panel = _make_panel(n_sessions=3, bars_per_session=2)
-    result = _decision_and_final_rows(panel, ("09:15",))
-    assert result.size >= 1
-    assert result[-1] == panel.ts.shape[0] - 1
-
-
-def test_decision_and_final_rows_decision_times_empty_tuple() -> None:
-    panel = _make_panel(n_sessions=3, bars_per_session=2)
-    result = _decision_and_final_rows(panel, ())
-    assert result.size == 1
-    assert result[0] == panel.ts.shape[0] - 1
+    result = build_daily(
+        _row_day_index(panel),
+        np.empty(0, dtype=np.float64),
+        np.empty(0, dtype=np.float64),
+        np.empty(0, dtype=np.float64),
+        np.empty(0, dtype=np.float64),
+        _session_dates_epoch(panel),
+        initial_capital=1e7,
+    )
+    assert result.n_days == 0
+    assert result.dates.size == 0
+    assert result.returns.size == 0
 
 
 def test_daily_returns_empty_returns() -> None:
+    """Was: nonempty panel + empty returns array -> empty result. Spec AMENDMENT 1
+    section D + item 4 explicitly REVERSE this: a panel where every session has no
+    decision row (empty per-row arrays) must still get one row PER SESSION, with zero
+    return/turnover and equity carried at `initial_capital` (there being nothing else to
+    carry forward for the first session) -- not be omitted. The old assertion
+    (`result.size == 0`) is not preserved because the spec explicitly calls the old
+    omission behaviour a defect ("omitting a flat session ... overstates annualized
+    return and Sharpe"), not a refactor detail. This asserts the new, corrected value
+    for the same scenario.
+    """
     panel = _make_panel()
-    result = _daily_returns(np.empty(0, dtype=np.float64), panel, None)
-    assert result.size == 0
+    result = build_daily(
+        np.empty(0, dtype=np.int64),
+        np.empty(0, dtype=np.float64),
+        np.empty(0, dtype=np.float64),
+        np.empty(0, dtype=np.float64),
+        np.empty(0, dtype=np.float64),
+        _session_dates_epoch(panel),
+        initial_capital=1e7,
+    )
+    assert result.n_days == len(panel.dates)
+    assert np.all(result.returns == 0.0)
+    assert np.all(result.equity == 1e7)
 
 
 def test_daily_returns_empty_panel_nonempty_returns() -> None:
@@ -103,21 +184,62 @@ def test_daily_returns_empty_panel_nonempty_returns() -> None:
         dates=np.empty(0, dtype=object),
     )
     returns = np.array([0.01, -0.02], dtype=np.float64)
-    result = _daily_returns(returns, panel, None)
-    assert result.size == 0
+    result = build_daily(
+        np.array([0, 0], dtype=np.int64),
+        returns,
+        returns,
+        returns,
+        returns,
+        _session_dates_epoch(panel),
+        initial_capital=1e7,
+    )
+    assert result.returns.size == 0
 
 
 def test_daily_returns_length_mismatch_raises() -> None:
+    """`_daily_returns` raised `ValueError` with message "length mismatch" when its
+    reconstructed row count disagreed with the caller's `returns` array. That specific
+    reconstruction is gone; `build_daily` now validates every row-level array
+    (`equity`, `returns`, `gross_returns`, `turnover`) against `row_day_index` up
+    front and raises `ValueError` naming the offending array and both lengths --
+    still a `ValueError`, but not with the old message, so the text match is not
+    preserved, only the exception class, the underlying "must not silently produce
+    wrong data" invariant, and (now) the offending array's name.
+    """
     panel = _make_panel(n_sessions=2, bars_per_session=2)
+    row_day_index = np.array([0, 0, 1], dtype=np.int64)
     returns = np.array([0.01, 0.02, 0.03], dtype=np.float64)
-    with pytest.raises(ValueError, match="length mismatch"):
-        _daily_returns(returns, panel, None)
+    mismatched_returns = np.array([0.01, 0.02], dtype=np.float64)
+    with pytest.raises(ValueError, match="returns"):
+        build_daily(
+            row_day_index,
+            returns,
+            mismatched_returns,
+            returns,
+            returns,
+            _session_dates_epoch(panel),
+            initial_capital=1e7,
+        )
 
 
 def test_daily_turnover_empty_turnover() -> None:
+    """Was: nonempty panel + empty turnover array -> empty result. See
+    `test_daily_returns_empty_returns` above for why the old assertion is not
+    preserved -- spec AMENDMENT 1 section D / item 4 requires a decision-less session's
+    turnover to be zero, not omitted.
+    """
     panel = _make_panel()
-    result = _daily_turnover(np.empty(0, dtype=np.float64), panel, None)
-    assert result.size == 0
+    result = build_daily(
+        np.empty(0, dtype=np.int64),
+        np.empty(0, dtype=np.float64),
+        np.empty(0, dtype=np.float64),
+        np.empty(0, dtype=np.float64),
+        np.empty(0, dtype=np.float64),
+        _session_dates_epoch(panel),
+        initial_capital=1e7,
+    )
+    assert result.n_days == len(panel.dates)
+    assert np.all(result.turnover == 0.0)
 
 
 def test_daily_turnover_empty_panel_nonempty_turnover() -> None:
@@ -129,24 +251,70 @@ def test_daily_turnover_empty_panel_nonempty_turnover() -> None:
         dates=np.empty(0, dtype=object),
     )
     turnover = np.array([0.1, 0.2], dtype=np.float64)
-    result = _daily_turnover(turnover, panel, None)
-    assert result.size == 0
+    result = build_daily(
+        np.array([0, 0], dtype=np.int64),
+        turnover,
+        turnover,
+        turnover,
+        turnover,
+        _session_dates_epoch(panel),
+        initial_capital=1e7,
+    )
+    assert result.turnover.size == 0
 
 
 def test_daily_turnover_length_mismatch_raises() -> None:
+    """`_daily_turnover` raised `ValueError` with message "length mismatch" on a
+    reconstructed-row-count disagreement. `build_daily`'s turnover path sums via
+    `np.add.reduceat` over group boundaries derived from `row_day_index`; previously a
+    mismatched TURNOVER array (as opposed to a mismatched returns array, see
+    `test_daily_returns_length_mismatch_raises`) raised `IndexError`, not `ValueError`
+    -- an incidental, less-informative failure mode than the deleted helper's explicit
+    validation, and a different exception class from the same class of caller error.
+    Fixed: `build_daily` now validates `turnover`'s length against `row_day_index` up
+    front, alongside `equity`/`returns`/`gross_returns`, and raises `ValueError` naming
+    the offending array.
+    """
     panel = _make_panel(n_sessions=2, bars_per_session=2)
-    turnover = np.array([0.1, 0.2, 0.3], dtype=np.float64)
-    with pytest.raises(ValueError, match="length mismatch"):
-        _daily_turnover(turnover, panel, None)
+    row_day_index = np.array([0, 0, 1], dtype=np.int64)
+    returns = np.array([0.01, 0.02, 0.03], dtype=np.float64)
+    mismatched_turnover = np.array([0.1, 0.2], dtype=np.float64)
+    with pytest.raises(ValueError, match="turnover"):
+        build_daily(
+            row_day_index,
+            returns,
+            returns,
+            returns,
+            mismatched_turnover,
+            _session_dates_epoch(panel),
+            initial_capital=1e7,
+        )
 
 
 def test_daily_return_ts_n_days_zero() -> None:
-    panel = _make_panel()
-    result = _daily_return_ts(panel, None, 0)
-    assert result.size == 0
+    """Was: `_daily_return_ts(panel, None, 0)` -> empty. Under the new API there is no
+    separate `n_days` argument -- `n_days` is always `len(dates)` -- so this is now the
+    same scenario as an empty `dates` array producing an empty result, no raise.
+    """
+    result = build_daily(
+        np.empty(0, dtype=np.int64),
+        np.empty(0, dtype=np.float64),
+        np.empty(0, dtype=np.float64),
+        np.empty(0, dtype=np.float64),
+        np.empty(0, dtype=np.float64),
+        np.empty(0, dtype=np.int64),
+        initial_capital=1e7,
+    )
+    assert result.n_days == 0
+    assert result.dates.size == 0
 
 
 def test_daily_return_ts_empty_panel_nonzero_n_days() -> None:
+    """Was: empty panel, `n_days=3` requested -> empty result. There is no longer a
+    caller-supplied `n_days` decoupled from `dates`; this asserts the equivalent
+    invariant that an empty panel's `dates` (hence empty `DailyResult`) is produced
+    without raising even when non-trivial per-row data is supplied.
+    """
     panel = Panel(
         fields={},
         symbols=(),
@@ -154,62 +322,17 @@ def test_daily_return_ts_empty_panel_nonzero_n_days() -> None:
         day_offsets=np.array([0], dtype=np.int64),
         dates=np.empty(0, dtype=object),
     )
-    result = _daily_return_ts(panel, None, 3)
-    assert result.size == 0
-
-
-def test_daily_return_ts_row_indices_empty_branch(monkeypatch: pytest.MonkeyPatch) -> None:
-    import nifty_quant.cli as cli_mod
-
-    panel = _make_panel(n_sessions=3, bars_per_session=2)
-    monkeypatch.setattr(
-        cli_mod,
-        "_decision_and_final_rows",
-        lambda panel, decision_times: np.empty(0, dtype=np.int64),
+    result = build_daily(
+        np.array([0, 1], dtype=np.int64),
+        np.array([1.0, 2.0]),
+        np.array([0.01, 0.02]),
+        np.array([0.01, 0.02]),
+        np.array([0.1, 0.2]),
+        _session_dates_epoch(panel),
+        initial_capital=1e7,
     )
-    result = _daily_return_ts(panel, None, 3)
-    assert result.size == 3
-
-
-def test_daily_return_ts_fallback_no_padding() -> None:
-    panel = _make_panel(n_sessions=5, bars_per_session=1)
-    result = _daily_return_ts(panel, None, 3)
-    assert result.size == 3
-
-
-def test_daily_return_ts_fallback_padding_empty_dates(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    import nifty_quant.cli as cli_mod
-
-    panel = Panel(
-        fields={},
-        symbols=(),
-        ts=np.array([1_700_000_000, 1_700_000_060], dtype=np.int64),
-        day_offsets=np.array([0, 1, 2], dtype=np.int64),
-        dates=np.empty(0, dtype=object),
-    )
-    monkeypatch.setattr(
-        cli_mod,
-        "_decision_and_final_rows",
-        lambda panel, decision_times: np.array([0, 1], dtype=np.int64),
-    )
-    result = _daily_return_ts(panel, None, 5)
-    assert result.size == 5
-    assert np.all(result == 0)
-
-
-def test_daily_return_ts_final_empty_dates_returns_zeros() -> None:
-    panel = Panel(
-        fields={},
-        symbols=(),
-        ts=np.array([1_700_000_000, 1_700_000_060], dtype=np.int64),
-        day_offsets=np.array([0, 1, 2], dtype=np.int64),
-        dates=np.empty(0, dtype=object),
-    )
-    result = _daily_return_ts(panel, None, 2)
-    assert result.size == 2
-    assert np.all(result == 0)
+    assert result.n_days == 0
+    assert result.returns.size == 0
 
 
 def test_symbols_command_exception(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -560,15 +683,35 @@ def _make_ohlcv_panel(session_dates, bars_per_session, symbols=("A", "B")):
     return Panel(fields, symbols, ts, day_offsets, np.asarray(session_dates, dtype=object))
 
 
-def _fake_result(n=3, *, gross=None, net=None, turnover=None):
+def _fake_result(n=3, *, gross=None, net=None, turnover=None, daily=None):
+    """``daily`` defaults to an IDENTITY `DailyResult` -- one row per RAW row, via
+    `build_daily` with `row_day_index=arange(n)` -- so `.returns`/`.gross_returns`/
+    `.turnover` equal `net`/`gross`/`turnover` unchanged. This mirrors the
+    `lambda x, panel, decision_times: x` passthrough stub used almost everywhere in
+    this file before the migration (``_daily_returns``/``_daily_turnover`` no longer
+    exist to monkeypatch). Pass an explicit `daily=` (a `DailyResult`) for the handful
+    of call sites that need the CLI to see something other than the identity mapping.
+    """
     if gross is None:
         gross = np.full(n, -0.001, dtype=np.float64)
     if turnover is None:
         turnover = np.full(gross.size, 1.0, dtype=np.float64)
     if net is None:
         net = gross - 0.0005 * turnover
+    equity_curve = np.cumprod(1.0 + net) * 1e7
+    if daily is None:
+        n_rows = net.size
+        daily = build_daily(
+            np.arange(n_rows, dtype=np.int64),
+            equity_curve,
+            net,
+            gross,
+            turnover,
+            np.arange(n_rows, dtype=np.int64),
+            initial_capital=1e7,
+        )
     return BacktestResult(
-        equity_curve=np.cumprod(1.0 + net) * 1e7,
+        equity_curve=equity_curve,
         returns=net,
         positions=np.zeros((net.size, 1)),
         trades=pd.DataFrame({"symbol": [], "side": [], "qty": [], "price": []}),
@@ -580,6 +723,7 @@ def _fake_result(n=3, *, gross=None, net=None, turnover=None):
         unfilled_notional_pct=0.0,
         forced_eod_liquidation_days=0,
         initial_capital=1e7,
+        daily=daily,
     )
 
 
@@ -618,13 +762,15 @@ def test_backtest_strategy_config_mismatch_fails_before_loaders(monkeypatch) -> 
 
 def test_backtest_breakeven_nan_no_trades_branch(monkeypatch, tmp_path) -> None:
     import nifty_quant.backtest.engine as engine_mod
-    import nifty_quant.cli as cli_mod
     import nifty_quant.data.panel as panel_mod
     import nifty_quant.settings as settings_mod
     import nifty_quant.universe.static as universe_mod
 
     session_dates = [datetime.date(2024, 1, 1), datetime.date(2024, 1, 2)]
     panel = _make_ohlcv_panel(session_dates, [3, 3])
+    # `daily` defaults to the identity mapping (see `_fake_result` docstring); the
+    # "no trades / zero turnover" branch this test targets is driven by
+    # `result.gross_returns.size < 2` (cli.py), unrelated to `result.daily`.
     fake = _fake_result(n=1, gross=np.array([0.001]), net=np.array([0.0005]))
 
     monkeypatch.setattr(panel_mod, "load_panel", lambda spec: panel)
@@ -633,12 +779,6 @@ def test_backtest_breakeven_nan_no_trades_branch(monkeypatch, tmp_path) -> None:
     )
     monkeypatch.setattr(
         engine_mod, "run_backtest", lambda strat, panel, config, *, tradable=None: fake
-    )
-    monkeypatch.setattr(
-        cli_mod, "_daily_returns", lambda returns, panel, decision_times: np.array([0.0005, 0.0004])
-    )
-    monkeypatch.setattr(
-        cli_mod, "_daily_turnover", lambda turnover, panel, decision_times: np.array([1.0, 1.0])
     )
     monkeypatch.setattr(settings_mod, "RESULTS_ROOT", tmp_path)
 
@@ -649,7 +789,6 @@ def test_backtest_breakeven_nan_no_trades_branch(monkeypatch, tmp_path) -> None:
 
 def test_backtest_latency_sensitivity_note_signal_dies(monkeypatch, tmp_path) -> None:
     import nifty_quant.backtest.engine as engine_mod
-    import nifty_quant.cli as cli_mod
     import nifty_quant.data.panel as panel_mod
     import nifty_quant.settings as settings_mod
     import nifty_quant.universe.static as universe_mod
@@ -671,10 +810,6 @@ def test_backtest_latency_sensitivity_note_signal_dies(monkeypatch, tmp_path) ->
         universe_mod, "load_universe", lambda name: Universe(name="ab", symbols=("A", "B"))
     )
     monkeypatch.setattr(engine_mod, "run_backtest", stub_run_backtest)
-    monkeypatch.setattr(cli_mod, "_daily_returns", lambda returns, panel, decision_times: returns)
-    monkeypatch.setattr(
-        cli_mod, "_daily_turnover", lambda turnover, panel, decision_times: np.ones_like(turnover)
-    )
     monkeypatch.setattr(settings_mod, "RESULTS_ROOT", tmp_path)
 
     result = runner.invoke(app, _backtest_args())
@@ -684,7 +819,6 @@ def test_backtest_latency_sensitivity_note_signal_dies(monkeypatch, tmp_path) ->
 
 def test_backtest_latency_sensitivity_exception_branch(monkeypatch, tmp_path) -> None:
     import nifty_quant.backtest.engine as engine_mod
-    import nifty_quant.cli as cli_mod
     import nifty_quant.data.panel as panel_mod
     import nifty_quant.settings as settings_mod
     import nifty_quant.universe.static as universe_mod
@@ -704,10 +838,6 @@ def test_backtest_latency_sensitivity_exception_branch(monkeypatch, tmp_path) ->
         universe_mod, "load_universe", lambda name: Universe(name="ab", symbols=("A", "B"))
     )
     monkeypatch.setattr(engine_mod, "run_backtest", stub_run_backtest)
-    monkeypatch.setattr(cli_mod, "_daily_returns", lambda returns, panel, decision_times: returns)
-    monkeypatch.setattr(
-        cli_mod, "_daily_turnover", lambda turnover, panel, decision_times: np.ones_like(turnover)
-    )
     monkeypatch.setattr(settings_mod, "RESULTS_ROOT", tmp_path)
 
     result = runner.invoke(app, _backtest_args())
@@ -719,7 +849,6 @@ def test_backtest_latency_sensitivity_exception_branch(monkeypatch, tmp_path) ->
 
 def test_backtest_manifest_load_failure_is_nonfatal(monkeypatch, tmp_path) -> None:
     import nifty_quant.backtest.engine as engine_mod
-    import nifty_quant.cli as cli_mod
     import nifty_quant.data.manifest as manifest_mod
     import nifty_quant.data.panel as panel_mod
     import nifty_quant.settings as settings_mod
@@ -738,10 +867,6 @@ def test_backtest_manifest_load_failure_is_nonfatal(monkeypatch, tmp_path) -> No
     monkeypatch.setattr(
         engine_mod, "run_backtest", lambda strat, panel, config, *, tradable=None: fake
     )
-    monkeypatch.setattr(cli_mod, "_daily_returns", lambda returns, panel, decision_times: returns)
-    monkeypatch.setattr(
-        cli_mod, "_daily_turnover", lambda turnover, panel, decision_times: np.ones_like(turnover)
-    )
     monkeypatch.setattr(settings_mod, "RESULTS_ROOT", tmp_path)
     monkeypatch.setattr(
         manifest_mod.Manifest,
@@ -756,7 +881,6 @@ def test_backtest_manifest_load_failure_is_nonfatal(monkeypatch, tmp_path) -> No
 
 def test_backtest_engine_failure_fallback_record_succeeds(monkeypatch, tmp_path) -> None:
     import nifty_quant.backtest.engine as engine_mod
-    import nifty_quant.cli as cli_mod
     import nifty_quant.data.panel as panel_mod
     import nifty_quant.settings as settings_mod
     import nifty_quant.universe.static as universe_mod
@@ -772,12 +896,6 @@ def test_backtest_engine_failure_fallback_record_succeeds(monkeypatch, tmp_path)
         universe_mod, "load_universe", lambda name: Universe(name="ab", symbols=("A", "B"))
     )
     monkeypatch.setattr(engine_mod, "run_backtest", stub_run_backtest)
-    monkeypatch.setattr(
-        cli_mod, "_daily_returns", lambda returns, panel, decision_times: np.array([0.001, 0.002])
-    )
-    monkeypatch.setattr(
-        cli_mod, "_daily_turnover", lambda turnover, panel, decision_times: np.array([1.0, 1.0])
-    )
     monkeypatch.setattr(settings_mod, "RESULTS_ROOT", tmp_path)
 
     result = runner.invoke(app, _backtest_args())
@@ -787,7 +905,6 @@ def test_backtest_engine_failure_fallback_record_succeeds(monkeypatch, tmp_path)
 
 def test_backtest_engine_failure_fallback_record_also_fails(monkeypatch, tmp_path) -> None:
     import nifty_quant.backtest.engine as engine_mod
-    import nifty_quant.cli as cli_mod
     import nifty_quant.data.panel as panel_mod
     import nifty_quant.research.registry as registry_reg_mod
     import nifty_quant.settings as settings_mod
@@ -804,12 +921,6 @@ def test_backtest_engine_failure_fallback_record_also_fails(monkeypatch, tmp_pat
         universe_mod, "load_universe", lambda name: Universe(name="ab", symbols=("A", "B"))
     )
     monkeypatch.setattr(engine_mod, "run_backtest", stub_run_backtest)
-    monkeypatch.setattr(
-        cli_mod, "_daily_returns", lambda returns, panel, decision_times: np.array([0.001, 0.002])
-    )
-    monkeypatch.setattr(
-        cli_mod, "_daily_turnover", lambda turnover, panel, decision_times: np.array([1.0, 1.0])
-    )
     monkeypatch.setattr(settings_mod, "RESULTS_ROOT", tmp_path)
     monkeypatch.setattr(
         registry_reg_mod,
@@ -860,15 +971,35 @@ class _FakeCalendar:
 ALL_DATES = pd.bdate_range("2024-01-01", periods=12).date.tolist()
 
 
-def _fake_result(n=3, *, gross=None, net=None, turnover=None):
+def _fake_result(n=3, *, gross=None, net=None, turnover=None, daily=None):
+    """``daily`` defaults to an IDENTITY `DailyResult` -- one row per RAW row, via
+    `build_daily` with `row_day_index=arange(n)` -- so `.returns`/`.gross_returns`/
+    `.turnover` equal `net`/`gross`/`turnover` unchanged. This mirrors the
+    `lambda x, panel, decision_times: x` passthrough stub used almost everywhere in
+    this file before the migration (``_daily_returns``/``_daily_turnover`` no longer
+    exist to monkeypatch). Pass an explicit `daily=` (a `DailyResult`) for the handful
+    of call sites that need the CLI to see something other than the identity mapping.
+    """
     if gross is None:
         gross = np.full(n, -0.001, dtype=np.float64)
     if turnover is None:
         turnover = np.full(gross.size, 1.0, dtype=np.float64)
     if net is None:
         net = gross - 0.0005 * turnover
+    equity_curve = np.cumprod(1.0 + net) * 1e7
+    if daily is None:
+        n_rows = net.size
+        daily = build_daily(
+            np.arange(n_rows, dtype=np.int64),
+            equity_curve,
+            net,
+            gross,
+            turnover,
+            np.arange(n_rows, dtype=np.int64),
+            initial_capital=1e7,
+        )
     return BacktestResult(
-        equity_curve=np.cumprod(1.0 + net) * 1e7,
+        equity_curve=equity_curve,
         returns=net,
         positions=np.zeros((net.size, 1)),
         trades=pd.DataFrame({"symbol": [], "side": [], "qty": [], "price": []}),
@@ -880,6 +1011,7 @@ def _fake_result(n=3, *, gross=None, net=None, turnover=None):
         unfilled_notional_pct=0.0,
         forced_eod_liquidation_days=0,
         initial_capital=1e7,
+        daily=daily,
     )
 
 
@@ -901,12 +1033,13 @@ def _walkforward_args() -> list[str]:
     ]
 
 
-def _patch_walkforward_common(
-    monkeypatch, tmp_path, panel, run_backtest_stub, daily_returns_stub, daily_turnover_stub
-):
+def _patch_walkforward_common(monkeypatch, tmp_path, panel, run_backtest_stub):
+    """`daily_returns_stub`/`daily_turnover_stub` no longer exist as separate
+    parameters: `result.daily` is now baked directly into whatever `BacktestResult`
+    `run_backtest_stub` returns (see `_fake_result`'s `daily=` override for call sites
+    that need something other than the default identity mapping)."""
     import nifty_quant.backtest.engine as engine_mod
     import nifty_quant.calendar as calendar_mod
-    import nifty_quant.cli as cli_mod
     import nifty_quant.data.panel as panel_mod
     import nifty_quant.settings as settings_mod
     import nifty_quant.universe.static as universe_mod
@@ -916,8 +1049,6 @@ def _patch_walkforward_common(
         universe_mod, "load_universe", lambda name: Universe(name="ab", symbols=("A", "B"))
     )
     monkeypatch.setattr(engine_mod, "run_backtest", run_backtest_stub)
-    monkeypatch.setattr(cli_mod, "_daily_returns", daily_returns_stub)
-    monkeypatch.setattr(cli_mod, "_daily_turnover", daily_turnover_stub)
     monkeypatch.setattr(settings_mod, "RESULTS_ROOT", tmp_path)
     monkeypatch.setattr(
         calendar_mod.TradingCalendar,
@@ -1119,8 +1250,6 @@ def test_walkforward_manifest_load_raises_nonfatal(monkeypatch, tmp_path) -> Non
         tmp_path,
         panel,
         lambda strat, panel, config, *, tradable=None: _fake_result(),
-        lambda x, panel, decision_times: x,
-        lambda x, panel, decision_times: x,
     )
     result = runner.invoke(app, _walkforward_args())
     assert result.exit_code == 0
@@ -1136,8 +1265,6 @@ def test_walkforward_breakeven_warning_printed(monkeypatch, tmp_path) -> None:
         lambda strat, panel, config, *, tradable=None: _fake_result(
             gross=np.full(3, -0.02, dtype=np.float64), turnover=np.full(3, 1.0, dtype=np.float64)
         ),
-        lambda x, panel, decision_times: x,
-        lambda x, panel, decision_times: x,
     )
     result = runner.invoke(app, _walkforward_args())
     assert result.exit_code == 0
@@ -1154,8 +1281,6 @@ def test_walkforward_breakeven_warning_not_printed(monkeypatch, tmp_path) -> Non
         lambda strat, panel, config, *, tradable=None: _fake_result(
             gross=np.full(3, 0.05, dtype=np.float64), turnover=np.full(3, 1.0, dtype=np.float64)
         ),
-        lambda x, panel, decision_times: x,
-        lambda x, panel, decision_times: x,
     )
     result = runner.invoke(app, _walkforward_args())
     assert result.exit_code == 0
@@ -1188,23 +1313,35 @@ def test_walkforward_latency_signal_dies(monkeypatch, tmp_path) -> None:
         tmp_path,
         panel,
         _latency_stub,
-        lambda x, panel, decision_times: x,
-        lambda x, panel, decision_times: x,
     )
     result = runner.invoke(app, _walkforward_args())
     assert result.exit_code == 0
     assert "NOTE: signal dies at one minute of latency" in result.output
 
 
+def _empty_daily() -> DailyResult:
+    return DailyResult(
+        dates=np.empty(0, dtype=np.int64),
+        equity=np.empty(0, dtype=np.float64),
+        returns=np.empty(0, dtype=np.float64),
+        gross_returns=np.empty(0, dtype=np.float64),
+        turnover=np.empty(0, dtype=np.float64),
+        n_days=0,
+    )
+
+
 def test_walkforward_pooled_net_size_lt_2(monkeypatch, tmp_path) -> None:
+    """Forces every split's `result.daily` to be empty (was: `_daily_returns`/
+    `_daily_turnover` monkeypatched to always return an empty array regardless of
+    input) so the pooled `net`/`gross` series stay below the `size >= 2` guard that
+    gates `breakeven_cost_bps` -- the branch this test targets.
+    """
     panel = _make_ohlcv_panel(ALL_DATES, [5] * len(ALL_DATES))
     _patch_walkforward_common(
         monkeypatch,
         tmp_path,
         panel,
-        lambda strat, panel, config, *, tradable=None: _fake_result(),
-        lambda x, panel, decision_times: np.empty(0, dtype=np.float64),
-        lambda x, panel, decision_times: np.empty(0, dtype=np.float64),
+        lambda strat, panel, config, *, tradable=None: _fake_result(daily=_empty_daily()),
     )
     result = runner.invoke(app, _walkforward_args())
     assert result.exit_code == 0
@@ -1221,8 +1358,6 @@ def test_walkforward_engine_raises_fallback_succeeds(monkeypatch, tmp_path) -> N
         tmp_path,
         panel,
         _raise_engine,
-        lambda x, panel, decision_times: x,
-        lambda x, panel, decision_times: x,
     )
     result = runner.invoke(app, _walkforward_args())
     assert result.exit_code != 0
@@ -1242,8 +1377,6 @@ def test_walkforward_engine_raises_fallback_fails(monkeypatch, tmp_path) -> None
         tmp_path,
         panel,
         _raise_engine,
-        lambda x, panel, decision_times: x,
-        lambda x, panel, decision_times: x,
     )
     real_trial_registry_cls = registry_mod.TrialRegistry
     call_count = {"n": 0}
@@ -1275,9 +1408,6 @@ _VALID_VOLUME_BREAKOUT_PARAMS = {
     "min_hold_bars": 5,
     "cooldown_bars": 0,
     "square_off_time": "15:20",
-    "stop_loss_pct": 0.01,
-    "target_pct": 0.02,
-    "target_vol_ann": 0.15,
     "sigma_floor": 1.0e-5,
     "max_weight": 0.10,
     "gross": 1.0,
@@ -1299,8 +1429,10 @@ def _write_sweep_yaml(tmp_path, *, sweep_values=(2.0, 2.5)) -> Path:
 
 
 def _sweep_monkeypatch_set(monkeypatch, tmp_path, panel, *, run_backtest_stub):
+    """`result.daily` is now baked directly into whatever `run_backtest_stub` returns
+    (via `_fake_result`'s default identity mapping); no separate daily-returns/
+    turnover stub to install here any more."""
     import nifty_quant.backtest.engine as engine_mod
-    import nifty_quant.cli as cli_mod
     import nifty_quant.data.panel as panel_mod
     import nifty_quant.settings as settings_mod
     import nifty_quant.universe.static as universe_mod
@@ -1310,10 +1442,6 @@ def _sweep_monkeypatch_set(monkeypatch, tmp_path, panel, *, run_backtest_stub):
         universe_mod, "load_universe", lambda name: Universe(name="ab", symbols=("A", "B"))
     )
     monkeypatch.setattr(engine_mod, "run_backtest", run_backtest_stub)
-    monkeypatch.setattr(cli_mod, "_daily_returns", lambda returns, panel, decision_times: returns)
-    monkeypatch.setattr(
-        cli_mod, "_daily_turnover", lambda turnover, panel, decision_times: turnover
-    )
     monkeypatch.setattr(settings_mod, "RESULTS_ROOT", tmp_path)
 
 

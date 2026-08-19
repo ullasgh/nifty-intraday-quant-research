@@ -23,14 +23,18 @@ cannot convert it into P&L.
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+from datetime import datetime, timezone
 
 import numpy as np
 import pandas as pd
 
 import nifty_quant.guards as guards
+from nifty_quant.backtest.daily import DailyResult, build_daily
+from nifty_quant.backtest.orders import OrderIntent, PendingOrder
 from nifty_quant.backtest.portfolio import GrossNotionalSizer, Portfolio, SizingResult
 from nifty_quant.data.panel import Panel
 from nifty_quant.execution.costs import (
+    CompositeCostModel,
     CostModel,
     FillBatch,
     NSEDeliveryEquityCosts,
@@ -67,10 +71,59 @@ class BacktestResult:
     unfilled_notional_pct: float
     forced_eod_liquidation_days: int
     initial_capital: float = 1e7
+    # AMENDMENT 2 item 3: a session-end drop (an order whose fill row would land
+    # outside its own session, defect F1) is a distinct event from a market
+    # rejection and is deliberately NOT folded into `rejected_order_rate` -- see
+    # `specs/order_lifecycle.md`.
+    n_orders_dropped_at_session_end: int = 0
     n_symbols_absent: int = 0
     absent_symbols: tuple[str, ...] = ()
+    # F4: count of held-symbol/row substitutions where a missing (non-finite or
+    # zero) close was marked using that symbol's LAST OBSERVED close instead of
+    # writing NaN into equity. This is a deliberate, counted exception to rule 6
+    # (never silently forward-fill) -- a nonzero value means some portion of
+    # `equity_curve` rests on a carried-forward mark, not a fresh observation,
+    # and that should be inspected before trusting P&L on affected symbols.
+    n_stale_marks: int = 0
+    # F2: SURFACE negative cash rather than prevent it -- preventing it would mean
+    # the sizer silently under-fills a target the strategy asked for, which is a
+    # worse lie. `min_cash_seen` is the lowest cash balance observed on any mark
+    # across the whole run (finite: cash is never NaN by construction); a value
+    # below 0 means part of this backtest financed trades from an overdraft no
+    # strategy declared. `n_rows_negative_cash` counts how many of those marks
+    # were negative. See also `guards.Strictness.FULL`, which raises on any
+    # negative cash via `check_cash_non_negative` below.
+    min_cash_seen: float = 0.0
+    n_rows_negative_cash: int = 0
+    # F7: forced EOD liquidation (`_execute_direct_fill` under `OrderIntent.
+    # FORCED_EOD`) bypasses the `tradable` mask entirely -- it can always
+    # liquidate because it never asks whether it may. This is a MODELLING
+    # limitation, not a bug (refusing to liquidate would break I2, "session ends
+    # flat", and change every result): `forced_eod_liquidation_days` therefore
+    # includes days where the flat close was only reachable by filling against a
+    # symbol this same panel marked non-tradable. `n_forced_liquidations_against_
+    # nontradable` counts exactly those symbol-level fills so the limitation is
+    # visible rather than folded silently into the headline count.
+    n_forced_liquidations_against_nontradable: int = 0
     ruined: bool = False
+    # Indexes `equity_curve` (and `returns`), which is sampled at DECISION rows plus
+    # one final append at the terminal liquidation -- NOT at every bar of the panel.
+    # -1 means the run never ruined. F3: the row where equity first reaches <= 0 is
+    # flagged at that row, not the row after.
     ruin_index: int = -1
+    # Defaulted (empty) so BacktestResult constructors that predate this field --
+    # test fixtures outside this refactor's scope -- do not crash on a missing
+    # argument. `run_backtest` always passes a fully populated `daily` explicitly.
+    daily: DailyResult = field(
+        default_factory=lambda: DailyResult(
+            dates=np.empty(0, dtype=np.int64),
+            equity=np.empty(0, dtype=np.float64),
+            returns=np.empty(0, dtype=np.float64),
+            gross_returns=np.empty(0, dtype=np.float64),
+            turnover=np.empty(0, dtype=np.float64),
+            n_days=0,
+        )
+    )
 
     def to_dict(self) -> dict[str, float | int | bool]:
         if self.equity_curve.size and self.initial_capital != 0.0:
@@ -85,11 +138,17 @@ class BacktestResult:
             "rejected_order_rate": self.rejected_order_rate,
             "unfilled_notional_pct": self.unfilled_notional_pct,
             "forced_eod_liquidation_days": self.forced_eod_liquidation_days,
+            "n_forced_liquidations_against_nontradable": (
+                self.n_forced_liquidations_against_nontradable
+            ),
             "final_equity": final_equity,
             "total_return": total_return,
             "mean_turnover": float(np.mean(self.turnover)) if self.turnover.size else 0.0,
             "ruined": self.ruined,
             "ruin_index": self.ruin_index,
+            "n_stale_marks": self.n_stale_marks,
+            "min_cash_seen": self.min_cash_seen,
+            "n_rows_negative_cash": self.n_rows_negative_cash,
         }
 
 
@@ -119,7 +178,8 @@ def _compute_returns(equity: np.ndarray, initial_capital: float) -> tuple[np.nda
     bad[0] = initial_bad or not np.isfinite(equity[0])
     if n > 1:
         prev = equity[:-1]
-        bad[1:] = (~np.isfinite(prev)) | (prev <= 0.0) | (~np.isfinite(equity[1:]))
+        cur = equity[1:]
+        bad[1:] = (~np.isfinite(prev)) | (prev <= 0.0) | (~np.isfinite(cur)) | (cur <= 0.0)
 
     ruined_mask = np.logical_or.accumulate(bad)
 
@@ -233,10 +293,13 @@ def run_backtest(
             initial_capital=float(config.capital),
         )
 
-        pending_orders: dict[int, np.ndarray] = {}
+        # AMENDMENT 2 item 1: only ENTRY and EOD_EXIT orders ever populate this queue.
+        # RISK_EXIT and FORCED_EOD fill directly at row t (`_execute_direct_fill`) and
+        # never enter it. Queueing for an already-populated fill row APPENDS -- see
+        # `_queue_pending` -- never overwrites.
+        pending_orders: dict[int, list[PendingOrder]] = {}
         in_flight: np.ndarray = np.zeros(n_sym, dtype=np.float64)
         active_stops: dict[int, float] = {}
-        square_off_queued = False
 
         records: list[dict[str, object]] = []
         n_submitted = 0
@@ -244,11 +307,16 @@ def run_backtest(
         sum_unfilled = 0.0
         sum_desired = 0.0
         forced_eod_liquidation_days = 0
+        n_orders_dropped_at_session_end = 0
+        n_forced_liquidations_against_nontradable = 0  # F7
+        min_cash_seen = float(config.capital)  # F2
+        n_rows_negative_cash = 0  # F2
 
         equity_vals: list[float] = []
         gross_vals: list[float] = []
         positions_list: list[np.ndarray] = []
         turnover_list: list[float] = []
+        row_day_vals: list[int] = []
         notional_since_snapshot = 0.0
 
         trade_columns = (
@@ -264,6 +332,7 @@ def run_backtest(
             "shortfall_bps",
             "participation",
             "filled_frac",
+            "intent",
         )
 
         def _record_trade(
@@ -273,6 +342,7 @@ def run_backtest(
             price: float,
             charges: float,
             desired_qty: float,
+            intent: OrderIntent,
         ) -> None:
             qty_f = float(qty)
             price_f = float(price)
@@ -316,6 +386,9 @@ def run_backtest(
                     "shortfall_bps": shortfall_bps,
                     "participation": participation,
                     "filled_frac": filled_frac,
+                    # AMENDMENT 2 item 2: parquet-safe -- store the enum's `.value`
+                    # (a plain str), never the enum member or an int.
+                    "intent": intent.value,
                 }
             )
 
@@ -323,7 +396,61 @@ def run_backtest(
             for sym_idx in np.flatnonzero(portfolio.shares == 0):
                 active_stops.pop(int(sym_idx), None)
 
-        def _execute_model_fill(order: np.ndarray, t: int) -> float:
+        def _net_pending(
+            pending_list: list[PendingOrder],
+        ) -> tuple[np.ndarray, list[OrderIntent | None]]:
+            """Sum a fill row's queued orders in queue order into one net share
+            vector, and compute the per-symbol "dominant" intent for the blotter:
+            the largest-absolute-contribution order for that symbol, ties resolved
+            to the later-queued order (spec section B rule 4). This is purely a
+            reporting convention -- the netted quantity is what is executed either
+            way, regardless of which intent is recorded.
+            """
+            net = np.zeros(n_sym, dtype=np.float64)
+            best_abs = np.zeros(n_sym, dtype=np.float64)
+            dominant: list[OrderIntent | None] = [None] * n_sym
+            for po in pending_list:
+                shares = np.asarray(po.shares, dtype=np.float64)
+                net = net + shares
+                abs_shares = np.abs(shares)
+                for sym_idx in np.flatnonzero(abs_shares > 0.0):
+                    if abs_shares[sym_idx] >= best_abs[sym_idx]:
+                        best_abs[sym_idx] = abs_shares[sym_idx]
+                        dominant[sym_idx] = po.intent
+            return net, dominant
+
+        def _queue_pending(
+            fill_row: int, order: np.ndarray, intent: OrderIntent, t: int, day_idx: int
+        ) -> None:
+            """Queue `order` for `fill_row`, appending to (never overwriting) any
+            orders already queued for that row. Bounded by the SESSION, not the
+            panel (confirmed defect F1): an order whose fill row would land at or
+            after this session's end is dropped and counted, never left to fill
+            into the next session.
+            """
+            nonlocal in_flight, n_orders_dropped_at_session_end
+
+            session_end = int(panel.day_offsets[day_idx + 1])
+            if fill_row >= session_end:
+                n_orders_dropped_at_session_end += 1
+                return
+
+            order = np.asarray(order, dtype=np.float64)
+            pending_orders.setdefault(fill_row, []).append(
+                PendingOrder(intent=intent, shares=order, queued_row=t)
+            )
+            in_flight = in_flight + order
+
+        def _eod_exit_pending() -> bool:
+            return any(
+                po.intent == OrderIntent.EOD_EXIT
+                for orders_at_row in pending_orders.values()
+                for po in orders_at_row
+            )
+
+        def _execute_model_fill(
+            order: np.ndarray, t: int, intents: list[OrderIntent | None]
+        ) -> float:
             nonlocal n_submitted, n_rejected, sum_unfilled, sum_desired
 
             order = np.asarray(order, dtype=np.float64)
@@ -341,6 +468,18 @@ def run_backtest(
             portfolio.apply_fills(filled, fill_price_arr, total_charges)
 
             for sym_idx in np.flatnonzero(filled != 0):
+                intent = intents[sym_idx]
+                if intent is None:
+                    # No queued PendingOrder contributed any shares for this symbol
+                    # (order[sym_idx] == 0), yet the fill model reported a nonzero
+                    # fill anyway -- a phantom fill, only reachable with a
+                    # pluggable/test-double fill_model. There is no principled
+                    # "dominant" intent to attribute in that case; ENTRY is the
+                    # least-wrong default since it is the only intent that can
+                    # legitimately appear standalone (unlike EOD_EXIT, which only
+                    # ever appears alongside a non-flat book this queue already
+                    # knows about).
+                    intent = OrderIntent.ENTRY
                 _record_trade(
                     t,
                     int(sym_idx),
@@ -348,6 +487,7 @@ def run_backtest(
                     float(fill_price_arr[sym_idx]),
                     float(charges_arr.total[sym_idx]),
                     float(order[sym_idx]),
+                    intent,
                 )
 
             fill_notional = float(np.sum(np.abs(filled) * fill_price_arr))
@@ -363,7 +503,11 @@ def run_backtest(
             return fill_notional
 
         def _execute_direct_fill(
-            t: int, order: np.ndarray, price_arr: np.ndarray, cost_model: CostModel
+            t: int,
+            order: np.ndarray,
+            price_arr: np.ndarray,
+            cost_model: CostModel,
+            intent: OrderIntent,
         ) -> float:
             nonlocal n_submitted, sum_desired
 
@@ -387,6 +531,7 @@ def run_backtest(
                     float(price_arr[sym_idx]),
                     float(charges_arr.total[sym_idx]),
                     float(order[sym_idx]),
+                    intent,
                 )
 
             fill_notional = float(np.sum(np.abs(order) * price_arr))
@@ -399,37 +544,95 @@ def run_backtest(
             _remove_zero_stops()
             return fill_notional
 
+        def _flush_snapshot(mark_prices: np.ndarray) -> None:
+            """Mark, append one (equity, gross, positions, turnover, day)
+            snapshot row, and reset the fill-notional accumulator.
+
+            F8 fix: called at every decision row (unchanged) AND, when there is
+            unflushed notional, at every session's last row. Before this, a
+            square-off or forced-EOD fill executing AFTER a session's final
+            decision row left its notional in `notional_since_snapshot` until
+            whichever row read it NEXT -- which could be the FOLLOWING
+            session's first decision row, misattributing that day's turnover to
+            the wrong session. Flushing at session end (see call site) means
+            nothing can cross a session boundary; the pooled/total turnover is
+            unchanged either way, only which day each piece is tagged with.
+            """
+            nonlocal notional_since_snapshot
+            portfolio.mark(mark_prices)
+            equity_vals.append(portfolio.equity(mark_prices))
+            gross_vals.append(config.capital + portfolio.cum_pnl)
+            positions_list.append(portfolio.shares.copy())
+
+            denom_equity = equity_vals[-2] if len(equity_vals) > 1 else config.capital
+            if not np.isfinite(denom_equity) or denom_equity <= 0.0:
+                denom_equity = config.capital
+            turnover_val = (
+                notional_since_snapshot / denom_equity if denom_equity > 0.0 else 0.0
+            )
+            turnover_list.append(turnover_val)
+            notional_since_snapshot = 0.0
+            row_day_vals.append(day_idx)
+
         for t in range(n_rows):
             day_idx = int(day_index[t])
             is_first_row = t == panel.day_offsets[day_idx]
 
             if is_first_row:
+                # Defect F1 fix: a session-bound `_queue_pending` guarantees no order
+                # ever leaks past its own session's last row, so the queue must be
+                # fully drained by the time the next session's first row is reached.
+                guards.check(
+                    not pending_orders,
+                    (
+                        f"pending_orders not empty at start of session {day_idx} "
+                        f"(row {t}): {pending_orders!r}"
+                    ),
+                    level=guards.Strictness.FULL,
+                )
                 active_stops.clear()
-                square_off_queued = False
                 strategy.on_session_start(panel.dates[day_idx])
 
             if t > 0:
                 prev_close = close[t - 1]
                 portfolio.mark(prev_close)
+                # F4: positions_value must come from `portfolio.equity()`, which
+                # marks a held-but-missing symbol at its last observed close
+                # (counted in `n_stale_marks`) -- NOT from an independent raw
+                # np.dot against `prev_close` here, which would reintroduce the
+                # exact NaN-book failure F6 exists to catch, off a legitimately
+                # stale-marked position.
                 guards.check_accounting(
                     cash=portfolio.cash,
-                    positions_value=float(
-                        np.dot(
-                            portfolio.shares,
-                            np.where(portfolio.shares != 0, prev_close, 0.0),
-                        )
-                    ),
+                    positions_value=float(portfolio.equity(prev_close) - portfolio.cash),
                     costs=portfolio.cum_costs,
                     initial_capital=config.capital,
                     pnl=portfolio.cum_pnl,
                 )
+                # AMENDMENT 1 item 1: `in_flight` must equal the summed shares of
+                # every order still in `pending_orders`, checked every row at FULL
+                # strictness rather than only inside one test.
+                pending_total = np.zeros(n_sym, dtype=np.float64)
+                for orders_at_row in pending_orders.values():
+                    for po in orders_at_row:
+                        pending_total = pending_total + np.asarray(
+                            po.shares, dtype=np.float64
+                        )
+                guards.check(
+                    bool(np.allclose(in_flight, pending_total, atol=1e-6)),
+                    "in_flight desynchronised from the pending order book",
+                    level=guards.Strictness.FULL,
+                )
 
-            pending = pending_orders.pop(t, None)
-            if pending is not None:
-                in_flight -= pending
+            pending_list = pending_orders.pop(t, None)
+            if pending_list is not None:
+                net_order, dominant_intents = _net_pending(pending_list)
+                in_flight = in_flight - net_order
                 if not pending_orders:
                     in_flight[:] = 0.0
-                notional_since_snapshot += _execute_model_fill(pending, t)
+                notional_since_snapshot += _execute_model_fill(
+                    net_order, t, dominant_intents
+                )
 
             if req.needs_intrabar_risk:
                 for sym_idx in list(active_stops):
@@ -478,27 +681,15 @@ def run_backtest(
                     stop_price_arr = np.zeros(n_sym, dtype=np.float64)
                     stop_price_arr[sym_idx] = trigger_price
                     notional_since_snapshot += _execute_direct_fill(
-                        t, stop_order, stop_price_arr, config.cost_model
+                        t,
+                        stop_order,
+                        stop_price_arr,
+                        config.cost_model,
+                        OrderIntent.RISK_EXIT,
                     )
 
             if is_decision_row[t]:
-                portfolio.mark(close[t])
-                equity_vals.append(portfolio.equity(close[t]))
-                gross_vals.append(config.capital + portfolio.cum_pnl)
-                positions_list.append(portfolio.shares.copy())
-
-                denom_equity = (
-                    equity_vals[-2] if len(equity_vals) > 1 else config.capital
-                )
-                if not np.isfinite(denom_equity) or denom_equity <= 0.0:
-                    denom_equity = config.capital
-                turnover_val = (
-                    notional_since_snapshot / denom_equity
-                    if denom_equity > 0.0
-                    else 0.0
-                )
-                turnover_list.append(turnover_val)
-                notional_since_snapshot = 0.0
+                _flush_snapshot(close[t])
 
                 cursor = t - 1
                 view = ArrayMarketView(
@@ -534,93 +725,161 @@ def run_backtest(
                         ),
                     )
 
-                target = strategy.on_decision(view, signals_row, state)
-                if target is not None:
-                    target.validate(n_sym)
-                    mark_prices = close[cursor]
-                    capital_now = (
-                        portfolio.equity(mark_prices)
-                        if config.compound
-                        else config.capital
-                    )
-                    target_weights = np.asarray(
-                        target.weights, dtype=np.float64
-                    )
-                    orig_gross = float(np.sum(np.abs(target_weights)))
-                    effective_mask = present_close[cursor]
-                    masked_weights = np.where(effective_mask, target_weights, 0.0)
-                    masked_gross = float(np.sum(np.abs(masked_weights)))
-                    if orig_gross > 0.0 and 0.0 < masked_gross < orig_gross:
-                        target_weights = masked_weights * (orig_gross / masked_gross)
-                    else:
-                        target_weights = masked_weights
-                    bar_traded_value = close[cursor] * volume_safe[cursor]
-                    sizing_result = config.sizer.to_shares(
-                        target_weights,
-                        mark_prices,
-                        capital_now,
-                        bar_traded_value=bar_traded_value,
-                        max_participation=config.fill_model.max_participation,
-                    )
-                    assert isinstance(sizing_result, SizingResult)
-                    target_shares = sizing_result.shares
-                    order = target_shares - portfolio.shares - in_flight
-                    fill_row = t + 1 + int(config.decision_latency_bars)
-                    if fill_row < n_rows:
-                        if fill_row in pending_orders:
-                            # Unreachable from the DECISION side. For a fixed
-                            # decision_latency_bars L, fill_row = t + 1 + L is strictly
-                            # increasing in t, so two decisions can never share a fill row.
-                            # A collision with an earlier-queued SQUARE-OFF (which queues at
-                            # t_sq + 1) needs t_sq + 1 == t_dec + 1 + L with t_sq < t_dec,
-                            # i.e. t_sq = t_dec + L >= t_dec -- a contradiction for any
-                            # L >= 0. The realizable direction (square-off queued after the
-                            # decision) is caught by the square-off block's own identical
-                            # check below, which IS covered. Kept because it is the correct
-                            # netting if latency ever becomes per-decision rather than fixed.
-                            in_flight -= pending_orders[fill_row]  # pragma: no cover
-                        pending_orders[fill_row] = order
-                        in_flight += order
+                # Spec item D / AMENDMENT: no re-opening after square-off. Equity,
+                # turnover and position bookkeeping above still run for every
+                # decision row regardless; only the call into the strategy and any
+                # resulting ENTRY order are gated off at or past the square-off row.
+                if t < square_off_row_for_day[day_idx]:
+                    target = strategy.on_decision(view, signals_row, state)
+                    if target is not None:
+                        target.validate(n_sym)
+                        mark_prices = close[cursor]
+                        capital_now = (
+                            portfolio.equity(mark_prices)
+                            if config.compound
+                            else config.capital
+                        )
+                        target_weights = np.asarray(
+                            target.weights, dtype=np.float64
+                        )
+                        orig_gross = float(np.sum(np.abs(target_weights)))
+                        effective_mask = present_close[cursor]
+                        masked_weights = np.where(effective_mask, target_weights, 0.0)
+                        masked_gross = float(np.sum(np.abs(masked_weights)))
+                        if orig_gross > 0.0 and 0.0 < masked_gross < orig_gross:
+                            target_weights = masked_weights * (orig_gross / masked_gross)
+                        else:
+                            target_weights = masked_weights
+                        bar_traded_value = close[cursor] * volume_safe[cursor]
+                        sizing_result = config.sizer.to_shares(
+                            target_weights,
+                            mark_prices,
+                            capital_now,
+                            bar_traded_value=bar_traded_value,
+                            max_participation=config.fill_model.max_participation,
+                        )
+                        assert isinstance(sizing_result, SizingResult)
+                        target_shares = sizing_result.shares
+                        order = target_shares - portfolio.shares - in_flight
+                        fill_row = t + 1 + int(config.decision_latency_bars)
+                        _queue_pending(fill_row, order, OrderIntent.ENTRY, t, day_idx)
 
-                    for symbol, sym_idx in panel.sym_ix.items():
-                        stop_key = f"stop:{symbol}"
-                        if stop_key in target.meta:
-                            active_stops[sym_idx] = float(target.meta[stop_key])
+                        for symbol, sym_idx in panel.sym_ix.items():
+                            stop_key = f"stop:{symbol}"
+                            if stop_key in target.meta:
+                                active_stops[sym_idx] = float(target.meta[stop_key])
 
             is_last_row = t == panel.day_offsets[day_idx + 1] - 1
-            if t >= square_off_row_for_day[day_idx] and not square_off_queued:
+            # Square-off as STATE (spec section C), not a one-shot latch: re-arm
+            # and re-queue an EOD_EXIT for the REMAINING shares every row while
+            # past the square-off row, non-flat, and no EOD_EXIT is currently
+            # in flight -- until flat or the session ends. No explicit reset is
+            # needed at `is_first_row`: the guard above already proves
+            # `pending_orders` (and therefore `_eod_exit_pending()`) starts every
+            # session empty.
+            if t >= square_off_row_for_day[day_idx] and not _eod_exit_pending():
                 if np.any(portfolio.shares != 0):
                     if square_off_row_for_day[day_idx] == panel.day_offsets[day_idx + 1] - 1:
+                        # Unchanged special case (spec item C.4): the square-off row
+                        # IS the session's last row, so there is no later row to
+                        # queue-and-wait for. Direct fill, uncapped, tagged EOD_EXIT.
                         eod_order = -portfolio.shares.copy()
                         notional_since_snapshot += _execute_direct_fill(
                             t,
                             eod_order,
                             close[t],
                             config.cost_model,
+                            OrderIntent.EOD_EXIT,
                         )
-                        square_off_queued = True
-                    else:
+                    elif not is_last_row:
                         fill_row = t + 1
-                        if fill_row < n_rows and not is_last_row:
-                            square_off_order = -portfolio.shares.copy()
-                            if fill_row in pending_orders:
-                                in_flight -= pending_orders[fill_row]
-                            pending_orders[fill_row] = square_off_order
-                            in_flight += square_off_order
-                            square_off_queued = True
+                        square_off_order = -portfolio.shares.copy()
+                        _queue_pending(
+                            fill_row, square_off_order, OrderIntent.EOD_EXIT, t, day_idx
+                        )
+                    # else: retries have exhausted every row this session without
+                    # reaching flat. No room left to queue another attempt; the
+                    # terminal FORCED_EOD safety net below picks up the remainder
+                    # (spec item C.5) -- this is a genuine failure to liquidate in
+                    # time, distinct from ordinary EOD_EXIT behaviour.
 
             if is_last_row:
                 if not np.all(portfolio.shares == 0):
                     forced_eod_liquidation_days += 1
                     eod_order = -portfolio.shares.copy()
+                    # F7: forced EOD liquidation bypasses the `tradable` mask
+                    # entirely -- it can always liquidate because it never asks
+                    # whether it may. This is a MODELLING limitation, not a bug
+                    # (refusing to liquidate would break I2, "session ends
+                    # flat", and change every result): count every symbol-level
+                    # fill this forces against a bar THIS SAME panel marked
+                    # non-tradable, surfaced beside `forced_eod_liquidation_days`
+                    # rather than folded silently into it.
+                    n_forced_liquidations_against_nontradable += int(
+                        np.sum((eod_order != 0) & ~tradable_full[t])
+                    )
+                    # Spec section E: the forced-EOD leg is charged config.cost_model
+                    # PLUS NSEDeliveryEquityCosts, composed rather than substituted --
+                    # HEAD paid delivery-only charges here, which is systematically
+                    # cheaper in six of seven components than an ordinary sale.
                     notional_since_snapshot += _execute_direct_fill(
                         t,
                         eod_order,
                         close[t],
-                        NSEDeliveryEquityCosts(),
+                        CompositeCostModel(
+                            models=(config.cost_model, NSEDeliveryEquityCosts())
+                        ),
+                        OrderIntent.FORCED_EOD,
                     )
                 assert np.all(portfolio.shares == 0)
                 strategy.on_session_end(panel.dates[day_idx])
+
+                # F8: any notional still unaccounted for THIS row (an ordinary
+                # square-off or RISK_EXIT stop that executed after this
+                # session's last decision-row flush, or the FORCED_EOD fill
+                # just above) must be attributed to THIS session, not left in
+                # `notional_since_snapshot` for the next session's first
+                # decision row to misattribute. Folded into the last snapshot
+                # row already recorded for this SAME day_idx (which must exist:
+                # residual notional can only arise from unwinding a position
+                # that a decision row in this same session opened) rather than
+                # appending a new row, so `len(equity_curve)` is unchanged --
+                # only the turnover VALUE moves, never the pooled/total sum.
+                # Skipped for the panel's absolute last row: the trailing
+                # markup just below already tags that row with the correct
+                # (final) day_idx, so F8 cannot manifest there -- there is no
+                # "next session" to misattribute into.
+                if notional_since_snapshot != 0.0 and t != n_rows - 1:
+                    folded = False
+                    for i in range(len(row_day_vals) - 1, -1, -1):
+                        if row_day_vals[i] != day_idx:
+                            break
+                        denom = equity_vals[i - 1] if i > 0 else config.capital
+                        if not np.isfinite(denom) or denom <= 0.0:
+                            denom = config.capital
+                        if denom > 0.0:
+                            turnover_list[i] += notional_since_snapshot / denom
+                        notional_since_snapshot = 0.0
+                        folded = True
+                        break
+                    guards.check(
+                        folded or notional_since_snapshot == 0.0,
+                        (
+                            f"F8: unflushed notional {notional_since_snapshot} at end "
+                            f"of session {day_idx} with no prior snapshot row for "
+                            "this session to attribute it to"
+                        ),
+                        level=guards.Strictness.FULL,
+                    )
+
+            # F2: SURFACE (never prevent) negative cash. Sampled once per row,
+            # after every fill this row could have made (ordinary, stop,
+            # square-off, forced-EOD), so a same-row dip is caught even if a
+            # later fill this same row brings cash back up.
+            if portfolio.cash < min_cash_seen:
+                min_cash_seen = portfolio.cash
+            if portfolio.cash < 0.0:
+                n_rows_negative_cash += 1
 
         if n_rows > 0:
             portfolio.mark(close[n_rows - 1])
@@ -640,10 +899,12 @@ def run_backtest(
             )
             turnover_list.append(turnover_val)
             notional_since_snapshot = 0.0
+            row_day_vals.append(day_idx)
 
         equity_curve_arr = np.asarray(equity_vals, dtype=np.float64)
         gross_curve_arr = np.asarray(gross_vals, dtype=np.float64)
         turnover_arr = np.asarray(turnover_list, dtype=np.float64)
+        row_day_arr = np.asarray(row_day_vals, dtype=np.int64)
         positions_arr = (
             np.asarray(positions_list, dtype=np.float64)
             if positions_list
@@ -672,6 +933,33 @@ def run_backtest(
         else:
             ruin_index = -1
 
+        # AMENDMENT 1 item 2: dates are a DATE KEY, UTC midnight of the session date,
+        # never a bar timestamp -- one entry per session in the PANEL (`panel.dates`),
+        # not per session that produced rows.
+        session_dates_epoch = np.asarray(
+            [
+                int(
+                    datetime(
+                        session_date.year,
+                        session_date.month,
+                        session_date.day,
+                        tzinfo=timezone.utc,
+                    ).timestamp()
+                )
+                for session_date in panel.dates
+            ],
+            dtype=np.int64,
+        )
+        daily = build_daily(
+            row_day_arr,
+            equity_curve_arr,
+            returns_arr,
+            gross_returns_arr,
+            turnover_arr,
+            session_dates_epoch,
+            initial_capital=float(config.capital),
+        )
+
         trades = pd.DataFrame(records, columns=trade_columns)
         trades = trades.astype(
             {
@@ -687,6 +975,7 @@ def run_backtest(
                 "shortfall_bps": np.float64,
                 "participation": np.float64,
                 "filled_frac": np.float64,
+                "intent": object,
             }
         )
 
@@ -699,12 +988,20 @@ def run_backtest(
             total_costs=float(portfolio.cum_costs),
             n_trades=len(trades),
             turnover=turnover_arr,
+            daily=daily,
             rejected_order_rate=(n_rejected / n_submitted if n_submitted else 0.0),
             unfilled_notional_pct=(sum_unfilled / sum_desired if sum_desired > 0 else 0.0),
             forced_eod_liquidation_days=forced_eod_liquidation_days,
+            n_orders_dropped_at_session_end=n_orders_dropped_at_session_end,
+            n_forced_liquidations_against_nontradable=(
+                n_forced_liquidations_against_nontradable
+            ),
             initial_capital=float(config.capital),
             n_symbols_absent=n_symbols_absent,
             absent_symbols=absent_symbols,
+            n_stale_marks=int(portfolio.n_stale_marks),
+            min_cash_seen=min_cash_seen,
+            n_rows_negative_cash=n_rows_negative_cash,
             ruined=ruined,
             ruin_index=ruin_index,
         )

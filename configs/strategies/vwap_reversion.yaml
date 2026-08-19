@@ -8,7 +8,6 @@ params:
   vol_window: 30
   min_bars_since_open: 15
   square_off_time: "15:20"
-  target_vol_ann: 0.15
   sigma_floor: 1.0e-5
   max_weight: 0.10
   gross: 1.0

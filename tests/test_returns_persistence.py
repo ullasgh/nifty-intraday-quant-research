@@ -1,8 +1,13 @@
 """TDD red tests for returns-persistence spec (specs/returns_persistence.md).
 
 The producer feature does not exist yet: these tests are intentionally RED.
-They monkeypatch only data/engine plumbing and exercise the real CLI, real
-`_daily_returns`, and real registry/metrics consumer code.
+They monkeypatch only data/engine plumbing and exercise the real CLI, the real
+`BacktestResult.daily` aggregation (`nifty_quant.backtest.daily.build_daily`),
+and real registry/metrics consumer code. `_fake_result` builds its `daily`
+field with the same `build_daily` call and the same per-row day-index /
+session-date derivation the engine itself uses (`engine.py`'s `day_index`
+and `session_dates_epoch`), so the fake stays faithful to what a real
+`run_backtest` call would populate.
 """
 
 from __future__ import annotations
@@ -19,9 +24,10 @@ import pytest
 import yaml
 from typer.testing import CliRunner
 
+from nifty_quant.backtest.daily import build_daily
 from nifty_quant.backtest.engine import BacktestResult
 from nifty_quant.backtest.metrics import pbo_cscv
-from nifty_quant.cli import _daily_returns, app
+from nifty_quant.cli import app
 from nifty_quant.data.panel import Panel
 from nifty_quant.research.registry import TrialRegistry
 from nifty_quant.universe.static import Universe
@@ -67,8 +73,37 @@ def _make_panel(
     return Panel(fields, symbols, ts, day_offsets, np.asarray(session_dates, dtype=object))
 
 
+def _row_day_index(panel: Panel) -> np.ndarray:
+    """Per-row day index, computed exactly as `engine.py`'s `day_index` local."""
+    n_rows = panel.n_rows()
+    return (
+        np.searchsorted(panel.day_offsets, np.arange(n_rows, dtype=np.int64), side="right")
+        - 1
+    )
+
+
+def _session_dates_epoch(panel: Panel) -> np.ndarray:
+    """`panel.dates` as int64 UTC-midnight epoch seconds, matching `engine.py`'s
+    `session_dates_epoch` local (spec AMENDMENT 1 item 2)."""
+    return np.asarray(
+        [
+            int(
+                datetime(
+                    session_date.year,
+                    session_date.month,
+                    session_date.day,
+                    tzinfo=timezone.utc,
+                ).timestamp()
+            )
+            for session_date in panel.dates
+        ],
+        dtype=np.int64,
+    )
+
+
 def _fake_result(
     n_rows: int,
+    panel: Panel,
     *,
     ruined: bool = False,
     ruin_index: int = -1,
@@ -82,6 +117,10 @@ def _fake_result(
     series for test 18, which must be indistinguishable from a ruined series by return
     values alone. ``BacktestResult`` is frozen, so all mutation must happen before
     construction, never on the built instance.
+
+    ``panel`` is used only to populate ``daily`` (via the real `build_daily`, on the
+    same per-row day index / session dates the engine itself derives) so this fake
+    stays faithful to what `run_backtest` would actually hand the CLI.
     """
     rng = np.random.default_rng(seed)
     gross = rng.normal(loc=0.0006, scale=0.004, size=n_rows).astype(np.float64)
@@ -93,8 +132,19 @@ def _fake_result(
     if zero_from is not None and 0 <= zero_from < n_rows:
         returns = returns.copy()
         returns[zero_from:] = 0.0
+    initial_capital = 1e7
+    equity_curve = np.cumprod(1.0 + returns) * initial_capital
+    daily = build_daily(
+        _row_day_index(panel),
+        equity_curve,
+        returns,
+        gross,
+        turnover,
+        _session_dates_epoch(panel),
+        initial_capital=initial_capital,
+    )
     return BacktestResult(
-        equity_curve=np.cumprod(1.0 + returns) * 1e7,
+        equity_curve=equity_curve,
         returns=returns,
         positions=np.zeros((n_rows, 1)),
         trades=pd.DataFrame({"symbol": [], "side": [], "qty": [], "price": []}),
@@ -105,9 +155,10 @@ def _fake_result(
         rejected_order_rate=0.0,
         unfilled_notional_pct=0.0,
         forced_eod_liquidation_days=0,
-        initial_capital=1e7,
+        initial_capital=initial_capital,
         ruined=ruined,
         ruin_index=ruin_index if ruined else -1,
+        daily=daily,
     )
 
 
@@ -119,7 +170,7 @@ def _capturing_run_backtest(
         result = (
             result_factory(panel)
             if result_factory is not None
-            else _fake_result(panel.n_rows())
+            else _fake_result(panel.n_rows(), panel)
         )
         calls.append({"panel": panel, "tradable": kwargs.get("tradable"), "result": result})
         return result
@@ -217,9 +268,6 @@ def _write_sweep_yaml(tmp_path: Path) -> Path:
             "min_hold_bars": 5,
             "cooldown_bars": 0,
             "square_off_time": "15:20",
-            "stop_loss_pct": 0.01,
-            "target_pct": 0.02,
-            "target_vol_ann": 0.15,
             "sigma_floor": 1.0e-5,
             "max_weight": 0.10,
             "gross": 1.0,
@@ -308,16 +356,18 @@ def _run_walkforward_cli(
         classmethod(lambda cls, symbol="NIFTY50": _FakeCalendar(all_dates)),
     )
     runner.invoke(app, _walkforward_args(all_dates))
-    # Do NOT assert exit_code == 0 here. `walkforward`'s pooled-summary step calls
-    # `breakeven_cost_bps(pooled_gross, pooled_turnover)` where `pooled_gross` is
-    # DAY-aggregated (via the real `_daily_returns`) but `pooled_turnover` is the raw
-    # per-decision-row `res.turnover` concatenated across splits -- a pre-existing
-    # shape-mismatch bug in `cli.py` that is orthogonal to the returns-persistence
-    # feature under test here (it is masked in the existing test suite only because
-    # `cli._daily_returns` is monkeypatched there to a fixed-length stub). Every
-    # per-split `TrialRecord` is written to the registry inside the loop, before this
-    # pooled step runs, so split-level artifacts are still observable even though the
-    # command ultimately exits non-zero. Out of scope to fix (cli.py is off-limits).
+    # NOTE (updated by the daily-results migration): this used to intentionally NOT
+    # assert exit_code == 0, because `walkforward`'s pooled-summary step called
+    # `breakeven_cost_bps(pooled_gross, pooled_turnover)` with `pooled_gross`
+    # DAY-aggregated but `pooled_turnover` the raw per-decision-row `res.turnover`
+    # concatenated across splits -- a shape mismatch. `cli.py` now builds
+    # `pooled_turnover_list` from `res.daily.turnover` (day-aggregated, same basis as
+    # `pooled_gross`/`pooled_net`), so that mismatch is gone; `walkforward` exits 0 on
+    # this fixture as of this migration (verified out-of-band, not asserted here since
+    # cli.py is off-limits for this migration and no caller here relied on the
+    # non-zero exit). Every per-split `TrialRecord` is written to the registry inside
+    # the loop, before this pooled step runs, so split-level artifacts are observable
+    # regardless of the pooled step's outcome.
     return calls
 
 
@@ -400,7 +450,10 @@ def test_stored_series_equals_cli_daily_returns_output(
     panel = _panel_4_sessions_5_bars()
     trial_dir, calls = _run_backtest_cli(monkeypatch, tmp_path, panel)
     assert len(calls) >= 1
-    expected = _daily_returns(calls[0]["result"].returns, calls[0]["panel"], None)
+    # The CLI now writes `result.daily.returns` directly (no `_daily_returns`
+    # reconstruction helper exists any more); this asserts the persisted parquet
+    # matches that field exactly rather than a value re-derived independently.
+    expected = calls[0]["result"].daily.returns
     stored = pd.read_parquet(trial_dir / "returns.parquet")["return"].to_numpy()
     assert np.array_equal(stored, expected)
 
@@ -531,7 +584,7 @@ def test_ruined_run_still_writes_returns(
         monkeypatch,
         tmp_path,
         panel,
-        result_factory=lambda p: _fake_result(p.n_rows(), ruined=True, ruin_index=14),
+        result_factory=lambda p: _fake_result(p.n_rows(), p, ruined=True, ruin_index=14),
     )
 
     assert (trial_dir / "returns.parquet").is_file()
@@ -551,7 +604,7 @@ def test_ruined_flag_and_index_are_recorded(
         monkeypatch,
         tmp_path,
         panel,
-        result_factory=lambda p: _fake_result(p.n_rows(), ruined=True, ruin_index=14),
+        result_factory=lambda p: _fake_result(p.n_rows(), p, ruined=True, ruin_index=14),
     )
 
     _MISSING = object()
@@ -579,13 +632,13 @@ def test_consumer_can_distinguish_ruined_from_flat_series(
         monkeypatch,
         ruined_dir,
         panel,
-        result_factory=lambda p: _fake_result(p.n_rows(), ruined=True, ruin_index=14),
+        result_factory=lambda p: _fake_result(p.n_rows(), p, ruined=True, ruin_index=14),
     )
 
     def flat_factory(p: Panel) -> BacktestResult:
         # Not ruined: returns[14:] happen to be zero for an unrelated, legitimate
         # reason (e.g. no position held), constructed pre-freeze via zero_from.
-        return _fake_result(p.n_rows(), zero_from=14)
+        return _fake_result(p.n_rows(), p, zero_from=14)
 
     flat_trial_dir, _ = _run_backtest_cli(
         monkeypatch,
@@ -623,13 +676,13 @@ def test_two_identical_runs_write_identical_bytes(
         monkeypatch,
         run_a,
         panel,
-        result_factory=lambda p: _fake_result(p.n_rows()),
+        result_factory=lambda p: _fake_result(p.n_rows(), p),
     )
     trial_dir_b, _ = _run_backtest_cli(
         monkeypatch,
         run_b,
         panel,
-        result_factory=lambda p: _fake_result(p.n_rows()),
+        result_factory=lambda p: _fake_result(p.n_rows(), p),
     )
 
     assert (trial_dir_a / "returns.parquet").read_bytes() == (

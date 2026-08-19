@@ -126,6 +126,43 @@ class CostModel(Protocol):
 
 
 @dataclass(frozen=True)
+class CompositeCostModel:
+    """Sums the component charges of every member model over the same fills.
+
+    Used to compose a base cost model (e.g. ``config.cost_model``) with a
+    supplementary model (e.g. ``NSEDeliveryEquityCosts``) instead of the two being
+    special-cased or substituted for one another -- see
+    `specs/order_lifecycle.md` section E. Generic over any number/kind of member
+    ``CostModel``s, not hardcoded to a specific pair.
+    """
+
+    models: tuple[CostModel, ...]
+
+    def charges(self, fills: FillBatch) -> Charges:
+        if not self.models:
+            raise ValueError("CompositeCostModel requires at least one member model")
+
+        per_model = [model.charges(fills) for model in self.models]
+        zero = np.zeros_like(fills.notional, dtype=np.float64)
+
+        def _sum(field: str) -> np.ndarray:
+            total = zero.copy()
+            for charges in per_model:
+                total = total + getattr(charges, field)
+            return total
+
+        return Charges(
+            brokerage=_sum("brokerage"),
+            stt=_sum("stt"),
+            exchange_txn=_sum("exchange_txn"),
+            sebi=_sum("sebi"),
+            ipft=_sum("ipft"),
+            stamp_duty=_sum("stamp_duty"),
+            gst=_sum("gst"),
+        )
+
+
+@dataclass(frozen=True)
 class NSEIntradayEquityCosts:
     """NSE intraday (MIS) equity cost model. Implements CostModel structurally."""
 
@@ -200,7 +237,13 @@ class NSEDeliveryEquityCosts:
     def charges(self, fills: FillBatch) -> Charges:
         zero = np.zeros_like(fills.notional, dtype=np.float64)
         stt = self.stt_pct * fills.notional
-        stt = np.where(fills.is_buy, stt, stt + self.dp_charge_per_scrip)
+        # F5: the flat per-scrip DP charge is a genuine per-scrip charge -- a
+        # scrip with no trade (notional == 0) incurs none. Forced-EOD
+        # liquidation always hands this model the FULL share vector, which is
+        # mostly zeros in any real universe; without this guard every
+        # never-traded symbol was charged the flat fee anyway.
+        dp_charge = np.where(fills.notional != 0, self.dp_charge_per_scrip, 0.0)
+        stt = np.where(fills.is_buy, stt, stt + dp_charge)
 
         return Charges(
             brokerage=zero.copy(),

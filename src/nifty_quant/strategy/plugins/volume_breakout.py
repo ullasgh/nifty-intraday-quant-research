@@ -52,9 +52,6 @@ class VolumeBreakoutParams(BaseModel):
     min_hold_bars: int = 5
     cooldown_bars: int = 0
     square_off_time: str = "15:20"
-    stop_loss_pct: float = 0.01
-    target_pct: float = 0.02
-    target_vol_ann: float = 0.15
     sigma_floor: float = 1e-5
     max_weight: float = 0.10
     gross: float = 1.0
@@ -309,9 +306,14 @@ class VolumeBreakoutStrategy(Strategy):
                     (pos > 0 and short_sig[i]) or (pos < 0 and long_sig[i])
                 )
             elif p.exit_mode == "stop_target":
-                # PortfolioState has no entry price, so real stop/target
-                # tracking is approximated with the same max-holding-period
-                # safety net as 'time'.
+                # NOT a stop/target exit. PortfolioState carries no entry price, so no
+                # stop or target level can be evaluated here. This arm is a max-holding-
+                # period exit -- identical to 'time' except that it ignores min_hold_bars.
+                # The `stop_loss_pct` / `target_pct` parameters that named this mode were
+                # deleted (2026-08-19): they were validated, hashed into the config hash,
+                # and read by nothing. The MODE NAME remains misleading and is carried as
+                # a Phase F item: v2 either implements real stop/target semantics against
+                # a recorded entry price, or the mode is removed.
                 exit_pos = bars[sym] >= p.hold_bars
             else:
                 # Unreachable: `exit_mode` is declared on the pydantic Params model as
@@ -376,7 +378,6 @@ class VolumeBreakoutStrategy(Strategy):
             "gross": float(np.sum(np.abs(weights))),
             "long_count": float(np.sum(weights > 0)),
             "short_count": float(np.sum(weights < 0)),
-            "target_vol_ann": p.target_vol_ann,
         }
 
         return TargetPortfolio(weights=weights, meta=meta)

@@ -69,201 +69,6 @@ def _ensure_plugins_loaded() -> None:
     import nifty_quant.strategy.plugins  # noqa: F401
 
 
-def _decision_and_final_rows(
-    panel: "Panel",
-    decision_times: tuple[str, ...] | None,
-) -> "np.ndarray":
-    """Reconstruct the strategy's decision rows and unconditional final row.
-
-    This helper is shared by `_daily_returns`, `_daily_turnover`, and
-    `_daily_return_ts` so none of them can reconstruct a different row set for
-    the same backtest.
-    """
-    import numpy as np
-
-    n_rows = panel.ts.shape[0]
-    if n_rows == 0:
-        return np.empty(0, dtype=np.int64)
-
-    if decision_times is None:
-        decision_rows = np.arange(1, n_rows, dtype=np.int64)
-    else:
-        parts = [panel.rows_at_time(t) for t in decision_times]
-        decision_rows = (
-            np.unique(np.concatenate(parts)).astype(np.int64, copy=False)
-            if parts
-            else np.empty(0, dtype=np.int64)
-        )
-        decision_rows = decision_rows[decision_rows != 0]
-
-    return np.concatenate((decision_rows, np.array([n_rows - 1], dtype=np.int64)))
-
-
-def _daily_returns(
-    returns: "np.ndarray",
-    panel: "Panel",
-    decision_times: tuple[str, ...] | None,
-) -> "np.ndarray":
-    """Aggregate decision-row returns into one compounded return per trading day.
-
-    ``BacktestResult`` returns one entry per decision row plus an unconditional final
-    row, not one entry per trading day.  Computing metrics directly on those rows with
-    the default ``periods_per_year=252`` would annualize by the wrong factor for
-    bar-frequency and checkpoint strategies.  This helper reconstructs the engine's
-    decision-row selection from ``Strategy.data_request().decision_times`` and
-    ``Panel.rows_at_time``, appends the unconditional final row, maps rows to days using
-    ``Panel.day_offsets``, and compounds each day's returns with
-    ``aggregate_returns_by_group``.
-
-    Parameters
-    ----------
-    returns:
-        1-D array of raw per-decision-row returns from a ``BacktestResult``.
-    panel:
-        Panel used for the backtest; its ``ts``, ``day_offsets``, and ``rows_at_time``
-        are enough to reconstruct the engine's selection.
-    decision_times:
-        The strategy's decision times (``None`` means every row).
-
-    Returns
-    -------
-    np.ndarray
-        1-D float64 array of daily compounded returns. Empty input returns an empty
-        array.
-
-    Raises
-    ------
-    ValueError
-        If reconstructed row count does not match ``returns`` exactly.
-    """
-    import numpy as np
-
-    from nifty_quant.backtest.metrics import aggregate_returns_by_group
-
-    if returns.size == 0:
-        return np.empty(0, dtype=np.float64)
-
-    n_rows = panel.ts.shape[0]
-    if n_rows == 0:
-        return np.empty(0, dtype=np.float64)
-
-    row_indices = _decision_and_final_rows(panel, decision_times)
-
-    if row_indices.size != returns.size:
-        raise ValueError(
-            "Daily-return reconstruction length mismatch: reconstructed "
-            f"{row_indices.size} decision/final rows but backtest returns has "
-            f"{returns.size} entries."
-        )
-
-    day_indices = np.searchsorted(panel.day_offsets, row_indices, side="right") - 1
-    return aggregate_returns_by_group(returns, day_indices)
-
-
-def _daily_turnover(
-    turnover: "np.ndarray",
-    panel: "Panel",
-    decision_times: tuple[str, ...] | None,
-) -> "np.ndarray":
-    """Aggregate decision-row turnover into one additive total per trading day.
-
-    Returns compound within a session, whereas turnover sums within a session because
-    turnover is the notional churned and is therefore an additive quantity. Compounding
-    turnover would be meaningless. Use this helper instead of raw per-decision-row
-    turnover whenever pooling or concatenating it with day-aggregated returns, or the
-    two series will end up on different bases.
-    """
-    import numpy as np
-
-    if turnover.size == 0:
-        return np.empty(0, dtype=np.float64)
-
-    n_rows = panel.ts.shape[0]
-    if n_rows == 0:
-        return np.empty(0, dtype=np.float64)
-
-    row_indices = _decision_and_final_rows(panel, decision_times)
-
-    if row_indices.size != turnover.size:
-        raise ValueError(
-            "Daily-turnover reconstruction length mismatch: reconstructed "
-            f"{row_indices.size} decision/final rows but turnover has "
-            f"{turnover.size} entries."
-        )
-
-    day_indices = np.searchsorted(panel.day_offsets, row_indices, side="right") - 1
-    turnover = np.asarray(turnover, dtype=np.float64).reshape(-1)
-    starts = np.r_[0, np.flatnonzero(np.diff(day_indices) != 0) + 1]
-    return np.add.reduceat(turnover, starts)
-
-
-def _daily_return_ts(
-    panel: "Panel",
-    decision_times: tuple[str, ...] | None,
-    n_days: int,
-) -> "np.ndarray":
-    """Return UTC-midnight timestamps for daily-return values.
-
-    The int64 result has one epoch-second timestamp per requested day, ordered by the
-    distinct reconstructed day groups in the same ascending order as `_daily_returns`.
-    If ``n_days`` does not match those groups, a best-effort fallback uses trailing
-    panel days and repeats day zero as needed; this is intended for callers using
-    externally supplied or stubbed daily-return lengths and cannot recover an arbitrary
-    true row-to-day mapping.
-    """
-    from datetime import datetime, timezone
-
-    import numpy as np
-
-    if n_days == 0:
-        return np.empty(0, dtype=np.int64)
-
-    if panel.ts.shape[0] == 0:
-        return np.empty(0, dtype=np.int64)
-
-    row_indices = _decision_and_final_rows(panel, decision_times)
-    if row_indices.size == 0:
-        unique_days = np.empty(0, dtype=np.int64)
-    else:
-        day_indices = np.searchsorted(panel.day_offsets, row_indices, side="right") - 1
-        unique_days = np.unique(day_indices)
-
-    if unique_days.size != n_days:
-        # Unreachable when n_days comes from the real _daily_returns output because
-        # step 4 derives that length from these same reconstructed day groups.
-        unique_days = np.arange(
-            max(0, len(panel.dates) - n_days),
-            len(panel.dates),
-            dtype=np.int64,
-        )
-        if unique_days.size < n_days:
-            padding = n_days - unique_days.size
-            if len(panel.dates) == 0:
-                unique_days = np.zeros(n_days, dtype=np.int64)
-            else:
-                unique_days = np.concatenate(
-                    (np.zeros(padding, dtype=np.int64), unique_days)
-                )
-
-    if len(panel.dates) == 0:
-        return np.zeros(n_days, dtype=np.int64)
-
-    session_dates = panel.dates[unique_days]
-    return np.asarray(
-        [
-            int(
-                datetime.combine(
-                    session_date,
-                    datetime.min.time(),
-                    tzinfo=timezone.utc,
-                ).timestamp()
-            )
-            for session_date in session_dates
-        ],
-        dtype=np.int64,
-    )
-
-
 def _write_returns_parquet(
     path: Path,
     ts: "np.ndarray",
@@ -572,9 +377,8 @@ def backtest(
             tradable=tradable_full,
         )
 
-        decision_times = strat.data_request().decision_times
-        daily_gross = _daily_returns(result.gross_returns, panel, decision_times)
-        daily_net = _daily_returns(result.returns, panel, decision_times)
+        daily_gross = result.daily.gross_returns
+        daily_net = result.daily.returns
 
         gross = compute_metrics(daily_gross)
         net = compute_metrics(daily_net)
@@ -641,9 +445,7 @@ def backtest(
                     tradable=tradable_full,
                 )
                 latency_sharpes[latency_bars] = float(
-                    compute_metrics(
-                        _daily_returns(latency_result.returns, panel, decision_times)
-                    ).sharpe
+                    compute_metrics(latency_result.daily.returns).sharpe
                 )
                 latency_ruined[latency_bars] = bool(latency_result.ruined)
             ruined_suffix = {
@@ -706,8 +508,7 @@ def backtest(
         )
 
         result.trades.to_parquet(trial_dir / "result.parquet")
-        returns_ts = _daily_return_ts(panel, decision_times, daily_net.size)
-        _write_returns_parquet(trial_dir / "returns.parquet", returns_ts, daily_net)
+        _write_returns_parquet(trial_dir / "returns.parquet", result.daily.dates, daily_net)
 
         manifest_fingerprint = None
         try:
@@ -930,17 +731,13 @@ def walkforward(
                 BacktestConfig(capital=1e7, cost_model=cost_model),
                 tradable=test_tradable_mask,
             )
-            decision_times = strat.data_request().decision_times
-            split_daily_gross = _daily_returns(res.gross_returns, test_panel, decision_times)
-            split_daily_net = _daily_returns(res.returns, test_panel, decision_times)
-            split_daily_turnover = _daily_turnover(res.turnover, test_panel, decision_times)
+            split_daily_gross = res.daily.gross_returns
+            split_daily_net = res.daily.returns
+            split_daily_turnover = res.daily.turnover
             split_trial_dir = settings.RESULTS_ROOT / "trials" / wf_chash / split.id
             split_trial_dir.mkdir(parents=True, exist_ok=True)
-            split_returns_ts = _daily_return_ts(
-                test_panel, decision_times, split_daily_net.size
-            )
             _write_returns_parquet(
-                split_trial_dir / "returns.parquet", split_returns_ts, split_daily_net
+                split_trial_dir / "returns.parquet", res.daily.dates, split_daily_net
             )
             gross_sharpe = float(compute_metrics(split_daily_gross).sharpe)
             net_sharpe = float(compute_metrics(split_daily_net).sharpe)
@@ -1046,13 +843,8 @@ def walkforward(
                 ),
                 tradable=full_tradable_mask,
             )
-        full_decision_times = strat.data_request().decision_times
         latency_sharpes = {
-            lat: float(
-                compute_metrics(
-                    _daily_returns(res.returns, panel, full_decision_times)
-                ).sharpe
-            )
+            lat: float(compute_metrics(res.daily.returns).sharpe)
             for lat, res in latency_results.items()
         }
         latency_ruined: dict[int, bool] = {
@@ -1286,17 +1078,13 @@ def sweep(
                     panel,
                     BacktestConfig(capital=1e7, cost_model=cost_model),
                 )
-                sweep_decision_times = strat.data_request().decision_times
-                sweep_daily_net = _daily_returns(res.returns, panel, sweep_decision_times)
+                sweep_daily_net = res.daily.returns
                 trial_dir = settings.RESULTS_ROOT / "trials" / chash
                 trial_dir.mkdir(parents=True, exist_ok=True)
-                sweep_returns_ts = _daily_return_ts(
-                    panel, sweep_decision_times, sweep_daily_net.size
-                )
                 _write_returns_parquet(
-                    trial_dir / "returns.parquet", sweep_returns_ts, sweep_daily_net
+                    trial_dir / "returns.parquet", res.daily.dates, sweep_daily_net
                 )
-                sweep_daily_gross = _daily_returns(res.gross_returns, panel, sweep_decision_times)
+                sweep_daily_gross = res.daily.gross_returns
 
                 net = compute_metrics(sweep_daily_net)
                 gross = compute_metrics(sweep_daily_gross)
