@@ -37,7 +37,6 @@ from scipy import stats as sps
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import recon_low_turnover_tilt as base
 
-
 RECENT_START = datetime.date(2024, 1, 1)
 RECENT_END = datetime.date(2025, 7, 31)
 
