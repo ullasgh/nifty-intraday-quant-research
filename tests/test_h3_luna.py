@@ -6,14 +6,14 @@ from typing import Callable, Mapping
 
 import numpy as np
 import pytest
-from nifty_quant.research.hypotheses.h3_intraday_xsec_reversal import (
-    build_morning_residual_feature,
-    run_h3,
-)
 
 from nifty_quant.calendar import SessionGrid
 from nifty_quant.data.panel import Panel
 from nifty_quant.execution.costs import NSEIntradayEquityCosts
+from nifty_quant.research.hypotheses.h3_intraday_xsec_reversal import (
+    build_morning_residual_feature,
+    run_h3,
+)
 from nifty_quant.research.lens import Feature, FeatureKindError, HypothesisVerdict, Lens
 
 _IST_OFFSET = datetime.timedelta(hours=5, minutes=30)

@@ -780,7 +780,7 @@ class Lens:
                         if len(sorted_edges) > 1:
                             max_edge = sorted_edges[-1]
                             median_edge = sorted_edges[len(sorted_edges) // 2]
-                            if median_edge > 0 and max_edge > median_edge * 2:
+                            if median_edge > 0 and max_edge > median_edge * CONCENTRATION_RATIO_THRESHOLD:
                                 c4_result = "FAIL"
                                 concentration_reasons.append(_tod_reason)
 
@@ -876,9 +876,15 @@ class Lens:
                 years_desc = ", ".join(str(year) for year in complete_years)
             else:
                 years_desc = "none"
+            excluded_desc = (
+                ", ".join(str(year) for year in partial_years)
+                if partial_years
+                else "none"
+            )
             reasons.append(
                 f"7. Recent-years cost gate criterion: {c7_result} "
-                f"(complete_years={years_desc})"
+                f"(complete_years={years_desc}; "
+                f"excluded partial years: {excluded_desc})"
             )
         else:
             recent_years: list[int] = sorted(complete_years)[-2:]
