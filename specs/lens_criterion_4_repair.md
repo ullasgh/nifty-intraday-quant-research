@@ -67,6 +67,22 @@ call site."
      this criterion is about, so a per-bar mean systematically flatters illiquid names and
      corrupts decile-0 membership. Note at the call site that the per-session `nansum` is a
      statistic, not a rule-6 fill.
+
+   - **An ENTIRELY-ABSENT session must give NaN, not 0.0.** `np.nansum` over an all-NaN slice
+     returns `0.0`, which would classify a symbol that did not trade at all that day as a
+     ZERO-turnover name — putting it in decile 0, the exact decile that decides H2 — rather
+     than excluding it. That is a rule-6 violation (NaN means "no bar"; it is never zero).
+     So: compute the per-session total only where the session has at least one finite bar for
+     that symbol, and set the session total to NaN otherwise:
+
+         has_any = np.any(np.isfinite(turnover[day_slice]), axis=0)
+         day_value[s, :] = np.where(has_any, np.nansum(turnover[day_slice], axis=0), np.nan)
+
+     Note `validate.py`'s `tradable_mask` uses a bare `nansum` and does NOT do this — that is
+     CORRECT for its purpose (absent -> 0 ADV -> not tradable), and WRONG for ours (absent ->
+     0 turnover -> most-illiquid decile). The two uses legitimately differ; say so at the call
+     site so a future reader does not "harmonise" them.
+     Found by a test author while writing suite A, before any implementation existed.
    - Then a **trailing 20-session, strictly prior** mean; session 0 is NaN.
    - Session boundaries come from `panel.day_offsets` — **never** a fixed 375-bar stride
      (Muhurat ~60 bars, shortened ~105).
