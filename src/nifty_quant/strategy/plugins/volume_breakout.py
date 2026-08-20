@@ -1,9 +1,14 @@
 """
-Institutional Volume Exhaustion & Momentum Capture.
+Abnormal Volume Activity Breakout & Momentum Capture.
 
 This plugin implements a breakout-continuation strategy by default.  A ``fade``
 direction flips the sign of the generated signals to satisfy the opposite
 hypothesis.
+
+Note: the volume z-score signal identifies abnormal 1-minute volume ACTIVITY, not a
+proven order-flow mechanism -- without order-level data there is no way to attribute a
+volume spike to any specific participant type or intent. See specs/feature_layer.md D7.
+(KILLED: gross Sharpe -0.048 / net -0.233, see README "Measured findings".)
 """
 
 from __future__ import annotations

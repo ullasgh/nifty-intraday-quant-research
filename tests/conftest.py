@@ -109,13 +109,10 @@ def _isolated_holdout_lock(request, tmp_path, monkeypatch):
 # Delete each entry as its implementation lands. An entry left here after implementation
 # would silently stop gating real code, so the list is deliberately explicit rather than a
 # wildcard.
-_PENDING_SUITES = (
-    # Phase D. specs/feature_layer.md -- gap-stitched price path, breakout strength,
-    # Garman-Klass / Rogers-Satchell, efficiency ratio, and research/ic.py. No implementation
-    # written yet, so these are RED by design.
-    "test_feature_layer_a.py",
-    "test_feature_layer_b.py",
-)
+_PENDING_SUITES: tuple[str, ...] = ()
+# EMPTY, and that is the correct state: every tests-first suite dispatched so far has had
+# its implementation land. Entries go in only while a suite is RED by design, and come out
+# the moment it goes green -- a stale entry would silently stop gating real code.
 
 # Removed as their implementations landed and went green, which is the point of the list being
 # explicit: test_research_contract_{a,b}, test_tca_record_{a,b}, test_overlap_se_{a,b},

@@ -298,3 +298,114 @@ Getting back "essentially the naive SE" is the exact signature of dependence han
 applying — the same class as the `min_names=5` all-NaN trap and the iid fallback. It looked like a
 working pipeline and was not. Reporting it instead of accepting the number is what kept obligation
 13 meaningful, and the strict `se != naive_se` assertion should stay strict.
+
+---
+
+# AMENDMENT 3 — 2026-08-20. `horizon` is REQUIRED, and `per_bar` joins the pinned fields.
+
+## 1. `horizon` takes NO default
+
+The two suites disagreed: suite A never passes `horizon` to `information_coefficient`, suite B
+always does. AMENDMENT 1 item 5 wrote `*, horizon` with no default, which means required — but it
+did not say so explicitly, so the implementer defaulted it to `1` to satisfy both.
+
+**Resolution: `horizon` is required. Remove the default.**
+
+The reason is not pedantry about signatures. `ICResult.se` is computed by resampling with a block
+length of `horizon + 5`, so **the horizon determines the standard error**. A caller who omits it
+silently gets an SE computed for a 6-bar block regardless of the actual label overlap — which for a
+20-bar horizon is close to the naive iid SE this whole spec exists to stop people using.
+
+That is the exact silent-degradation shape already found three times in this program: the
+`min_names = 5` all-NaN collapse, the iid bootstrap fallback, and IC values fed through
+bucket-stats machinery returning the naive SE. In every case a wrong answer arrived looking like a
+right one. A required argument makes the failure loud.
+
+Suite A is updated to pass `horizon` explicitly at each call.
+
+## 2. `ICResult.per_bar` is added to the pinned field set
+
+    ICResult:  .mean  .se  .n_bars  .method  .horizon  .per_bar
+
+`per_bar` is the per-bar cross-sectional IC series. Suite A's obligation 13 reads it to compute its
+own naive SE for the comparison the obligation requires, so without it that test cannot run at all.
+
+This is the same lesson as `specs/overlap_se.md` AMENDMENT 1: **an invariant over a quantity the API
+does not expose is not testable, and a test author facing one will either fail permanently or
+soften the assertion.** Exposing the series is what makes obligation 13's `se > naive_se`
+comparison a real check rather than an assertion about an opaque number.
+
+## 3. Noted: no resampler extraction was needed
+
+AMENDMENT 2 required the moving-block resampler to be importable independently of the bucket-stats
+wrapper, and anticipated an extraction. It turned out `_block_bootstrap_resampling_2d` and
+`_derive_block_length` were ALREADY module-level in `expectancy.py`, so `ic.py` imports them
+directly and `expectancy.py` is unmodified. Single implementation, no copy — which was the actual
+requirement. Recorded so the amendment is not later read as describing work that did not happen.
+
+---
+
+# AMENDMENT 4 — 2026-08-20. Obligation 1's "bit for bit" is unachievable. My spec was wrong.
+
+Obligation 1 required `stitch_overnight_gaps` to leave within-session log-returns "EXACTLY
+unchanged, bit for bit". That cannot be delivered by any correct implementation, and this is a
+defect in the spec, not in the code.
+
+## Why, measured
+
+Stitching necessarily rescales every session after the first — that is the entire operation. In
+log space that is an additive per-session offset `c`, and in IEEE-754 float64:
+
+    (a + c) - (b + c) != a - b        62.15% of 200k random triples
+    (x * s) / (y * s) != x / y        31.77% of 200k random triples
+
+So the rescale itself destroys bit-exactness, independent of construction. The implementer
+confirmed this holds across three different constructions (multiplicative cumprod ~33% mismatch,
+additive log-space ~2.7%, power-of-2 scaling 50-65% on their fixture).
+
+## The precise characterisation, which is sharper than "floating point is fuzzy"
+
+There IS a scale factor that preserves ratios exactly:
+
+    power-of-two scale s: (x * s) / (y * s) != x / y    0.00% of 200k triples
+
+because multiplying by 2**k changes only the exponent and leaves the mantissa untouched. So
+bit-exactness is not impossible in principle — **it is incompatible with LEVEL CONTINUITY.** A
+power-of-two scale cannot make session k's first bar meet session k-1's last bar; it would leave a
+residual jump of up to 2x, which defeats the purpose of stitching entirely.
+
+The two requirements are mutually exclusive, and level continuity is the one worth having.
+
+## What the error actually is
+
+Measured on a 60/105/375-bar irregular fixture through the real implementation:
+
+    within-session log-return mismatches : 8 of 537
+    worst absolute deviation             : 4.441e-16
+    cross-session log-diff               : exactly 0.0, both boundaries
+
+4.44e-16 absolute on a log-return of order 0.01 is a relative error near 4e-14 — round-off, and
+some fourteen orders of magnitude below the ~0.01-0.02 overnight jump the stitch exists to remove.
+It cannot affect a Hurst estimate.
+
+Note what stayed exact: **the cross-session log-difference is 0.0 exactly**, at every boundary.
+That is the property the estimator depends on, and it is not approximate.
+
+## Restated obligation 1
+
+Within-session log-returns are preserved to within floating-point round-off:
+`np.allclose(d_stitched, d_original, rtol=0, atol=1e-14)`.
+
+`atol = 1e-14` is ~22x the worst measured deviation and ~1e12 times SMALLER than a genuine
+mis-stitch (which would show the full overnight gap, ~1e-2). The tolerance therefore cannot hide a
+real defect; it accommodates only the arithmetic.
+
+**Obligations 2 and 3 stay EXACT and must not be relaxed.** The cross-session difference must be
+`== 0.0` exactly, and a NaN must stay NaN at the same index. Those are the two properties that carry
+the meaning; only the shared-offset arithmetic is being conceded.
+
+## Note
+
+Suite A's obligation 1 passes an exact comparison today purely because its seed and sigma
+(0.004 / gap 0.02) happen not to cross a rounding boundary; suite B's (sigma 0.01) does. Both are
+moved to the same tolerance, so neither is one fixture change away from a spurious failure.

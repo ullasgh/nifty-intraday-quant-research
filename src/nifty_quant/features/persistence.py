@@ -13,6 +13,7 @@ on real data, median H ~= 0.467 and p90 ~= 0.556.
 
 import warnings
 from collections.abc import Callable
+from typing import Any
 
 import numpy as np
 
@@ -299,6 +300,166 @@ def rolling_hurst(
 
     hurst = np.where(np.isfinite(hurst), hurst, np.nan)
     return hurst.astype(np.float64)
+
+
+@finite_output(allow_nan=True)
+@causal(row_arg="close", domain="positive")
+def stitch_overnight_gaps(
+    close: np.ndarray, day_offsets: np.ndarray
+) -> np.ndarray:
+    """Remove overnight/cross-session jumps from a multi-session close panel.
+
+    Builds a continuous price PATH by treating every session's opening bar as
+    a level-preserving carry from the previous session's final bar (the
+    overnight return is set to zero), while leaving every WITHIN-session
+    one-bar return untouched. This lets a window-based estimator (see
+    ``hurst_on_stitched``) legitimately span session boundaries on the
+    stitched path, because the jumps it would otherwise see there have been
+    removed from the path.
+
+    This is NOT a forward-fill (repo rule 6): a stitched value exists ONLY
+    where ``close`` has a real (non-NaN) value at that same row. ``NaN`` in
+    ``close`` produces ``NaN`` in the output at the exact same index, and
+    nowhere else -- the stitch removes a jump between two real bars, it never
+    manufactures one. A NaN gap does not corrupt bars once ``close`` recovers
+    to a finite value: the recovering bar re-anchors to the last stitched
+    value produced before the gap (the same treatment as a session boundary),
+    rather than letting the gap propagate forward.
+
+    Parameters
+    ----------
+    close:
+        2-D array ``(n_rows, n_symbols)``, float32 or float64. Must be
+        strictly positive wherever finite (this is a price panel).
+    day_offsets:
+        1-D array of session-start row offsets, length n_days+1
+        (day_offsets[0] == 0, day_offsets[-1] == n_rows), strictly
+        increasing. Validated via ``check_day_offsets``.
+
+    Returns
+    -------
+    np.ndarray of float64, same shape as ``close``.
+
+    Notes
+    -----
+    Conceptually:
+
+        stitched[0]  = close[0]
+        stitched[t]  = stitched[t-1] * (close[t] / close[t-1])   within a session
+        stitched[t]  = stitched[t-1]                              at a session boundary
+
+    Computed as one running sum, in log space, of within-run log-differences
+    (each difference contributed exactly once, in row order) plus a single
+    per-column base offset, then exponentiated once at the end. Multiplying
+    price levels by an arbitrary carried-forward constant and re-logging does
+    not reproduce ``close``'s own log-differences bit-for-bit (float64
+    rounding does not cancel that way); accumulating the log-differences
+    directly does, because a session boundary or a NaN-gap recovery simply
+    contributes 0 to the running sum instead of a jump, and the running sum
+    is never re-derived from a scaled price -- only ever added to.
+    """
+    close = np.asarray(close)
+    if close.ndim != 2:
+        raise ValueError("close must be a 2-D array")
+    n_rows, n_cols = close.shape
+    if n_rows == 0 or n_cols == 0:
+        raise ValueError("close must not be empty")
+
+    offs = np.asarray(day_offsets, dtype=np.int64)
+    check_day_offsets(offs, n_rows)
+
+    x = close.astype(np.float64)
+    is_nan = np.isnan(x)
+    finite = ~is_nan
+    non_positive = finite & (x <= 0.0)
+    if np.any(non_positive):
+        n_bad = int(np.sum(non_positive))
+        raise ValueError(
+            f"stitch_overnight_gaps: requires strictly positive finite "
+            f"values; found {n_bad} non-positive value(s) across the panel"
+        )
+
+    with np.errstate(divide="ignore", invalid="ignore"):
+        log_close = np.where(is_nan, np.nan, np.log(x))
+
+    session_start = np.zeros(n_rows, dtype=bool)
+    session_start[offs[:-1]] = True
+
+    prev_nan = np.zeros((n_rows, n_cols), dtype=bool)
+    prev_nan[1:] = is_nan[:-1]
+
+    # "interior" rows: same session, current AND previous bar both real -- the
+    # only rows whose log-difference is added to the running total. Every
+    # other row (session start, the NaN row itself, or the bar right after a
+    # NaN gap) contributes 0 -- a session boundary and a NaN-gap recovery are
+    # both a "carry the running total forward without adding to it", exactly
+    # the same operation.
+    interior = (~session_start[:, None]) & (~prev_nan) & finite
+
+    diffs = np.zeros((n_rows, n_cols), dtype=np.float64)
+    diffs[1:] = log_close[1:] - log_close[:-1]
+    effective_diff = np.where(interior, diffs, 0.0)
+    # Safety net: interior rows never have a NaN diff by construction (both
+    # operands finite there by definition of `interior`), but guard against a
+    # stray NaN reaching the cumulative sum regardless.
+    effective_diff = np.where(np.isnan(effective_diff), 0.0, effective_diff)
+
+    running_total = np.cumsum(effective_diff, axis=0)
+
+    has_any_finite = np.any(finite, axis=0)
+    first_finite_row = np.argmax(finite, axis=0)
+    cols = np.arange(n_cols)
+    base = np.where(has_any_finite, log_close[first_finite_row, cols], np.nan)
+
+    log_stitched = base[np.newaxis, :] + running_total
+    log_stitched = np.where(is_nan, np.nan, log_stitched)
+    log_stitched = np.where(has_any_finite[np.newaxis, :], log_stitched, np.nan)
+
+    with np.errstate(over="ignore"):
+        stitched = np.exp(log_stitched)
+    return stitched.astype(np.float64)
+
+
+def hurst_on_stitched(
+    close: np.ndarray,
+    day_offsets: np.ndarray,
+    window: int = 390,
+    **rolling_hurst_kwargs: Any,
+) -> np.ndarray:
+    """Causal Hurst estimate on the gap-stitched price path.
+
+    Stitches ``close`` with ``stitch_overnight_gaps`` (removing overnight
+    jumps from the path) and then calls ``rolling_hurst`` on the stitched
+    path WITHOUT day bounds (``day_offsets=None``) -- the window may now
+    legitimately span session boundaries because the jumps it would
+    otherwise see there have already been removed. This is the fix for the
+    arithmetic impossibility of a 390-bar window inside a ~375-bar session:
+    day-bounded ``rolling_hurst`` on the raw path is all-NaN there, while
+    this call is majority-finite on the same data.
+
+    Parameters
+    ----------
+    close:
+        2-D array ``(n_rows, n_symbols)``, float32 or float64.
+    day_offsets:
+        1-D array of session-start row offsets, length n_days+1. Passed
+        through to ``stitch_overnight_gaps``; NOT forwarded to the inner
+        ``rolling_hurst`` call, which deliberately runs unbounded.
+    window:
+        Rolling lookback in rows, forwarded to ``rolling_hurst``.
+    **rolling_hurst_kwargs:
+        Any of ``max_lag``, ``min_lag``, ``log_price``, ``min_count``,
+        ``warn_short_window``, forwarded to ``rolling_hurst``. Do not pass
+        ``day_offsets`` here -- it is not forwarded.
+
+    Returns
+    -------
+    np.ndarray of float64, same shape as ``close``.
+    """
+    kwargs = dict(rolling_hurst_kwargs)
+    kwargs.pop("day_offsets", None)
+    stitched = stitch_overnight_gaps(close, day_offsets)
+    return rolling_hurst(stitched, window=window, day_offsets=None, **kwargs)
 
 
 def hurst_static(

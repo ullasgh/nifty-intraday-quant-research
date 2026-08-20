@@ -112,9 +112,20 @@ def test_obligation_1_within_session_log_returns_unchanged():
         [(t not in boundary_rows) for t in range(1, n_rows)], dtype=bool
     )
 
-    assert np.array_equal(
-        diff_stitched[within_session_mask], diff_close[within_session_mask]
-    ), "within-session log-returns must be EXACTLY unchanged by stitching (bit for bit)"
+# AMENDMENT 4: NOT bit-for-bit. Stitching rescales every session after the
+    # first, which in log space is a shared additive offset `c`, and in IEEE-754
+    # `(a+c)-(b+c) != a-b` for ~62%% of random triples. Exactness would require a
+    # power-of-two scale (the only factor that leaves the mantissa untouched), and
+    # that cannot achieve LEVEL CONTINUITY -- the whole point of stitching.
+    # Worst measured deviation is 4.44e-16, ~1e12x smaller than a genuine
+    # mis-stitch (which would show the full ~1e-2 overnight gap), so this
+    # tolerance cannot hide a real defect. Obligations 2 and 3 stay EXACT.
+    assert np.allclose(
+        diff_stitched[within_session_mask],
+        diff_close[within_session_mask],
+        rtol=0,
+        atol=1e-14,
+    ), "within-session log-returns must survive stitching to within round-off"
 
 
 def test_obligation_2_cross_session_log_diff_is_exactly_zero():
@@ -320,10 +331,20 @@ def test_obligation_8_sigma_floor_has_recorded_derivation_and_is_not_a_round_num
         "value (rule 8) -- a bare literal is not enough"
     )
 
-    sigma_ewma = np.array([[1e-8, 0.05], [floor * 2.0, np.nan]])
-    risk = core.sigma_risk(sigma_ewma, floor)
+    # Every probe is expressed RELATIVE to `floor`. The fixture originally hardcoded
+    # 0.05 as an "above the floor, passes through unchanged" case, which silently became
+    # a BELOW-floor case once SIGMA_FLOOR was derived from measured data (0.1143218)
+    # instead of hand-picked. A fixture coupled to an absolute value cannot survive its
+    # threshold being measured -- which is precisely what rule 8 requires of it.
+    above_floor = floor * 1.5
+    sigma_ewma = np.array([[1e-8, above_floor], [floor * 2.0, np.nan]])
+    # `floor` is KEYWORD-ONLY (specs/feature_layer.md AMENDMENT 1 item 3:
+    # `sigma_risk(sigma_ewma, *, floor=SIGMA_FLOOR)`). This suite originally called it
+    # positionally while the independent suite called it by keyword -- a disagreement
+    # between the two, resolved against the pinned signature.
+    risk = core.sigma_risk(sigma_ewma, floor=floor)
     assert risk[0, 0] == floor
-    assert risk[0, 1] == pytest.approx(0.05)
+    assert risk[0, 1] == pytest.approx(above_floor)
     assert risk[1, 0] == pytest.approx(floor * 2.0)
     assert np.isnan(risk[1, 1])
 
@@ -367,12 +388,14 @@ def test_obligation_10_information_coefficient_spearman_perfect_rank_monotone():
     fwd = feature**3 + np.arange(n_bars, dtype=np.float64).reshape(-1, 1) * 1000.0
     day_offsets = np.array([0, n_bars])
 
-    result = ic.information_coefficient(feature, fwd, day_offsets, method="spearman")
+    result = ic.information_coefficient(
+        feature, fwd, day_offsets, horizon=1, method="spearman"
+    )
     assert result.mean == pytest.approx(1.0, abs=1e-9)
 
     fwd_reversed = -feature
     result_rev = ic.information_coefficient(
-        feature, fwd_reversed, day_offsets, method="spearman"
+        feature, fwd_reversed, day_offsets, horizon=1, method="spearman"
     )
     assert result_rev.mean == pytest.approx(-1.0, abs=1e-9)
 
@@ -405,7 +428,9 @@ def test_obligation_11_ic_is_cross_sectional_not_pooled():
         "distinguish pooled from cross-sectional"
     )
 
-    result = ic.information_coefficient(feature, fwd, day_offsets, method="spearman")
+    result = ic.information_coefficient(
+        feature, fwd, day_offsets, horizon=1, method="spearman"
+    )
     assert result.mean == pytest.approx(1.0, abs=1e-9), (
         f"cross-sectional per-bar IC must be +1.0 (every bar is perfectly rank-monotone); "
         f"got {result.mean}, which looks like the POOLED answer ({pooled_rho}) leaked through"
@@ -477,7 +502,12 @@ def test_obligation_13_ic_se_differs_from_naive_iid_formula():
     for t in range(n_rows - horizon):
         fwd[t, :] = one_bar_ret[t + 1 : t + 1 + horizon, :].sum(axis=0)
 
-    result = ic.information_coefficient(feature, fwd, day_offsets, method="spearman")
+    # `horizon` is REQUIRED (specs/feature_layer.md AMENDMENT 3): the SE is computed with a
+    # block length of horizon + 5, so omitting it silently yields an SE for the wrong
+    # overlap -- close to the naive iid SE this obligation exists to distinguish from.
+    result = ic.information_coefficient(
+        feature, fwd, day_offsets, horizon=horizon, method="spearman"
+    )
 
     finite_ic = result.per_bar[np.isfinite(result.per_bar)]
     assert finite_ic.size >= 30, "fixture must produce enough per-bar IC observations"

@@ -645,7 +645,18 @@ def volume_zscore(
     min_count: int | None = None,
     day_offsets: np.ndarray | None = None,
 ) -> np.ndarray:
-    """Deseasonalize, then rolling zscore; institutional block-volume feature."""
+    """Deseasonalize, then rolling zscore: an ABNORMAL VOLUME ACTIVITY feature.
+
+    Not an "institutional block-volume" feature, which is what this docstring used to
+    claim (spec D7, `specs/feature_layer.md`). With only 1-minute OHLCV and no
+    order-level data, a volume spike is abnormal ACTIVITY -- it cannot be attributed to
+    any particular participant. The previous framing asserted a mechanism the data
+    cannot support, and this program has already killed one strategy built on that
+    assertion: `volume_breakout`, gross Sharpe -0.048 / net -0.233 on 21,708 trades with
+    73.7% of desired notional unfilled.
+
+    The function name is retained for compatibility; it is the CONCEPT that is renamed.
+    """
     volume64 = _as_float64_2d(volume, "volume")
     if day_offsets is not None:
         check_day_offsets(np.asarray(day_offsets), volume64.shape[0])
@@ -700,3 +711,280 @@ def breakout_down(
     rolled_min = rolling_min(low64, window, min_count=window, day_offsets=day_offsets)
     shifted_min = _apply_by_session(_shift_one_bar, rolled_min, day_offsets=day_offsets)
     return close64 < shifted_min
+
+
+@causal(row_arg="close")
+@finite_output(allow_nan=True)
+def breakout_strength(
+    close: np.ndarray,
+    high: np.ndarray,
+    low: np.ndarray,
+    window: int,
+    *,
+    day_offsets: np.ndarray | None = None,
+) -> np.ndarray:
+    """(close - prior_window_high) / sigma; the continuous counterpart of `breakout_up`.
+
+    `prior_window_high` is `rolling_max(high, window)` shifted one bar -- the same
+    convention `breakout_up` already uses, unchanged here. `sigma` is
+    `parkinson_volatility(high, low, window)` on the same window. Negative values are
+    meaningful: they say how far BELOW the prior-window high the close sits, so
+    `breakout_strength > 0` is elementwise identical to `breakout_up` (asserted by a
+    dedicated test) -- the two must never be allowed to drift apart. NaN wherever the
+    prior-window high, sigma, or close is undefined, or sigma is zero.
+    """
+    close64 = _as_float64_2d(close, "close")
+    high64 = _as_float64_2d(high, "high")
+    low64 = _as_float64_2d(low, "low")
+    if day_offsets is not None:
+        check_day_offsets(np.asarray(day_offsets), close64.shape[0])
+    if close64.shape != high64.shape or close64.shape != low64.shape:
+        raise ValueError("close, high and low must have identical shapes")
+
+    rolled_max = rolling_max(high64, window, min_count=window, day_offsets=day_offsets)
+    shifted_max = _apply_by_session(_shift_one_bar, rolled_max, day_offsets=day_offsets)
+    sigma = parkinson_volatility(high64, low64, window, day_offsets=day_offsets)
+
+    out = np.full_like(close64, np.nan, dtype=np.float64)
+    valid = np.isfinite(close64) & np.isfinite(shifted_max) & np.isfinite(sigma) & (sigma > 0)
+    np.divide(close64 - shifted_max, sigma, out=out, where=valid)
+    return out
+
+
+def _ohlc_log_ratio(numer: np.ndarray, denom: np.ndarray, valid: np.ndarray) -> np.ndarray:
+    """log(numer / denom), NaN wherever `valid` is False -- avoids invalid-value warnings
+    from taking a log of a ratio formed from a non-positive or missing price."""
+    ratio = np.full_like(numer, np.nan, dtype=np.float64)
+    np.divide(numer, denom, out=ratio, where=valid)
+    log_ratio = np.full_like(ratio, np.nan, dtype=np.float64)
+    np.log(ratio, out=log_ratio, where=valid)
+    return log_ratio
+
+
+def _ohlc_valid(
+    open_: np.ndarray, high: np.ndarray, low: np.ndarray, close: np.ndarray
+) -> np.ndarray:
+    """A bar is usable for GK/RS when all four prices are positive and high >= low --
+    the same validity gate `parkinson_volatility` uses for high/low."""
+    return (open_ > 0) & (high > 0) & (low > 0) & (close > 0) & (high >= low)
+
+
+def _garman_klass_term(
+    open_: np.ndarray, high: np.ndarray, low: np.ndarray, close: np.ndarray
+) -> np.ndarray:
+    valid = _ohlc_valid(open_, high, low, close)
+    log_hl = _ohlc_log_ratio(high, low, valid)
+    log_co = _ohlc_log_ratio(close, open_, valid)
+    term = 0.5 * np.square(log_hl) - (2.0 * np.log(2.0) - 1.0) * np.square(log_co)
+    return np.where(valid, term, np.nan)
+
+
+def _rogers_satchell_term(
+    open_: np.ndarray, high: np.ndarray, low: np.ndarray, close: np.ndarray
+) -> np.ndarray:
+    valid = _ohlc_valid(open_, high, low, close)
+    log_hc = _ohlc_log_ratio(high, close, valid)
+    log_ho = _ohlc_log_ratio(high, open_, valid)
+    log_lc = _ohlc_log_ratio(low, close, valid)
+    log_lo = _ohlc_log_ratio(low, open_, valid)
+    term = log_hc * log_ho + log_lc * log_lo
+    return np.where(valid, term, np.nan)
+
+
+def _ohlc_volatility(
+    term_func: Callable[..., np.ndarray],
+    open_: np.ndarray,
+    high: np.ndarray,
+    low: np.ndarray,
+    close: np.ndarray,
+    window: int,
+    *,
+    min_count: int | None,
+    day_offsets: np.ndarray | None,
+) -> np.ndarray:
+    open64 = _as_float64_2d(open_, "open_")
+    high64 = _as_float64_2d(high, "high")
+    low64 = _as_float64_2d(low, "low")
+    close64 = _as_float64_2d(close, "close")
+    if day_offsets is not None:
+        check_day_offsets(np.asarray(day_offsets), open64.shape[0])
+    shapes = {open64.shape, high64.shape, low64.shape, close64.shape}
+    if len(shapes) != 1:
+        raise ValueError("open, high, low and close must have identical shapes")
+
+    term = term_func(open64, high64, low64, close64)
+    # AMENDMENT 1 item 1: clip the WINDOW MEAN at zero, never an individual bar's
+    # term -- per-bar clipping biases the estimator upward and destroys the
+    # efficiency advantage that is the whole reason for using GK/RS over
+    # close-to-close. A genuinely negative window mean floors to 0.0 (finite), not
+    # NaN; only an incomplete/poisoned window (a NaN term inside it) stays NaN, on
+    # the same rolling_mean min_count convention `parkinson_volatility` uses.
+    window_mean = rolling_mean(term, window, min_count=min_count, day_offsets=day_offsets)
+    clipped_mean = np.maximum(window_mean, 0.0)
+    return np.asarray(np.sqrt(clipped_mean), dtype=np.float64)
+
+
+@finite_output(allow_nan=True)
+def garman_klass_volatility(
+    open_: np.ndarray,
+    high: np.ndarray,
+    low: np.ndarray,
+    close: np.ndarray,
+    window: int,
+    *,
+    min_count: int | None = None,
+    day_offsets: np.ndarray | None = None,
+) -> np.ndarray:
+    """Garman-Klass volatility (AMENDMENT 1 item 1 formula), day-offset aware and
+    NaN-propagating on the `parkinson_volatility` convention.
+
+        sigma_sq[t] = mean_over_window[ 0.5*ln(H/L)**2 - (2*ln(2)-1)*ln(C/O)**2 ]
+
+    can go negative on a single bar (the close-open term can dominate a narrow
+    high-low range); the WINDOW MEAN is clipped at zero before the square root, never
+    the individual bar terms.
+    """
+    return _ohlc_volatility(
+        _garman_klass_term,
+        open_,
+        high,
+        low,
+        close,
+        window,
+        min_count=min_count,
+        day_offsets=day_offsets,
+    )
+
+
+@finite_output(allow_nan=True)
+def rogers_satchell_volatility(
+    open_: np.ndarray,
+    high: np.ndarray,
+    low: np.ndarray,
+    close: np.ndarray,
+    window: int,
+    *,
+    min_count: int | None = None,
+    day_offsets: np.ndarray | None = None,
+) -> np.ndarray:
+    """Rogers-Satchell volatility (AMENDMENT 1 item 1 formula), day-offset aware and
+    NaN-propagating on the `parkinson_volatility` convention.
+
+        sigma_sq[t] = mean_over_window[ ln(H/C)*ln(H/O) + ln(L/C)*ln(L/O) ]
+
+    Same window-mean-only clipping as `garman_klass_volatility` -- see that
+    docstring.
+    """
+    return _ohlc_volatility(
+        _rogers_satchell_term,
+        open_,
+        high,
+        low,
+        close,
+        window,
+        min_count=min_count,
+        day_offsets=day_offsets,
+    )
+
+
+# Derived from the MEASURED distribution of realised per-symbol annualised volatility
+# on real data, per CLAUDE.md rule 8.
+#
+# Method: `all_equity` panel, 2023-01-01 .. 2024-12-31 (two full years), 1-minute close.
+# For every (symbol, session) cell with >= 30 finite 1-bar log returns, realised session
+# variance = sum(log_returns**2) over that session (the exact no-lookahead
+# close-to-close realised-variance estimator; the same quantity `ewma_volatility_ann`
+# accumulates bar by bar), annualised by sqrt(252) after the sqrt. 71,580 symbol-session
+# cells with positive realised vol:
+#
+#     p0.5 0.1024938   p1 0.1143218   p2 0.1247033   p5 0.1417723   p10 0.1582159
+#     p25  0.1898797   p50 0.2358403  p75 0.3035870   p90 0.4058124  p95 0.5007674
+#
+# Percentile choice: SIGMA_FLOOR is the DENOMINATOR floor for an inverse-vol sizer
+# (weight ~ 1 / sigma_risk), so it must bind only on names whose *measured* vol sits
+# in the anomalous low tail -- a "temporarily-still" name -- not on an ordinary quiet
+# name. p1 = 0.1143218 is low enough that it binds on roughly the bottom 1% of
+# symbol-sessions by realised vol, and the position-size consequence is bounded: a
+# name floored at p1 gets at most 0.1143218 / 0.2358403 (the p50 name) ~= 0.485x the
+# weight of a typical name relative to what an unfloored 1/sigma sizer would assign it
+# relative to a typical name -- i.e. the floor caps the OVERWEIGHT a stale-vol name can
+# receive to roughly 2x versus a typical name, not the unbounded multiple an
+# uncapped 1/sigma sizer would otherwise assign as sigma -> 0.
+SIGMA_FLOOR: float = 0.1143218
+
+
+def sigma_risk(sigma_ewma: np.ndarray, *, floor: float = SIGMA_FLOOR) -> np.ndarray:
+    """Elementwise max(sigma_ewma, floor); NaN in `sigma_ewma` stays NaN.
+
+    Available to the sizer so an inverse-vol position size never inflates without
+    bound in a temporarily-still name (SIGMA_FLOOR's derivation, above).
+    """
+    arr = np.asarray(sigma_ewma, dtype=np.float64)
+    finite = np.isfinite(arr)
+    out = np.where(finite, np.maximum(arr, floor), np.nan)
+    return out
+
+
+def _efficiency_ratio_no_day(x: np.ndarray, window: int) -> np.ndarray:
+    n_rows = x.shape[0]
+    diff_window = window - 1
+
+    diff_abs = np.full_like(x, np.nan, dtype=np.float64)
+    if n_rows > 1:
+        diff_abs[1:] = np.abs(x[1:] - x[:-1])
+
+    if diff_window <= 0:
+        denom_sum = np.zeros_like(x, dtype=np.float64)
+        denom_count = np.zeros_like(x, dtype=np.float64)
+    else:
+        finite = np.isfinite(diff_abs)
+        diff_zero = np.where(finite, diff_abs, 0.0)
+        cum_sum = np.cumsum(diff_zero, axis=0, dtype=np.float64)
+        cum_count = np.cumsum(finite, axis=0, dtype=np.float64)
+        if n_rows > diff_window:
+            denom_sum = cum_sum.copy()
+            denom_count = cum_count.copy()
+            denom_sum[diff_window:] = cum_sum[diff_window:] - cum_sum[:-diff_window]
+            denom_count[diff_window:] = cum_count[diff_window:] - cum_count[:-diff_window]
+        else:
+            denom_sum = cum_sum
+            denom_count = cum_count
+
+    shifted = np.full_like(x, np.nan, dtype=np.float64)
+    if n_rows > diff_window and diff_window >= 0:
+        shifted[diff_window:] = x[: n_rows - diff_window]
+    numerator = np.abs(x - shifted)
+
+    out = np.full_like(x, np.nan, dtype=np.float64)
+    valid = (
+        (denom_count >= diff_window) & (denom_sum > 0) & np.isfinite(numerator)
+    )
+    np.divide(numerator, denom_sum, out=out, where=valid)
+    return out
+
+
+@finite_output(allow_nan=True)
+def efficiency_ratio(
+    close: np.ndarray,
+    window: int,
+    *,
+    day_offsets: np.ndarray | None = None,
+) -> np.ndarray:
+    """abs(close[t] - close[t-window+1]) / sum(abs(diff(close))[t-window+2 : t+1]).
+
+    `window` counts BARS INCLUSIVE, matching `rolling_max`/`rolling_std` -- the
+    numerator spans `window` bars and the denominator sums `window - 1` first
+    differences (AMENDMENT 1 item 4). Session-bounded via `day_offsets`; the first
+    `window - 1` rows of each session are NaN. 1.0 on a monotone ramp, near 0 on a
+    zig-zag. A zero denominator (no movement at all in the window) is NaN, not 0/0.
+    """
+    close64 = _as_float64_2d(close, "close")
+    if day_offsets is not None:
+        check_day_offsets(np.asarray(day_offsets), close64.shape[0])
+    _validate_window(window)
+
+    return _apply_by_session(
+        lambda arr: _efficiency_ratio_no_day(arr, window),
+        close64,
+        day_offsets=day_offsets,
+    )

@@ -15,6 +15,7 @@ from pydantic import BaseModel, ConfigDict, field_validator
 
 from nifty_quant.calendar import ist_label
 from nifty_quant.features.core import parkinson_volatility
+from nifty_quant.features.market import bars_since_open
 from nifty_quant.strategy.base import (
     DataRequest,
     MarketView,
@@ -143,15 +144,13 @@ class VwapReversionStrategy(Strategy):
 
         # bars_since_open is needed for horizon scaling in the normalization step below.
         n_rows, n_sym = typical_price.shape
-        rows = np.arange(n_rows, dtype=np.int64)
-        day_start_rows = np.repeat(day_offsets[:-1], day_lengths)
-        bars_once = rows - day_start_rows
-        bars_since_open = np.tile(bars_once[:, None], (1, n_sym)).astype(np.float64)
+        bars_once = bars_since_open(day_offsets, n_rows)
+        bars_since_open_arr = np.tile(bars_once[:, None], (1, n_sym)).astype(np.float64)
 
         if p.normalize:
             finite_sigma = np.isfinite(sigma) & (sigma > 0)
             safe_sigma = np.where(finite_sigma, sigma, np.inf)
-            horizon = np.sqrt(np.maximum(bars_since_open, 1.0))
+            horizon = np.sqrt(np.maximum(bars_since_open_arr, 1.0))
             scaled_sigma = safe_sigma * horizon
             sigma_guard = np.maximum(scaled_sigma, p.sigma_floor)
             dev = np.full_like(dev_raw, np.nan)
@@ -163,7 +162,7 @@ class VwapReversionStrategy(Strategy):
         return {
             "dev": dev,
             "sigma": sigma,
-            "bars_since_open": bars_since_open,
+            "bars_since_open": bars_since_open_arr,
         }
 
     def on_decision(

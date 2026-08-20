@@ -66,10 +66,20 @@ class TestObligation1WithinSessionLogReturnsUnchanged:
 
         within_session = day_id[1:] == day_id[:-1]
 
-        # Bit-for-bit: array_equal, not allclose.
-        assert np.array_equal(
-            diff_stitched[within_session], diff_close[within_session]
-        ), "within-session log-returns must be EXACTLY unchanged by stitching"
+        # AMENDMENT 4: NOT bit-for-bit. Stitching rescales every session after the
+        # first, which in log space is a shared additive offset `c`, and in IEEE-754
+        # `(a+c)-(b+c) != a-b` for ~62%% of random triples. Exactness would require a
+        # power-of-two scale (the only factor that leaves the mantissa untouched), and
+        # that cannot achieve LEVEL CONTINUITY -- the whole point of stitching.
+        # Worst measured deviation is 4.44e-16, ~1e12x smaller than a genuine
+        # mis-stitch (which would show the full ~1e-2 overnight gap), so this
+        # tolerance cannot hide a real defect. Obligations 2 and 3 stay EXACT.
+        assert np.allclose(
+            diff_stitched[within_session],
+            diff_close[within_session],
+            rtol=0,
+            atol=1e-14,
+        ), "within-session log-returns must survive stitching to within round-off"
 
 
 class TestObligation2CrossSessionLogDiffIsZero:
