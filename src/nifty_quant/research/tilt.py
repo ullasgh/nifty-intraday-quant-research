@@ -18,7 +18,6 @@ from __future__ import annotations
 import dataclasses
 import datetime
 from collections import defaultdict
-from pathlib import Path
 
 import numpy as np
 
@@ -26,7 +25,7 @@ from nifty_quant.calendar import TradingCalendar
 from nifty_quant.data.panel import Panel
 from nifty_quant.execution.costs import NSEIntradayEquityCosts
 from nifty_quant.research.hypotheses.h2_overnight_reversal import build_overnight_feature
-from nifty_quant.research.splits import HoldoutLock
+from nifty_quant.research.splits import HoldoutLock, default_holdout_lock_path
 
 
 @dataclasses.dataclass(frozen=True)
@@ -359,7 +358,7 @@ def run_tilt(panel: Panel, config: TiltConfig) -> TiltResult:
     try:
         cal = TradingCalendar.from_index_bars("NIFTY50")
         real_dates = cal.session_dates()
-        holdout_lock = HoldoutLock(path=Path("/tmp/nifty_quant_holdout_lock.json"))
+        holdout_lock = HoldoutLock(path=default_holdout_lock_path())
         holdout_start, holdout_end = holdout_lock.holdout_range(real_dates)
         if config.end >= holdout_start:
             raise ValueError(

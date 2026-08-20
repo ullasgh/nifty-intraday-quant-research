@@ -50,6 +50,12 @@ class BacktestConfig:
     square_off_time: str = "15:20"
     decision_latency_bars: int = 0
     compound: bool = False
+    # F11: `guards.check_cash_non_negative` is implemented (see `guards.py`), but
+    # NOT wired on by default -- `compound=False` sizes off day-one capital
+    # forever, which routinely drives cash to -Rs 64,43,280 in ordinary runs.
+    # Turning this on unconditionally would crash those runs; it is therefore a
+    # deliberate per-run opt-in until the `compound` question is settled.
+    check_negative_cash: bool = False
     cost_model: CostModel = field(default_factory=NSEIntradayEquityCosts)
     fill_model: FillModel = field(
         default_factory=lambda: FillModel(slippage=SqrtImpactSlippage())
@@ -91,8 +97,9 @@ class BacktestResult:
     # across the whole run (finite: cash is never NaN by construction); a value
     # below 0 means part of this backtest financed trades from an overdraft no
     # strategy declared. `n_rows_negative_cash` counts how many of those marks
-    # were negative. See also `guards.Strictness.FULL`, which raises on any
-    # negative cash via `check_cash_non_negative` below.
+    # were negative. F11: `guards.check_cash_non_negative` additionally raises at
+    # `guards.Strictness.FULL`, but ONLY when `BacktestConfig.check_negative_cash`
+    # is explicitly set -- it is opt-in, not a default (see that field's comment).
     min_cash_seen: float = 0.0
     n_rows_negative_cash: int = 0
     # F7: forced EOD liquidation (`_execute_direct_fill` under `OrderIntent.
@@ -897,6 +904,11 @@ def run_backtest(
                 min_cash_seen = portfolio.cash
             if portfolio.cash < 0.0:
                 n_rows_negative_cash += 1
+            # F11: opt-in only (see `BacktestConfig.check_negative_cash`'s comment) --
+            # `compound=False` sizing off day-one capital routinely drives cash
+            # negative in ordinary runs, so this is never on by default.
+            if config.check_negative_cash:
+                guards.check_cash_non_negative(portfolio.cash, row=t, floor=0.0)
 
         if n_rows > 0:
             portfolio.mark(close[n_rows - 1])

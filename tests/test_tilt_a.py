@@ -372,6 +372,7 @@ def test_turnover_never_exceeds_long_only_normalised_bound() -> None:
         assert row.turnover <= 2.0 + 1e-9
 
 
+@pytest.mark.holdout_aware
 def test_holdout_window_is_protected() -> None:
     real_dates = TradingCalendar.from_index_bars("NIFTY50").session_dates()
     holdout_start, holdout_end = HoldoutLock(

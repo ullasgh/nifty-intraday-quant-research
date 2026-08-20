@@ -180,6 +180,10 @@ class WalkForwardSplitter:
         return splits
 
 
+class HoldoutBoundaryError(ValueError):
+    """Raised when a stored holdout boundary disagrees with a fresh recomputation."""
+
+
 @dataclass(frozen=True)
 class HoldoutLock:
     path: Path
@@ -189,13 +193,66 @@ class HoldoutLock:
         if not trading_dates:
             raise ValueError("trading_dates must not be empty")
 
-        holdout_end = trading_dates[-1]
-        cutoff = _subtract_months(holdout_end, self.holdout_months)
-        holdout_start = next(
+        candidate_end = trading_dates[-1]
+        cutoff = _subtract_months(candidate_end, self.holdout_months)
+        candidate_start = next(
             (day for day in trading_dates if day >= cutoff),
-            holdout_end,
+            candidate_end,
         )
-        return holdout_start, holdout_end
+
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+
+        with _locked_path(self.path):
+            state: dict[str, Any] = {"count": 0, "log": []}
+            if self.path.exists():
+                with self.path.open("r", encoding="utf-8") as fh:
+                    loaded = json.load(fh)
+                if isinstance(loaded, dict):
+                    state = loaded
+
+            if "holdout_start" not in state or "holdout_end" not in state:
+                # First-ever initialisation, OR a migration of a legacy
+                # count/log-only file: persist the candidate, leaving count/log
+                # (already inside `state`) untouched.
+                self._atomic_write(
+                    {
+                        **state,
+                        "holdout_start": candidate_start.isoformat(),
+                        "holdout_end": candidate_end.isoformat(),
+                    }
+                )
+                return candidate_start, candidate_end
+
+            stored_start = date.fromisoformat(state["holdout_start"])
+            stored_end = date.fromisoformat(state["holdout_end"])
+
+            if candidate_end <= stored_end:
+                # A prefix/window query: this caller's calendar does not extend
+                # past what is already known, so it asserts nothing new about the
+                # calendar. Trust the stored boundary; do not recompute/compare.
+                return stored_start, stored_end
+
+            # The calendar has gained sessions past the previously known point, so the
+            # boundary WOULD move. That is never acceptable silently.
+            #
+            # There is deliberately no equality check here. The `candidate_end <= stored_end`
+            # guard above already returned, so `candidate_end > stored_end` strictly holds --
+            # which means `(candidate_start, candidate_end)` can never equal
+            # `(stored_start, stored_end)`. The former guard was
+            # `if (candidate_start, candidate_end) != (stored_start, stored_end): raise`,
+            # whose condition was vacuously True and whose trailing
+            # `return stored_start, stored_end` was unreachable by any caller that does not
+            # violate `candidate_end = trading_dates[-1]`. Removed as dead code rather than
+            # marked with a pragma, so the control flow states what actually happens.
+            raise HoldoutBoundaryError(
+                f"stored holdout boundary "
+                f"[{stored_start.isoformat()}, {stored_end.isoformat()}] "
+                f"disagrees with a recomputation over the current calendar "
+                f"[{candidate_start.isoformat()}, {candidate_end.isoformat()}]; "
+                "a holdout boundary must never move -- if the dataset genuinely "
+                "gained new sessions this must be a deliberate, recorded decision, "
+                "not a silent shift"
+            )
 
     def read_count(self) -> int:
         if not self.path.exists():
@@ -249,3 +306,48 @@ class HoldoutLock:
             self._atomic_write(new_state)
 
         return count + 1
+
+    def annotate_legacy_reads(self, reason: str) -> int:
+        """Mark pre-existing log entries as false positives, in place.
+
+        Does NOT reset ``count`` and does NOT truncate ``log`` -- the audit trail
+        must record that these reads happened and why they did not count.
+        Idempotent: an entry that already carries an ``"annotation"`` is left
+        alone, so re-running this after new legitimate reads have been recorded
+        only annotates the entries that still lack one.
+        """
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+
+        with _locked_path(self.path):
+            if not self.path.exists():
+                return 0
+
+            state: dict[str, Any] = {"count": 0, "log": []}
+            with self.path.open("r", encoding="utf-8") as fh:
+                loaded = json.load(fh)
+            if isinstance(loaded, dict):
+                state = loaded
+
+            log = state.get("log", [])
+            annotated = 0
+            for entry in log:
+                if "annotation" not in entry:
+                    entry["annotation"] = reason
+                    annotated += 1
+
+            if annotated:
+                self._atomic_write(state)
+
+            return annotated
+
+
+def default_holdout_lock_path() -> Path:
+    """The single shared lock path every caller must use.
+
+    ``settings.RESULTS_ROOT / "holdout_lock.json"`` -- imported locally to avoid
+    any top-of-file circular-import risk, matching this repo's lazy-import
+    convention elsewhere (e.g. ``nifty_quant.cli``).
+    """
+    from nifty_quant import settings
+
+    return settings.RESULTS_ROOT / "holdout_lock.json"

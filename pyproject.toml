@@ -33,6 +33,7 @@ nq = "nifty_quant.cli:app"
 testpaths = ["tests"]
 markers = [
     "slow: marks tests as slow (deselect with '-m \"not slow\"')",
+    "holdout_aware: test exercises holdout protection; give it the REAL boundary, not the far-future stand-in",
 ]
 
 [tool.coverage.run]

@@ -58,6 +58,11 @@ class TrialMatrix:
     n_dropped: int
     drop_reasons: dict[str, str]
     alignment: Literal["inner"]
+    # specs/pbo_dsr_wiring.md D1: which row (artifact path, ts, split_id) each KEPT
+    # trial actually resolved to. A selection that can pick the wrong row on a
+    # config_hash collision must say which row it picked -- keyed by trial_id
+    # (config_hash), same order as `trial_ids`.
+    resolved_artifacts: dict[str, tuple[str, str, str]]
 
     def explain(self) -> str:
         """Return a human-readable summary of the assembled trial matrix."""
@@ -70,6 +75,17 @@ class TrialMatrix:
                 f"dropped {self.n_dropped}."
             ),
         ]
+
+        if self.trial_ids:
+            lines.append("Resolved artifacts (kept trials):")
+            for trial_id in self.trial_ids:
+                resolved = self.resolved_artifacts.get(trial_id)
+                if resolved is None:  # pragma: no cover - defensive, always populated
+                    continue
+                result_path, ts, split_id = resolved
+                lines.append(
+                    f"  - {trial_id}: path={result_path} ts={ts} split_id={split_id}"
+                )
 
         if self.drop_reasons:
             lines.append("Dropped trials:")
@@ -314,15 +330,32 @@ class TrialRegistry:
                 if config_hash in seen_ids:
                     continue
                 seen_ids.add(config_hash)
+                # specs/pbo_dsr_wiring.md D1: prefer the NEWEST row that actually has
+                # an artifact -- the OLDEST row (previously `ORDER BY ts, rowid LIMIT
+                # 1`) could be a stale walk-forward test slice sharing a config_hash
+                # with a later, much longer sweep result. Fall back to the newest row
+                # regardless of result_path only when NO row for this hash has an
+                # artifact at all, so the drop-reason path below still reports "no
+                # result_path recorded" instead of a misleading "not found".
                 row = self._conn.execute(
                     """
                     SELECT * FROM trials
-                    WHERE config_hash = ?
-                    ORDER BY ts, rowid
+                    WHERE config_hash = ? AND result_path IS NOT NULL
+                    ORDER BY ts DESC, rowid DESC
                     LIMIT 1
                     """,
                     (config_hash,),
                 ).fetchone()
+                if row is None:
+                    row = self._conn.execute(
+                        """
+                        SELECT * FROM trials
+                        WHERE config_hash = ?
+                        ORDER BY ts DESC, rowid DESC
+                        LIMIT 1
+                        """,
+                        (config_hash,),
+                    ).fetchone()
                 candidate_rows.append((config_hash, row))
         else:
             query = (
@@ -333,20 +366,32 @@ class TrialRegistry:
             if strategy is not None:
                 query += " AND strategy = ?"
                 params.append(strategy)
-            query += " ORDER BY ts, rowid"
+            # Ascending: the OUTPUT order of distinct trials (trial_ids/matrix
+            # columns) is each config_hash's first-appearance order, oldest first
+            # -- unrelated to, and preserved across, the D1 collision fix below.
+            query += " ORDER BY ts ASC, rowid ASC"
 
-            seen_ids = set()
             rows = self._conn.execute(query, params).fetchall()
+            best_row_by_hash: dict[str, sqlite3.Row] = {}
+            first_seen_order: list[str] = []
             for row in rows:
                 config_hash = str(row["config_hash"])
-                if config_hash in seen_ids:
-                    continue
-                seen_ids.add(config_hash)
-                candidate_rows.append((config_hash, row))
+                if config_hash not in best_row_by_hash:
+                    first_seen_order.append(config_hash)
+                # D1 collision fix: rows arrive in ascending (ts, rowid) order and
+                # the WHERE clause already restricts to rows with an artifact, so
+                # each later write for the same config_hash overwrites the
+                # previous one here -- the row a hash ends up mapped to is always
+                # the NEWEST one that has an artifact, even though the output
+                # order above stays oldest-first.
+                best_row_by_hash[config_hash] = row
+            for config_hash in first_seen_order:
+                candidate_rows.append((config_hash, best_row_by_hash[config_hash]))
 
         drop_reasons: dict[str, str] = {}
         kept_ids: list[str] = []
         loaded: list[tuple[np.ndarray, np.ndarray]] = []
+        resolved_artifacts: dict[str, tuple[str, str, str]] = {}
 
         for config_hash, row in candidate_rows:
             if row is None:
@@ -446,6 +491,11 @@ class TrialRegistry:
             )
             kept_ids.append(config_hash)
             loaded.append((sorted_ts, sorted_returns))
+            resolved_artifacts[config_hash] = (
+                str(result_path),
+                str(row["ts"]),
+                str(row["split_id"]),
+            )
 
         if loaded:
             common_ts = np.array(loaded[0][0], dtype=np.int64, copy=True)
@@ -474,4 +524,5 @@ class TrialRegistry:
             n_dropped=len(drop_reasons),
             drop_reasons=drop_reasons,
             alignment="inner",
+            resolved_artifacts=resolved_artifacts,
         )

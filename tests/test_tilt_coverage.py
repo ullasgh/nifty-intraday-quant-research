@@ -481,6 +481,7 @@ def test_no_usable_sessions_raises_with_descriptive_error() -> None:
         run_tilt(panel, config)
 
 
+@pytest.mark.holdout_aware
 def test_holdout_boundary_global_not_panel_relative() -> None:
     """Verify holdout protection uses GLOBAL calendar boundary, not panel-relative.
 

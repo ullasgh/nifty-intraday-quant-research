@@ -178,3 +178,61 @@ above. Its choice to accept any `Exception` for item 6 is superseded by the name
 `HoldoutBoundaryError`. Everything else in its 16 tests stands: 15 correctly RED with each failure
 traced to its specific defect rather than a fixture bug, and one hygiene test proving the real lock
 file is byte-identical before and after — which is the single most important test in that file.
+
+---
+
+# AMENDMENT 2 — 2026-08-20. Adjudicating item 9, and the collision with pre-existing tests.
+
+## 1. Item 9 — ONE READ PER INTERSECTING SPLIT. Suite A is wrong.
+
+The two suites contradict each other and no implementation satisfies both: Suite A expects **1**
+recorded read for a walkforward run with 3 intersecting splits; Suite B expects **one per
+intersecting split**. The implementer chose per-split and flagged it rather than picking silently.
+
+**Per-split is correct, and the reason is scientific, not stylistic.** The counter exists to record
+how many times out-of-sample data has been LOOKED AT, because each look is an opportunity to tune
+against it. A walkforward run evaluating three splits that reach into the holdout produces **three
+out-of-sample observations**, and a researcher who sees three results has had three chances to
+select on them. Recording that as "1" understates the multiple-testing exposure — which is the exact
+error this program has been correcting everywhere else (see `effective_n_trials` reporting 3.000
+where the honest value is 1.055).
+
+Per-split also preserves audit granularity: the log already records which split, so the count and
+the log agree. Suite A's `test_item_9` is updated to expect one per intersecting split.
+
+## 2. The collision with ~20 pre-existing tests — FIX THE FIXTURES, NOT THE REFUSAL
+
+Refuse-by-default breaks 5 PBO contract tests and roughly 15 pre-existing ones across
+`test_cli_coverage.py`, `test_cli_tradable.py`, `test_returns_persistence.py`,
+`test_walkforward_pooling.py` and `test_registry_returns.py`. None of them is about the holdout;
+they drive `nq walkforward` to test CLI plumbing, PBO, and returns persistence.
+
+Cause: their synthetic calendars are SHORTER than `holdout_months = 12`, so first-ever lock
+initialisation manufactures a boundary spanning their whole window, which their own splits then
+intersect. Attribution is proven — monkeypatching `holdout_range` restores the suite to **2959
+passed**.
+
+**The refusal is correct and must NOT be relaxed.** The fix is a shared pytest fixture that seeds a
+lock with a FAR-FUTURE boundary (e.g. 2099) at a `tmp_path`, applied to tests that are not about
+the holdout. That is honest: those tests genuinely have no holdout, and saying so explicitly beats
+either weakening the guard or sprinkling `--allow-holdout` through twenty files.
+
+**Do NOT** point those tests at the real `results/holdout_lock.json`, and do NOT pass
+`--allow-holdout` merely to silence them — that flag means "I intend to read the holdout", which is
+false for every one of these tests.
+
+## 3. Suite B's `_compute()` helper is internally contradictory — fix the helper
+
+Six of Suite B's failures share one root cause: `_compute()` builds
+`HoldoutLock(path=Path("/nonexistent/..."))` on the stated premise that "holdout_range does no file
+I/O". Amendment 1 item 3 REQUIRES that premise to become false (persist-on-first-call), so the
+helper cannot work against a correct implementation. Point it at a `tmp_path` instead.
+
+## 4. Two pre-existing tests now assert the D1 defect AS CORRECT — retire them
+
+`test_registry_returns.py::test_build_trial_matrix_registry_query_dedups_same_config_hash` and
+`::test_build_trial_matrix_registry_query_uses_non_null_duplicate_row` construct exactly the D1
+collision fixture and assert the OLD oldest-wins result. That is literally the bug
+`specs/pbo_dsr_wiring.md` D1 reverses, and it is why it went unnoticed: **the behaviour had a
+passing test defending it.** Rewrite both to the corrected contract (newest row with an artifact
+wins), keeping their fixtures.

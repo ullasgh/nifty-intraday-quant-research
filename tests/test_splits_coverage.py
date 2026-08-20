@@ -20,25 +20,46 @@ def _make_trading_dates(count: int) -> list[date]:
     return dates
 
 
-def test_import_fallback_when_fcntl_import_raises(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    # Use monkeypatch to manage sys.modules changes so they're automatically
-    # restored after the test, preventing pollution of subsequent imports
-    if "nifty_quant.research.splits" in sys.modules:
-        monkeypatch.delitem(sys.modules, "nifty_quant.research.splits")
+def test_import_fallback_when_fcntl_import_raises() -> None:
+    """The `except ImportError: fcntl = None` fallback at import time.
 
+    Restoration is done by hand in a `finally`, NOT via monkeypatch, and that is the
+    whole point of this comment.
+
+    `monkeypatch.delitem(sys.modules, ...)` restores `sys.modules` correctly, but
+    `importlib.import_module` ALSO rebinds the attribute on the parent package, and
+    monkeypatch knows nothing about that. The result was two live module objects:
+
+        sys.modules["nifty_quant.research.splits"]   -> the original
+        nifty_quant.research.splits                  -> the reloaded copy
+
+    Code reaching the module by `from ... import X` got one; code reaching it as a
+    package attribute got the other. A test monkeypatching `WalkForwardSplitter.split`
+    on one object therefore had no effect on the copy the CLI actually resolved, and the
+    run fell through to real splitting on a short synthetic calendar.
+
+    Cost of that leak: five tests in `test_pbo_dsr_wiring_a.py` and `test_cli_coverage.py`
+    failing under some shuffle orders only -- they passed individually, in pairs, across
+    25 seeds of their own file, and in the full suite in deterministic order. Found by
+    bisecting a reproducing shuffle seed down to a two-test pair.
+
+    Anything that deletes a module from `sys.modules` and re-imports it must restore the
+    parent package attribute too, or it leaves module identity split behind it.
+    """
+    import nifty_quant.research as research_pkg
+
+    original_mod = sys.modules["nifty_quant.research.splits"]
     real_fcntl = fcntl
-    monkeypatch.setitem(sys.modules, "fcntl", None)
+    try:
+        del sys.modules["nifty_quant.research.splits"]
+        sys.modules["fcntl"] = None
 
-    reloaded = importlib.import_module("nifty_quant.research.splits")
-    assert reloaded.fcntl is None
-
-    # Restore and re-import so the module is in a clean state for other tests
-    monkeypatch.setitem(sys.modules, "fcntl", real_fcntl)
-    if "nifty_quant.research.splits" in sys.modules:
-        monkeypatch.delitem(sys.modules, "nifty_quant.research.splits")
-    importlib.import_module("nifty_quant.research.splits")
+        reloaded = importlib.import_module("nifty_quant.research.splits")
+        assert reloaded.fcntl is None
+    finally:
+        sys.modules["fcntl"] = real_fcntl
+        sys.modules["nifty_quant.research.splits"] = original_mod
+        research_pkg.splits = original_mod
 
 
 def test_record_read_works_when_fcntl_unavailable(

@@ -353,6 +353,11 @@ def backtest(
             "hand-chosen default for this threshold, so it must be a deliberate choice per run."
         ),
     ),
+    allow_holdout: bool = typer.Option(
+        False,
+        "--allow-holdout",
+        help="Allow a deliberate, recorded read of the stored holdout window.",
+    ),
 ) -> None:
     """Run a single full-sample backtest."""
     start_d = _parse_date(start, "--start")
@@ -378,6 +383,36 @@ def backtest(
             f"--strategy {strategy!r} does not match 'strategy: {cfg.get('strategy')!r}' "
             f"in {config}"
         )
+
+    from nifty_quant.calendar import TradingCalendar
+
+    try:
+        calendar = TradingCalendar.from_index_bars("NIFTY50")
+    except Exception as exc:
+        _fail(f"backtest could not resolve calendar: {exc}")
+
+    from nifty_quant.research.splits import (
+        HoldoutBoundaryError,
+        HoldoutLock,
+        default_holdout_lock_path,
+    )
+
+    holdout = HoldoutLock(path=default_holdout_lock_path())
+    full_dates = calendar.session_dates()
+    try:
+        holdout_start, holdout_end = holdout.holdout_range(full_dates)
+    except HoldoutBoundaryError as exc:
+        _fail(str(exc))
+
+    holdout_intersects = end_d >= holdout_start
+    if holdout_intersects and not allow_holdout:
+        _fail(
+            f"refusing: backtest end date {end_d} intersects the stored holdout "
+            f"window [{holdout_start}, {holdout_end}]; pass --allow-holdout for a "
+            "deliberate, recorded read"
+        )
+    if holdout_intersects and allow_holdout:
+        holdout.record_read(reason=f"backtest {start_d}..{end_d}")
 
     try:
         import json
@@ -797,6 +832,11 @@ def walkforward(
         "--execution-horizon",
         help="Decision-to-fill lag (in sessions); one term of the embargo.",
     ),
+    allow_holdout: bool = typer.Option(
+        False,
+        "--allow-holdout",
+        help="Permit a deliberate, recorded read of the holdout window.",
+    ),
 ) -> None:
     """Run an out-of-sample walk-forward evaluation."""
     from nifty_quant.calendar import DEFAULT_RESEARCH_START
@@ -887,8 +927,30 @@ def walkforward(
     if not splits:
         _fail("no walk-forward splits fit in the given date range/train/test years")
 
+    from nifty_quant.research.splits import (
+        HoldoutBoundaryError,
+        HoldoutLock,
+        default_holdout_lock_path,
+    )
+
+    holdout = HoldoutLock(path=default_holdout_lock_path())
+    full_dates = calendar.session_dates()
+    try:
+        holdout_start, holdout_end = holdout.holdout_range(full_dates)
+    except HoldoutBoundaryError as exc:
+        _fail(str(exc))
+
+    intersecting_splits = [s for s in splits if s.test[1] >= holdout_start]
+    if intersecting_splits and not allow_holdout:
+        _fail(
+            f"refusing: {len(intersecting_splits)} split(s) intersect the stored holdout "
+            f"window [{holdout_start}, {holdout_end}]; pass --allow-holdout for a "
+            "deliberate, recorded read"
+        )
+
     try:
         import json
+        import math
         from datetime import datetime, timezone
 
         import numpy as np
@@ -898,6 +960,7 @@ def walkforward(
         from nifty_quant.backtest.metrics import (
             compute_metrics,
             deflated_sharpe,
+            effective_n_trials,
             expected_max_sharpe,
             sharpe_standard_error,
             verdict_line,
@@ -908,7 +971,6 @@ def walkforward(
         from nifty_quant.execution.costs import NSEIntradayEquityCosts, breakeven_cost_bps
         from nifty_quant.research.provenance import get_git_sha
         from nifty_quant.research.registry import TrialRecord, TrialRegistry
-        from nifty_quant.research.splits import HoldoutLock
         from nifty_quant.strategy.registry import config_hash as strategy_config_hash
         from nifty_quant.universe.static import load_universe, survivorship_report
 
@@ -943,9 +1005,6 @@ def walkforward(
         )
 
         cost_model = NSEIntradayEquityCosts()
-
-        holdout = HoldoutLock(path=settings.RESULTS_ROOT / "holdout_lock.json")
-        holdout_start, _ = holdout.holdout_range(trading_dates)
 
         manifest_fingerprint = None
         try:
@@ -1115,11 +1174,49 @@ def walkforward(
 
         n_trials = max(trial_registry.n_trials(strategy=strategy), 1)
         var_trial_sharpes = trial_registry.var_trial_sharpes(strategy=strategy)
-        sr0 = expected_max_sharpe(n_trials, var_trial_sharpes) if n_trials >= 2 else 0.0
 
-        # This repo's TrialRegistry only stores summary Sharpes, not full per-trial
-        # return series, so effective_n_trials cannot be computed honestly here.
-        n_eff = float(n_trials)
+        # specs/pbo_dsr_wiring.md D3: the registry now stores full per-trial return
+        # series (result_path/returns.parquet), so effective_n_trials CAN be computed
+        # honestly from an assembled matrix -- feeding the raw count into
+        # expected_max_sharpe inflates sr0 and therefore UNDER-deflates the DSR
+        # (the permissive, dangerous direction). Build that matrix from every
+        # exploration-purpose trial this strategy has on record (this run's own new
+        # split trial included, since it was just written above).
+        wf_matrix = trial_registry.build_trial_matrix(strategy=strategy, purpose="exploration")
+        typer.echo(wf_matrix.explain())
+
+        if wf_matrix.matrix.shape[1] < 2:
+            # Fewer than two trial columns could be assembled: effective_n_trials
+            # is only a meaningful (correlation-based) statistic across MULTIPLE
+            # trials, so report it as unavailable rather than either the raw count
+            # or a technically-valid-but-misleading 1.0 -- a wrong number that
+            # looks right is worse than a missing one.
+            n_eff = float("nan")
+            sr0 = 0.0
+            typer.echo(
+                "NOTE: n_eff unavailable -- fewer than two trial artifacts could be "
+                f"assembled into a return matrix (raw trial count={n_trials}); SR0 "
+                "is reported as 0.0 rather than substituting the raw count into "
+                "expected_max_sharpe."
+            )
+        else:
+            n_eff = effective_n_trials(wf_matrix.matrix)
+            if n_eff < 2.0:
+                # AMENDMENT 1: expected_max_sharpe raises for n_trials < 2, and an
+                # honest n_eff this low is reachable (e.g. near-duplicate trials).
+                # Do NOT clamp it up to 2 -- that would silently invent multiple-
+                # testing breadth that was never there. n_eff near 1 means the
+                # sweep explored one idea N ways, so there is no selection effect
+                # to correct for: report sr0=0.0 and say so explicitly.
+                sr0 = 0.0
+                typer.echo(
+                    f"NOTE: honest effective_n_trials={n_eff:.4f} < 2 -- these "
+                    "trials are effectively a SINGLE trial, so there is no "
+                    "multiple-testing penalty to deflate against; SR0 is reported "
+                    "as 0.0 instead of calling expected_max_sharpe()."
+                )
+            else:
+                sr0 = expected_max_sharpe(n_eff, var_trial_sharpes)
 
         if pooled_net.size >= 2:
             pooled_net_mean = float(np.mean(pooled_net))
@@ -1130,6 +1227,14 @@ def walkforward(
 
         sr_se = sharpe_standard_error(pooled_net) if pooled_net.size >= 2 else float("nan")
         dsr = deflated_sharpe(pooled_net, sr0=sr0) if pooled_net.size >= 2 else float("nan")
+        if math.isnan(dsr):
+            # deflated_sharpe silently returns nan below T=4 (needs reliable
+            # skew/kurtosis) -- without this, a nan DSR looks like a computation
+            # failure rather than "too few periods" to the caller.
+            typer.echo(
+                f"DSR is nan: too few periods (T={pooled_net.size} < 4) for "
+                "reliable skew/kurtosis; see deflated_sharpe() docs."
+            )
 
         # PBO needs >= 2 trial return columns over the same T, not available from a
         # single strategy run; do not call pbo_cscv with a fabricated matrix.
@@ -1228,6 +1333,11 @@ def sweep(
     start: str | None = typer.Option(None, "--start"),
     end: str | None = typer.Option(None, "--end"),
     universe_name: str = typer.Option("all_equity", "--universe"),
+    allow_holdout: bool = typer.Option(
+        False,
+        "--allow-holdout",
+        help="Allow a deliberate, recorded read of the stored holdout window.",
+    ),
 ) -> None:
     """Run a parameter-sweep across a config file."""
     from nifty_quant.calendar import DEFAULT_RESEARCH_START, TradingCalendar
@@ -1268,6 +1378,35 @@ def sweep(
         )
 
     try:
+        calendar = TradingCalendar.from_index_bars("NIFTY50")
+    except Exception as exc:
+        _fail(f"sweep could not resolve calendar for holdout check: {exc}")
+
+    from nifty_quant.research.splits import (
+        HoldoutBoundaryError,
+        HoldoutLock,
+        default_holdout_lock_path,
+    )
+
+    holdout = HoldoutLock(path=default_holdout_lock_path())
+    full_dates = calendar.session_dates()
+    try:
+        holdout_start, holdout_end = holdout.holdout_range(full_dates)
+    except HoldoutBoundaryError as exc:
+        _fail(str(exc))
+
+    holdout_intersects = end_d >= holdout_start
+    if holdout_intersects and not allow_holdout:
+        _fail(
+            f"refusing: sweep end date {end_d} intersects the stored holdout "
+            f"window [{holdout_start}, {holdout_end}]; pass --allow-holdout for a "
+            "deliberate, recorded read"
+        )
+    if holdout_intersects and allow_holdout:
+        holdout.record_read(reason=f"sweep {start_d}..{end_d}")
+
+    try:
+        import inspect
         import json
         from datetime import datetime, timezone
 
@@ -1278,6 +1417,8 @@ def sweep(
         from nifty_quant.backtest.engine import BacktestConfig, run_backtest
         from nifty_quant.backtest.metrics import (
             compute_metrics,
+            effective_n_trials,
+            pbo_cscv,
             sharpe_standard_error,
         )
         from nifty_quant.data.manifest import Manifest
@@ -1357,10 +1498,18 @@ def sweep(
         registry_db = TrialRegistry(settings.RESULTS_ROOT / "trials.db")
         n_ok = 0
         n_failed = 0
+        # specs/pbo_dsr_wiring.md D2/D3: every config_hash this sweep run itself
+        # attempts (whether it ultimately succeeds or fails), so the matrix
+        # assembled below is built from exactly "the trials it just wrote" -- a
+        # failed trial is still recorded (with result_path=None) and
+        # build_trial_matrix correctly reports it as dropped rather than pretending
+        # it does not exist.
+        sweep_chashes: list[str] = []
 
         for i, params in enumerate(param_dicts):
             cfg = {"strategy": strategy_name, "params": params}
             chash = strategy_config_hash(cfg)
+            sweep_chashes.append(chash)
             try:
                 strat = registry.build(cfg)
                 res = run_backtest(
@@ -1462,6 +1611,48 @@ def sweep(
                 typer.echo(f"[{i + 1}/{len(param_dicts)}] {params} -> FAILED: {exc}")
 
         typer.echo(f"sweep complete: {n_ok} ok, {n_failed} failed, {len(param_dicts)} total")
+
+        # specs/pbo_dsr_wiring.md D2/D3: a sweep IS the multi-trial object PBO and
+        # effective_n_trials were designed for -- assemble a matrix from exactly the
+        # trials this run just wrote and report both, rather than leaving PBO
+        # permanently nan and n_eff a raw, correlation-blind count.
+        sweep_matrix = registry_db.build_trial_matrix(trial_ids=sweep_chashes)
+        typer.echo(sweep_matrix.explain())
+
+        n_splits_default = inspect.signature(pbo_cscv).parameters["n_splits"].default
+
+        if sweep_matrix.matrix.shape[1] == 0:
+            typer.echo(
+                "n_eff: unavailable -- no trial return matrix could be assembled "
+                f"from this sweep's {len(sweep_chashes)} trial(s); see explain() "
+                "above. Not substituting the raw trial count."
+            )
+            typer.echo(
+                "PBO: unavailable -- no trial return matrix could be assembled "
+                "for this sweep."
+            )
+        else:
+            sweep_n_eff = effective_n_trials(sweep_matrix.matrix)
+            typer.echo(f"n_eff={sweep_n_eff:.3f}")
+
+            if sweep_matrix.matrix.shape[1] < 2:
+                typer.echo(
+                    "PBO: unavailable -- pbo_cscv needs at least two trial "
+                    f"columns; this sweep assembled {sweep_matrix.matrix.shape[1]}."
+                )
+            else:
+                t_periods = sweep_matrix.matrix.shape[0]
+                if t_periods < n_splits_default:
+                    typer.echo(
+                        f"PBO refused: T={t_periods} < n_splits={n_splits_default} "
+                        "(need at least n_splits periods); cannot compute PBO for "
+                        "this sweep. Silently lowering n_splits would change the "
+                        "statistic being computed without saying so -- widen the "
+                        "date range or n_splits instead."
+                    )
+                else:
+                    sweep_pbo = pbo_cscv(sweep_matrix.matrix, n_splits=n_splits_default)
+                    typer.echo(f"PBO={sweep_pbo:.4f}")
     except Exception as exc:
         _fail(f"sweep failed: {exc}")
 

@@ -1091,6 +1091,27 @@ def check_accounting(
         )
 
 
+def check_cash_non_negative(
+    cash: float,
+    *,
+    row: int | None = None,
+    floor: float = 0.0,
+) -> None:
+    """Check that cash is finite and not below the specified floor at FULL strictness."""
+    _level = _strictness
+    if _level is None:
+        _level = get_strictness()
+    if _level < Strictness.FULL:
+        return
+
+    if cash < floor or not np.isfinite(cash):
+        if row is not None:
+            raise ContractViolation(
+                f"cash check failed: cash={cash}, floor={floor}, at row {row}"
+            )
+        raise ContractViolation(f"cash check failed: cash={cash}, floor={floor}")
+
+
 def check_aligned(*arrays: np.ndarray, names: Sequence[str] | None = None) -> None:
     """Check that all supplied arrays have the same leading length, always."""
     if len(arrays) < 2:

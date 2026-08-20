@@ -753,7 +753,12 @@ def test_build_trial_matrix_registry_query_dedups_same_config_hash(
 
     assert result.trial_ids == (trial_id,)
     assert result.n_dropped == 0
-    assert np.array_equal(result.matrix[:, 0], frame_first["return"].to_numpy(dtype=np.float64))
+    # D1 (specs/pbo_dsr_wiring.md): on a config_hash collision the NEWEST row with an
+    # artifact wins, not the oldest. This test previously asserted `frame_first` -- i.e.
+    # it DEFENDED the defect, which is why the defect survived: a sweep trial colliding
+    # with an earlier walk-forward run silently loaded that run's short test slice,
+    # collapsing T and making pbo_cscv raise while explain() reported "dropped 0".
+    assert np.array_equal(result.matrix[:, 0], frame_second["return"].to_numpy(dtype=np.float64))
 
 
 def test_build_trial_matrix_registry_query_uses_non_null_duplicate_row(
@@ -824,10 +829,14 @@ def test_build_trial_matrix_registry_query_uses_non_null_duplicate_row(
 
     assert result.trial_ids == (trial_id,)
     assert result.n_dropped == 0
-    assert explicit_result.trial_ids == ()
-    assert explicit_result.drop_reasons[trial_id] == (
-        "no result_path recorded for this trial"
-    )
+    # D1 (specs/pbo_dsr_wiring.md): the explicit-trial_ids path now prefers the newest row
+    # that HAS an artifact, so both query paths agree. Previously the explicit path took
+    # `ORDER BY ts LIMIT 1` -- the OLDEST row, here the one with no result_path -- and
+    # dropped the trial, while the unfiltered path found it. **The same trial resolving
+    # differently depending on which query you used WAS the defect**, and this test
+    # asserted that asymmetry as correct.
+    assert explicit_result.trial_ids == (trial_id,)
+    assert trial_id not in explicit_result.drop_reasons
 
 
 def test_build_trial_matrix_drops_explicit_trial_without_result_path(

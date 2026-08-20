@@ -421,7 +421,7 @@ def turnover(weights: np.ndarray) -> np.ndarray:
     return out
 
 
-def expected_max_sharpe(n_trials: int, var_trial_sharpes: float) -> float:
+def expected_max_sharpe(n_trials: int | float, var_trial_sharpes: float) -> float:
     """Return Bailey & Lopez de Prado's expected maximum Sharpe ratio under null.
 
     Formula:
@@ -429,7 +429,10 @@ def expected_max_sharpe(n_trials: int, var_trial_sharpes: float) -> float:
         ((1 - gamma) * Phi_inv(1 - 1/N) + gamma * Phi_inv(1 - 1/(N*e))),
     where ``gamma`` is Euler-Mascheroni and ``e`` is Euler's number.
     Raises ``ValueError`` for fewer than two trials and returns zero when variance is
-    exactly zero.
+    exactly zero. ``n_trials`` accepts a fractional ``float`` (e.g. an honest
+    ``effective_n_trials()`` result, which is a correlation-based EFFECTIVE count, not
+    an integer draw count) as well as a raw integer trial count -- the formula itself
+    is continuous in ``N`` and does not require an integer.
     """
     if n_trials < 2:
         raise ValueError("n_trials must be at least 2")
@@ -640,9 +643,15 @@ def verdict_line(
         )
 
     verdict = "ESTABLISHED" if dsr >= 0.95 else "NOT ESTABLISHED"
+    # SR0/DSR use general (`g`) formatting, not fixed-point, because a genuine
+    # deflation effect can move DSR/SR0 by many orders of magnitude (e.g. a
+    # correctly-deflated Sharpe under a large SR0 can land at 1e-40 rather than
+    # 1e-74) -- fixed 3-decimal formatting collapses both to the same "0.000" and
+    # silently destroys exactly the honest-vs-raw distinction this wiring exists
+    # to preserve.
     line = (
         f"Sharpe={sharpe_net:.3f} (SE={sr_se:.3f}) | trials={n_trials} "
-        f"(eff={n_eff:.3f}) | SR0={sr0:.3f} | DSR={dsr:.3f} | PBO={pbo:.3f} | {verdict}"
+        f"(eff={n_eff:.3f}) | SR0={sr0:.4g} | DSR={dsr:.4g} | PBO={pbo:.3f} | {verdict}"
     )
     if n_trades is not None and n_trades < min_trades_for_sharpe:
         line += (

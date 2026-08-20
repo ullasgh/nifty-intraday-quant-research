@@ -383,6 +383,7 @@ def test_weights_long_only_normalized() -> None:
     assert result.max_n_held > 0, "Should have at least one holding in some session"
 
 
+@pytest.mark.holdout_aware
 def test_holdout_protection() -> None:
     """Test 8: An end date inside the locked holdout window RAISES.
 
