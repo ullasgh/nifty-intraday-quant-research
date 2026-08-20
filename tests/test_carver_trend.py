@@ -14,6 +14,7 @@ from nifty_quant.data.panel import Panel
 from nifty_quant.strategy.base import PortfolioState, TargetPortfolio
 from nifty_quant.strategy.plugins.carver_trend import CarverTrendParams, CarverTrendStrategy
 from nifty_quant.strategy.registry import build, get
+from tests.contract_fixtures import minimal_contract
 
 
 @dataclass
@@ -554,8 +555,12 @@ def test_rebalance_buffer_reduces_trade_count() -> None:
     unbuffered = CarverTrendStrategy(params=CarverTrendParams(rebalance_buffer=0.0))
     buffered = CarverTrendStrategy(params=CarverTrendParams(rebalance_buffer=0.01))
 
-    result_unbuffered = run_backtest(unbuffered, panel, BacktestConfig())
-    result_buffered = run_backtest(buffered, panel, BacktestConfig())
+    result_unbuffered = run_backtest(
+        unbuffered, panel, BacktestConfig(), contract=minimal_contract()
+    )
+    result_buffered = run_backtest(
+        buffered, panel, BacktestConfig(), contract=minimal_contract()
+    )
 
     assert result_unbuffered.n_trades > 0
     # With buffer=0 the strategy re-targets on most bars, so a modest default buffer

@@ -493,3 +493,125 @@ flake budget rule 9 asks us to spend deliberately rather than by accident.
 - Report the measured FP rate AND the per-symbol lag-1 ACF table.
 - If your measured rho differs materially from the other suite's, say so rather than proceeding —
   that disagreement has now twice been the most informative output of this obligation.
+
+---
+
+# AMENDMENT 7 — 2026-08-20. Where L8 actually lived; and both suites need reconciling.
+
+## 1. The real L8 location was NOT `:470-471` alone
+
+The implementer found, while fixing it, that `ExpectancyTable.spread_t` was never computed from
+`BucketStat.t_stat` / `se_bps` at all. `conditional_expectancy` recomputed a SEPARATE spread SE as
+`std_bps / sqrt(n_effective)` — and that is where the over-correction actually leaked into the
+table-level statistic the Lens reads.
+
+So the defect had two mouths: the `n_effective` transform, and a table-level SE that bypassed the
+bucket SEs entirely. Fixed by combining `bucket_stats[-1].se_bps` and `bucket_stats[0].se_bps` in
+quadrature.
+
+This also explains AMENDMENT 2's finding cleanly: `BucketStat.t_stat` and `ExpectancyTable.spread_t`
+were not two views of one number, they were two different computations. A suite asserting on the
+former could not see the defect in the latter.
+
+## 2. The derived block length
+
+`block_length = horizon + BLOCK_LENGTH_EXTRA_BARS`, `BLOCK_LENGTH_EXTRA_BARS = 5`, DERIVED from
+lag-1..30 autocorrelation of same-session 1-minute log returns for 10 liquid names over
+2024-01-01..2024-03-31, read directly from the panel. All ten show the classic bid-ask-bounce
+NEGATIVE lag-1 ACF (-0.040 to -0.066) decaying below 0.02 within 2-5 bars; p95 decay lag = 5. Table
+recorded in source beside the constant, `lens.py`-style. This satisfies rule 8.
+
+## 3. Suite B: SIX tests are unconditional `pytest.fail()` and can never pass
+
+Obligations 7, 8 (x2), 9, 10 (x2) build a result and then call `pytest.fail(...)` unconditionally,
+with a comment describing what the assertion should have been.
+
+That was the right shape when the observation did not exist — I asked for exactly that. **It is now
+wrong**, because `se_bps`, `n_effective`, `block_length` and the skip count all exist. An
+unconditional failure is not a test; it cannot distinguish a correct implementation from a broken
+one, which is the same defect as a tautology pointing the other way.
+
+**Required:** convert all six into real assertions against the now-existing API.
+
+## 4. Suite A: three tests still unpack a 2-tuple
+
+Obligations 1, 2 and 10 do `resampled, _ = _block_bootstrap_resampling_2d(...)` while obligation 3
+IN THE SAME FILE correctly expects the AMENDMENT-2-pinned 3-tuple. Internally inconsistent, and
+can never pass against a spec-compliant implementation.
+
+AMENDMENT 2 anticipated this exact failure mode when it pinned the arity: "a `ValueError` on unpack
+is indistinguishable from the feature being absent." Reconcile all call sites to the 3-tuple
+`(resampled, block_indices, n_sessions_skipped)`.
+
+## 5. `test_expectancy_internal.py` — three stale tests, LEAD ADJUDICATION
+
+Not one of this spec's dual suites, but three of its tests unpack the 2-tuple or mock a 2-tuple
+return:
+
+    test_block_bootstrap_blocks_never_straddle_session
+    test_block_bootstrap_fallback_path_directly
+    test_all_nan_bootstrap_sample_produces_nan_not_warning   (its mock branch)
+
+They predate the pinned 3-tuple contract and are now stale. **Adjudicated: update them to the
+3-tuple.** Their assertions are otherwise correct and must be preserved — in particular the
+never-straddle-a-session check, which is exactly what the rewritten bootstrap must keep honouring.
+
+## 6. Both suites were left unreconciled against AMENDMENT 2
+
+Neither suite was fully updated after AMENDMENT 2 published the pinned arity — suite B papered over
+it with a both-arities helper AND unconditional failures, suite A applied it to one obligation
+only. Worth noting as a process fact: when an amendment changes an interface, EVERY suite written
+against that spec needs an explicit reconciliation pass, and "the agent said it applied the
+amendment" is not the same as every call site having been updated.
+
+---
+
+# AMENDMENT 8 — 2026-08-20. The iid fallback must be VISIBLE, not silent.
+
+A test author found a real behavioural change and reported it instead of patching the assertion,
+which is the correct call and is why this adjudication exists at all.
+
+## The change
+
+`test_expectancy_internal.py::test_block_bootstrap_fallback_path_directly` asserts
+`len(block_indices) == 5`. It now gets 0.
+
+- OLD fallback: appended a synthetic `(0, n_rows)` entry to `block_indices` per replicate.
+- NEW fallback: does whole-row iid resampling and never appends, so `block_indices` stays empty.
+
+## Adjudication: the NEW behaviour is correct, and the test updates
+
+An entry of `(0, n_rows)` claims a block of length `n_rows` was drawn. No such block was drawn, and
+`n_rows != block_length`, so it also violates the invariant that every block has the derived length
+— which obligation 10 asserts. A synthetic entry would make `block_indices` lie about what happened.
+
+Empty is honest: no blocks were drawn, because no session was long enough to draw one from.
+
+## But an empty list is not, by itself, an adequate signal
+
+Falling back to iid resampling **changes the estimator**. Every dependence correction this spec
+exists to provide is gone on that path, and a caller who does not notice gets a naive SE while
+believing they got an overlap-aware one. That is the same species as rule 6's prohibition on silent
+gap-filling: *"any gap-repair/fill must be opt-in and visible at the call site, never silent."*
+
+**Required: the fallback must be detectable from the return value alone**, without reading the
+source. It already is, and the contract is now pinned as such:
+
+    n_sessions_skipped == <total sessions>  AND  len(block_indices) == 0   <=>  iid fallback was used
+
+Both conditions together, and the docstring must state this explicitly so a caller can test for it.
+If a future change makes that conjunction ambiguous, add an explicit flag rather than leaving it
+inferable.
+
+**Restated test:** `test_block_bootstrap_fallback_path_directly` asserts
+`len(block_indices) == 0` AND `n_sessions_skipped == 3` (all three 3-bar sessions are shorter than
+`block_length = 10 + 5 = 15`), and states in a comment that the two together ARE the fallback
+signal. That is a stronger assertion than the count it replaces, because it pins the detectability
+of a silent estimator change rather than an incidental list length.
+
+## Also noted
+
+The same author replaced that file's old "we can't check this directly" comment with a real
+per-block session-boundary check, now that `block_indices` exposes `(start, length)`. That is
+worth more than the arity fix it came in with: the test's name promised blocks never straddle a
+session, and until now the file could not actually verify it.

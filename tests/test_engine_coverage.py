@@ -5,6 +5,7 @@ Targets only gaps identified by 89% -> 100% coverage pass.
 """
 
 import datetime as dt
+from dataclasses import dataclass, field
 from zoneinfo import ZoneInfo
 
 import numpy as np
@@ -20,7 +21,7 @@ from nifty_quant.backtest.engine import (
 )
 from nifty_quant.data.panel import Panel
 from nifty_quant.execution.costs import ZeroCost
-from nifty_quant.execution.fills import FillModel, ZeroSlippage
+from nifty_quant.execution.fills import FillModel, FillResult, ZeroSlippage
 from nifty_quant.strategy.base import (
     DataRequest,
     MarketView,
@@ -28,6 +29,7 @@ from nifty_quant.strategy.base import (
     Strategy,
     TargetPortfolio,
 )
+from tests.contract_fixtures import minimal_contract
 
 SYMBOLS = ("AAA", "BBB", "CCC")
 N_DAYS = 5
@@ -417,7 +419,7 @@ def test_run_backtest_rejects_mismatched_tradable_shape() -> None:
     bad_tradable = np.ones((N_ROWS + 1, N_SYM), dtype=bool)
 
     with pytest.raises(ValueError, match="tradable shape"):
-        run_backtest(strategy, panel, config, tradable=bad_tradable)
+        run_backtest(strategy, panel, config, tradable=bad_tradable, contract=minimal_contract())
 
 
 # ============================================================================
@@ -448,7 +450,7 @@ def test_run_backtest_with_empty_decision_times() -> None:
     strategy = NoDecisionStrategy(NoDecisionStrategy.Params())
     config = BacktestConfig()
 
-    result = run_backtest(strategy, panel, config)
+    result = run_backtest(strategy, panel, config, contract=minimal_contract())
 
     # No decisions, so no rebalancing, flat equity
     assert result.equity_curve[0] == pytest.approx(config.capital)
@@ -470,7 +472,7 @@ def test_trade_recording_with_non_finite_decision_price() -> None:
         cost_model=ZeroCost(),
     )
 
-    result = run_backtest(strategy, panel, config)
+    result = run_backtest(strategy, panel, config, contract=minimal_contract())
 
     # Ensure trades were recorded and shortfall_bps is computed correctly
     assert not result.trades.empty
@@ -492,7 +494,7 @@ def test_trade_recording_with_low_volume() -> None:
         cost_model=ZeroCost(),
     )
 
-    result = run_backtest(strategy, panel, config)
+    result = run_backtest(strategy, panel, config, contract=minimal_contract())
 
     # Trades should have participation calculated
     if not result.trades.empty:
@@ -512,7 +514,7 @@ def test_trade_recording_when_all_shares_filled() -> None:
         cost_model=ZeroCost(),
     )
 
-    result = run_backtest(strategy, panel, config)
+    result = run_backtest(strategy, panel, config, contract=minimal_contract())
 
     # First trade should be fully filled
     assert not result.trades.empty
@@ -559,7 +561,7 @@ def test_stop_order_skipped_when_zero_shares() -> None:
     strategy = ClosePositionStrategy(ClosePositionStrategy.Params())
     config = BacktestConfig()
 
-    result = run_backtest(strategy, panel, config)
+    result = run_backtest(strategy, panel, config, contract=minimal_contract())
     assert np.isfinite(result.equity_curve[-1])
 
 
@@ -597,7 +599,7 @@ def test_stop_order_skipped_when_non_finite_stop_price() -> None:
     config = BacktestConfig()
 
     # Should not crash, should skip non-finite stop
-    result = run_backtest(strategy, panel, config)
+    result = run_backtest(strategy, panel, config, contract=minimal_contract())
     assert np.isfinite(result.equity_curve[-1])
 
 
@@ -650,7 +652,7 @@ def test_stop_order_long_position_trigger_at_low() -> None:
         cost_model=ZeroCost(),
     )
 
-    result = run_backtest(strategy, panel, config)
+    result = run_backtest(strategy, panel, config, contract=minimal_contract())
     # Stop should have triggered, position should be flat at end
     assert result.forced_eod_liquidation_days == 0
 
@@ -704,7 +706,7 @@ def test_stop_order_short_position_trigger_at_high() -> None:
         cost_model=ZeroCost(),
     )
 
-    result = run_backtest(strategy, panel, config)
+    result = run_backtest(strategy, panel, config, contract=minimal_contract())
     # Stop should have triggered, position should be flat at end
     assert result.forced_eod_liquidation_days == 0
 
@@ -755,7 +757,7 @@ def test_pending_orders_does_not_double_accumulate() -> None:
         cost_model=ZeroCost(),
     )
 
-    result = run_backtest(strategy, panel, config)
+    result = run_backtest(strategy, panel, config, contract=minimal_contract())
 
     # Verify the position is correct and not doubled
     assert not result.trades.empty
@@ -799,7 +801,7 @@ def test_square_off_queued_when_not_last_row() -> None:
     strategy = HoldUntilSquareOffStrategy(HoldUntilSquareOffStrategy.Params())
     config = BacktestConfig(square_off_time="15:20")
 
-    result = run_backtest(strategy, panel, config)
+    result = run_backtest(strategy, panel, config, contract=minimal_contract())
 
     # No forced liquidation: square-off should have worked
     assert result.forced_eod_liquidation_days == 0
@@ -838,7 +840,7 @@ def test_square_off_direct_fill_on_last_row() -> None:
     strategy = TradeAtSessionEndStrategy(TradeAtSessionEndStrategy.Params())
     config = BacktestConfig(square_off_time="15:20")
 
-    result = run_backtest(strategy, panel, config)
+    result = run_backtest(strategy, panel, config, contract=minimal_contract())
 
     # No forced liquidation: square-off should have worked immediately
     assert result.forced_eod_liquidation_days == 0
@@ -870,7 +872,7 @@ def test_run_backtest_with_empty_panel() -> None:
     strategy = NoOpStrategy(NoOpStrategy.Params())
     config = BacktestConfig()
 
-    result = run_backtest(strategy, panel, config)
+    result = run_backtest(strategy, panel, config, contract=minimal_contract())
 
     # Empty input should produce empty output
     assert result.equity_curve.size == 0
@@ -917,7 +919,7 @@ def test_ruin_index_selected_from_net_only() -> None:
         cost_model=ZeroCost(),  # No costs to avoid ruining too fast
     )
 
-    result = run_backtest(strategy, panel, config)
+    result = run_backtest(strategy, panel, config, contract=minimal_contract())
 
     # Just verify the logic works without crashing
     assert isinstance(result.ruin_index, int)
@@ -959,7 +961,7 @@ def test_ruin_index_selected_from_gross_only() -> None:
         cost_model=ZeroCost(),
     )
 
-    result = run_backtest(strategy, panel, config)
+    result = run_backtest(strategy, panel, config, contract=minimal_contract())
 
     # Verify ruin_index is properly set
     assert isinstance(result.ruin_index, int)
@@ -1002,7 +1004,7 @@ def test_ruin_index_when_both_net_and_gross_ruin() -> None:
         cost_model=ZeroCost(),
     )
 
-    result = run_backtest(strategy, panel, config)
+    result = run_backtest(strategy, panel, config, contract=minimal_contract())
 
     # Verify structure: if ruined, ruin_index should be >= 0
     if result.ruined:
@@ -1074,7 +1076,7 @@ def test_square_off_and_eod_with_irregular_sessions() -> None:
     strategy = SimpleStrategy(SimpleStrategy.Params())
     config = BacktestConfig(square_off_time="15:20")
 
-    result = run_backtest(strategy, panel, config)
+    result = run_backtest(strategy, panel, config, contract=minimal_contract())
 
     # Should complete without error
     assert result.forced_eod_liquidation_days == 0
@@ -1131,7 +1133,7 @@ def test_decision_at_1059_fills_at_open_of_1100() -> None:
         cost_model=ZeroCost(),
     )
 
-    result = run_backtest(strategy, panel, config)
+    result = run_backtest(strategy, panel, config, contract=minimal_contract())
 
     # Trade should exist
     assert not result.trades.empty
@@ -1160,7 +1162,7 @@ def test_trade_with_zero_decision_price() -> None:
         cost_model=ZeroCost(),
     )
 
-    result = run_backtest(strategy, panel, config)
+    result = run_backtest(strategy, panel, config, contract=minimal_contract())
 
     # Verify that trades have valid shortfall_bps computation
     assert not result.trades.empty
@@ -1182,7 +1184,7 @@ def test_trade_with_zero_bar_traded_value() -> None:
         cost_model=ZeroCost(),
     )
 
-    result = run_backtest(strategy, panel, config)
+    result = run_backtest(strategy, panel, config, contract=minimal_contract())
 
     # With zero volume, trades should have participation = 0
     if not result.trades.empty:
@@ -1202,7 +1204,7 @@ def test_trade_with_unfillable_order() -> None:
         cost_model=ZeroCost(),
     )
 
-    result = run_backtest(strategy, panel, config)
+    result = run_backtest(strategy, panel, config, contract=minimal_contract())
 
     # With low participation cap, should have unfilled notional
     # Or just verify the test doesn't crash
@@ -1257,7 +1259,7 @@ def test_stop_order_when_short_with_finite_open() -> None:
         cost_model=ZeroCost(),
     )
 
-    result = run_backtest(strategy, panel, config)
+    result = run_backtest(strategy, panel, config, contract=minimal_contract())
     # Stop should have triggered
     assert result.forced_eod_liquidation_days == 0
 
@@ -1313,7 +1315,7 @@ def test_stop_order_when_long_with_non_finite_open() -> None:
         cost_model=ZeroCost(),
     )
 
-    result = run_backtest(strategy, panel, config)
+    result = run_backtest(strategy, panel, config, contract=minimal_contract())
     # Should not crash despite NaN values
     assert np.isfinite(result.equity_curve[-1])
 
@@ -1358,7 +1360,7 @@ def test_fill_row_already_pending() -> None:
         cost_model=ZeroCost(),
     )
 
-    result = run_backtest(strategy, panel, config)
+    result = run_backtest(strategy, panel, config, contract=minimal_contract())
     # Should complete without double-accumulation
     assert np.isfinite(result.equity_curve[-1])
 
@@ -1397,7 +1399,7 @@ def test_both_net_and_gross_ruin() -> None:
         cost_model=ZeroCost(),
     )
 
-    result = run_backtest(strategy, panel, config)
+    result = run_backtest(strategy, panel, config, contract=minimal_contract())
 
     # Verify ruin_index is properly computed
     if result.ruined:
@@ -1457,7 +1459,7 @@ def test_net_ruin_before_gross_extreme_costs() -> None:
         cost_model=FixedBpsCost(bps=100_000.0),  # 1000% per side
     )
 
-    result = run_backtest(strategy, panel, config)
+    result = run_backtest(strategy, panel, config, contract=minimal_contract())
 
     # Net must ruin from charges while gross survives
     assert result.ruined is True
@@ -1491,7 +1493,7 @@ def test_shortfall_calculation_with_non_finite_close() -> None:
         cost_model=ZeroCost(),
     )
 
-    result = run_backtest(strategy, panel, config)
+    result = run_backtest(strategy, panel, config, contract=minimal_contract())
 
     # Should handle NaN values gracefully
     assert np.isfinite(result.equity_curve[-1])
@@ -1519,7 +1521,7 @@ def test_participation_calculation_with_non_finite_notional() -> None:
         cost_model=ZeroCost(),
     )
 
-    result = run_backtest(strategy, panel, config)
+    result = run_backtest(strategy, panel, config, contract=minimal_contract())
 
     # All participation values should be 0 (zero volume)
     if not result.trades.empty:
@@ -1543,7 +1545,7 @@ def test_filled_frac_with_non_finite_qty() -> None:
         cost_model=ZeroCost(),
     )
 
-    result = run_backtest(strategy, panel, config)
+    result = run_backtest(strategy, panel, config, contract=minimal_contract())
 
     # With severe volume constraints, should have low fill rates
     # Just verify the test doesn't crash
@@ -1587,7 +1589,7 @@ def test_square_off_queued_before_session_end() -> None:
     # This ensures square_off_row is not at session end
     config = BacktestConfig(square_off_time="15:00")
 
-    result = run_backtest(strategy, panel, config)
+    result = run_backtest(strategy, panel, config, contract=minimal_contract())
 
     # No forced liquidation: square-off should have worked
     assert result.forced_eod_liquidation_days == 0
@@ -1634,7 +1636,7 @@ def test_net_only_ruin_sets_ruin_index() -> None:
         cost_model=ZeroCost(),  # No costs for now
     )
 
-    result = run_backtest(strategy, panel, config)
+    result = run_backtest(strategy, panel, config, contract=minimal_contract())
 
     # Verify ruin index structure
     assert isinstance(result.ruin_index, int)
@@ -1679,7 +1681,7 @@ def test_gross_only_ruin_sets_ruin_index() -> None:
         cost_model=ZeroCost(),
     )
 
-    result = run_backtest(strategy, panel, config)
+    result = run_backtest(strategy, panel, config, contract=minimal_contract())
 
     # Verify ruin_index is set correctly
     assert isinstance(result.ruin_index, int)
@@ -1709,7 +1711,7 @@ def test_shortfall_with_zero_decision_price() -> None:
         cost_model=ZeroCost(),
     )
 
-    result = run_backtest(strategy, panel, config)
+    result = run_backtest(strategy, panel, config, contract=minimal_contract())
 
     if not result.trades.empty:
         assert np.all(np.isfinite(result.trades["shortfall_bps"].values))
@@ -1734,7 +1736,7 @@ def test_participation_calculation_structure() -> None:
         cost_model=ZeroCost(),
     )
 
-    result = run_backtest(strategy, panel, config)
+    result = run_backtest(strategy, panel, config, contract=minimal_contract())
 
     # All trades should have valid participation values
     if not result.trades.empty:
@@ -1782,7 +1784,7 @@ def test_filled_frac_calculation() -> None:
         cost_model=ZeroCost(),
     )
 
-    result = run_backtest(strategy, panel, config)
+    result = run_backtest(strategy, panel, config, contract=minimal_contract())
 
     # filled_frac should be computed for all trades
     if not result.trades.empty:
@@ -1836,7 +1838,7 @@ def test_stop_order_with_zero_position_skips_stop() -> None:
         cost_model=ZeroCost(),
     )
 
-    result = run_backtest(strategy, panel, config)
+    result = run_backtest(strategy, panel, config, contract=minimal_contract())
 
     # Should complete without issues
     assert np.isfinite(result.equity_curve[-1])
@@ -1894,7 +1896,7 @@ def test_long_stop_conservative_min_trigger_price() -> None:
         cost_model=ZeroCost(),
     )
 
-    result = run_backtest(strategy, panel, config)
+    result = run_backtest(strategy, panel, config, contract=minimal_contract())
 
     assert result.forced_eod_liquidation_days == 0
 
@@ -1936,7 +1938,7 @@ def test_square_off_fill_timing() -> None:
     # square_off_time="15:00" is before session end, so queuing path triggered
     config = BacktestConfig(square_off_time="15:00")
 
-    result = run_backtest(strategy, panel, config)
+    result = run_backtest(strategy, panel, config, contract=minimal_contract())
 
     # Should square off cleanly without forced liquidation
     assert result.forced_eod_liquidation_days == 0
@@ -1983,7 +1985,7 @@ def test_square_off_queued_explicitly_before_last_row() -> None:
     # 15:00 is before session end (15:30) -> square-off row before last row
     config = BacktestConfig(square_off_time="15:00")
 
-    result = run_backtest(strategy, panel, config)
+    result = run_backtest(strategy, panel, config, contract=minimal_contract())
 
     # Square-off should execute without forced liquidation
     assert result.forced_eod_liquidation_days == 0
@@ -2009,7 +2011,7 @@ def test_shortfall_bps_zero_when_decision_price_zero() -> None:
         cost_model=ZeroCost(),
     )
 
-    result = run_backtest(strategy, panel, config)
+    result = run_backtest(strategy, panel, config, contract=minimal_contract())
 
     # Trades at bar 45 fill should record shortfall_bps = 0 from zero decision price
     if not result.trades.empty:
@@ -2039,7 +2041,7 @@ def test_participation_computed_correctly() -> None:
         cost_model=ZeroCost(),
     )
 
-    result = run_backtest(strategy, panel, config)
+    result = run_backtest(strategy, panel, config, contract=minimal_contract())
 
     # Participation should be computed for all trades
     if not result.trades.empty:
@@ -2047,19 +2049,31 @@ def test_participation_computed_correctly() -> None:
         assert np.all(result.trades["participation"] <= 1.0)
 
 
-def test_filled_frac_zero_when_denom_zero() -> None:
-    """Filled_frac = 0 when denom (abs(desired_qty)) is 0 (line 303).
+def test_filled_frac_zero_for_phantom_fill_with_zero_desired_order() -> None:
+    """Filled_frac = 0.0 when denom (abs(desired_qty)) is 0 (line 303).
 
-    When desired_qty = 0, denom = 0, condition at line 300 fails,
-    filled_frac = 0.0 (line 303). Occurs when order qty is 0.
+    Repairs a previously vacuous test (spec `tca_record.md` AMENDMENT 4 item 2, found by
+    mutation): the old version only asserted `result.trades.empty` for an all-zero-weight
+    strategy, which never places an order and so never reaches `_record_trade` /
+    `compute_filled_frac` at all -- reverting the zero-denominator branch to return NaN
+    left that version green. `desired_qty == 0` can only reach a *recorded trade* when a
+    pluggable fill_model reports a fill for a symbol whose own order was zero (a phantom
+    fill) -- see `test_engine_coverage3.py::
+    test_filled_frac_forced_zero_for_phantom_fill_with_zero_desired_order` for the same
+    construction (read there, not modified here). This version drives that state directly
+    so the branch is actually exercised.
     """
     panel = make_panel(flat_close(100.0))
 
-    class ZeroOrderStrategy(Strategy):
-        name = "zero_order"
+    class EnterOnceStrategy(Strategy):
+        name = "enter_once"
 
         class Params(BaseModel):
             pass
+
+        def __init__(self, params):
+            super().__init__(params)
+            self._entered = False
 
         def data_request(self) -> DataRequest:
             return DataRequest(decision_times=("10:00",))
@@ -2070,19 +2084,74 @@ def test_filled_frac_zero_when_denom_zero() -> None:
         def on_decision(
             self, view: MarketView, signals, state: PortfolioState
         ) -> TargetPortfolio | None:
-            # No order (weights = 0) -> desired_qty = 0 -> filled_frac = 0
-            return TargetPortfolio(weights=np.array([0.0, 0.0, 0.0], dtype=np.float64))
+            if self._entered:
+                return None
+            self._entered = True
+            # AAA gets a real order; BBB and CCC stay at weight 0 -> desired_qty == 0.
+            return TargetPortfolio(weights=np.array([0.1, 0.0, 0.0], dtype=np.float64))
 
-    strategy = ZeroOrderStrategy(ZeroOrderStrategy.Params())
+    @dataclass
+    class GhostFillModel:
+        """Wraps a real FillModel but overrides ONE symbol's reported fill to a fixed,
+        finite (qty, price) pair regardless of what was actually ordered for it, on the
+        FIRST execute call only -- proves `_record_trade` cannot divide by zero when a
+        pluggable fill_model reports a fill for a symbol whose own order was 0
+        (`desired_qty == 0`). Same pattern as `test_engine_coverage3.py::_GhostFillModel`,
+        reproduced locally rather than imported since that file is not to be modified.
+
+        Firing only once (rather than on every execute call, as the coverage3 version
+        does over its short single-day fixture) is required here because this file's
+        `make_panel` spans 5 full sessions: an unconditional override would keep forcing
+        a phantom BBB fill on every later EOD-exit execute call too, so the phantom
+        position it creates would never actually get flattened -- it would just keep
+        growing, corrupting the very desired_qty == 0 case under test.
+        """
+
+        ghost_idx: int
+        ghost_qty: float
+        ghost_price: float
+        max_participation: float = 0.02
+        _inner: FillModel = field(default_factory=lambda: FillModel(slippage=ZeroSlippage()))
+        _fired: bool = field(default=False, init=False)
+
+        def fill(self, orders, prices, bar_traded_value, tradable):
+            result = self._inner.fill(orders, prices, bar_traded_value, tradable)
+            if self._fired:
+                return result
+            self._fired = True
+            filled_qty = result.filled_qty.copy()
+            fill_price = result.fill_price.copy()
+            filled_qty[self.ghost_idx] = self.ghost_qty
+            fill_price[self.ghost_idx] = self.ghost_price
+            return FillResult(
+                filled_qty=filled_qty,
+                fill_price=fill_price,
+                rejected=result.rejected,
+                unfilled_notional=result.unfilled_notional,
+            )
+
+    strategy = EnterOnceStrategy(EnterOnceStrategy.Params())
     config = BacktestConfig(
-        fill_model=FillModel(slippage=ZeroSlippage()),
+        # BBB (index 1) has desired_qty == 0 (weight stays 0) but the ghost model
+        # reports a phantom fill for it anyway.
+        fill_model=GhostFillModel(ghost_idx=1, ghost_qty=37.0, ghost_price=100.0),
         cost_model=ZeroCost(),
     )
 
-    result = run_backtest(strategy, panel, config)
+    result = run_backtest(strategy, panel, config, contract=minimal_contract())
 
-    # No trades placed, which is correct behavior
-    assert result.trades.empty
+    # First BBB trade is the phantom fill itself (desired_qty == 0 -> filled_frac == 0.0,
+    # the branch under test). Because the ghost model only fires once (see docstring
+    # above), the 37-share phantom BBB position it creates is then squared off normally
+    # at day 1's EOD -- a second, legitimate trade with a non-zero desired_qty, not part
+    # of this assertion.
+    bbb_trades = result.trades[result.trades["symbol"] == "BBB"]
+    assert len(bbb_trades) == 2
+    phantom_row = bbb_trades.iloc[0]
+    assert phantom_row["desired_qty"] == 0.0
+    assert phantom_row["qty"] == pytest.approx(37.0)
+    assert phantom_row["filled_frac"] == 0.0
+    assert np.isfinite(phantom_row["filled_frac"])
 
 
 def test_stop_order_continue_when_shares_zero() -> None:
@@ -2133,7 +2202,7 @@ def test_stop_order_continue_when_shares_zero() -> None:
         cost_model=ZeroCost(),
     )
 
-    result = run_backtest(strategy, panel, config)
+    result = run_backtest(strategy, panel, config, contract=minimal_contract())
 
     # Stop should not execute when shares are zero
     assert np.isfinite(result.equity_curve[-1])
@@ -2191,7 +2260,7 @@ def test_long_stop_trigger_fills_at_min_open() -> None:
         cost_model=ZeroCost(),
     )
 
-    result = run_backtest(strategy, panel, config)
+    result = run_backtest(strategy, panel, config, contract=minimal_contract())
 
     # Stop should trigger at conservative fill price
     assert result.forced_eod_liquidation_days == 0
@@ -2216,7 +2285,7 @@ def test_reweight_rescales_when_absent_symbols_mask_weight() -> None:
         cost_model=ZeroCost(),
     )
 
-    result = run_backtest(strategy, panel, config)
+    result = run_backtest(strategy, panel, config, contract=minimal_contract())
 
     # With absent symbol, result should mark it as absent
     assert result.n_symbols_absent >= 1
@@ -2282,7 +2351,7 @@ def test_pending_orders_collision_same_fill_row_executes_as_sum() -> None:
         cost_model=ZeroCost(),
     )
 
-    result = run_backtest(strategy, panel, config)
+    result = run_backtest(strategy, panel, config, contract=minimal_contract())
 
     collision_row = 366
     collision_ts = int(panel.ts[collision_row])
@@ -2340,7 +2409,7 @@ def test_square_off_direct_fill_when_row_is_session_end() -> None:
     # 15:30 is session end for normal 375-bar day
     config = BacktestConfig(square_off_time="15:30")
 
-    result = run_backtest(strategy, panel, config)
+    result = run_backtest(strategy, panel, config, contract=minimal_contract())
 
     assert result.forced_eod_liquidation_days == 0
 
@@ -2384,7 +2453,7 @@ def test_square_off_queued_when_row_before_session_end() -> None:
     # 15:00 is before session end (15:30) -> queuing path triggered
     config = BacktestConfig(square_off_time="15:00")
 
-    result = run_backtest(strategy, panel, config)
+    result = run_backtest(strategy, panel, config, contract=minimal_contract())
 
     # Should complete without forced liquidation
     assert result.forced_eod_liquidation_days == 0
@@ -2409,7 +2478,7 @@ def test_shortfall_bps_zero_at_exact_fill_row() -> None:
         cost_model=ZeroCost(),
     )
 
-    result = run_backtest(strategy, panel, config)
+    result = run_backtest(strategy, panel, config, contract=minimal_contract())
 
     # At bar 45 fill, decision_price came from close[44] = 0
     # Condition at line 283 fails, shortfall_bps = 0.0 (line 286)
@@ -2437,7 +2506,7 @@ def test_participation_calculated_properly() -> None:
         cost_model=ZeroCost(),
     )
 
-    result = run_backtest(strategy, panel, config)
+    result = run_backtest(strategy, panel, config, contract=minimal_contract())
 
     # Participation should be calculated for all trades
     if not result.trades.empty:
@@ -2478,7 +2547,7 @@ def test_filled_frac_computation_at_fill_row() -> None:
         cost_model=ZeroCost(),
     )
 
-    result = run_backtest(strategy, panel, config)
+    result = run_backtest(strategy, panel, config, contract=minimal_contract())
 
     # Normal fills should have filled_frac in [0, 1]
     if not result.trades.empty:

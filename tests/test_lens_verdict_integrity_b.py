@@ -6,22 +6,24 @@ suite or any implementation change -- none exists yet. Covers all 10 numbered
 dropped from the conjunction), L3 (criterion 5 hard-FAILs a negative-signed
 edge), and L4 (`Lens.universe` stored and never read).
 
-This suite is EXPECTED TO BE RED against current `nifty_quant.research.lens`
-code: `HypothesisVerdict` has no `outcome` field yet, criterion 5 still hard-
-FAILs negative `lag_0_edge`, and `Lens.universe` is still ignored.
-
-Two spec-flagged ambiguities, resolved below and re-stated in the report:
-  - The spec names the new field `outcome` and its three values SURVIVED /
-    KILLED / INCONCLUSIVE, but does not say whether it is a plain string or an
-    enum. Every existing per-criterion result in lens.py (c1_result ... c7_result,
-    StabilityReport.dominant_sign) is a plain string Literal, so tests compare
-    `verdict.outcome` against the bare strings "SURVIVED" / "KILLED" /
-    "INCONCLUSIVE".
-  - Obligation 10 ("the verdict records the symbol count actually used") names
-    no attribute. Tests use `verdict.n_symbols_used`, chosen to match the
-    existing `n_years_total` / `n_years_sign_consistent` naming convention on
-    `StabilityReport`. A real implementation may pick a different name; this
-    test would then need a one-line rename, not a redesign.
+Originally written against unimplemented code (deliberately RED); updated
+after the implementation landed to match AMENDMENT 1 and AMENDMENT 2 of the
+spec, both now pinned rather than left as this suite's own guesses:
+  - `HypothesisVerdict.outcome` is a plain string `Literal["SURVIVED",
+    "KILLED", "INCONCLUSIVE"]`, not an enum (AMENDMENT 1.2) -- matches this
+    suite's original reading.
+  - The symbol count is `n_symbols_used` (AMENDMENT 1.3) -- matches this
+    suite's original reading.
+  - `cross_sectional_rank` enforces `min_names=5`; any fixture reaching it,
+    including a RESTRICTED universe, must retain >= 5 symbols or every row
+    goes all-NaN and every criterion degrades to FAIL for reasons unrelated
+    to what is under test (AMENDMENT 2). The obligation-9/10 fixture below
+    was rebuilt from 5/4 symbols to 6/5 for exactly this reason.
+  - Obligation 9's second assertion originally checked `n_total`, which is a
+    ROW count (`expectancy.n_defined`), not a symbol count, and is correctly
+    unchanged by dropping one of several always-present symbols (AMENDMENT
+    2). Replaced with a `n_symbols_used` check via `verdict()`; the
+    `spread_bps` assertion (the real, stronger effect check) is unchanged.
 """
 
 from __future__ import annotations
@@ -66,8 +68,15 @@ def _session_grid(
 
 
 def _signal_means(effect: float, n_symbols: int = 5) -> np.ndarray:
-    assert n_symbols == 5
-    return np.array([-effect, -effect / 2.0, 0.0, effect / 2.0, effect], dtype=np.float64)
+    """Symmetric per-symbol mean returns, evenly spaced in [-effect, +effect].
+
+    For n_symbols=5 this is exactly [-effect, -effect/2, 0, effect/2, effect]
+    (unchanged). Generalized so obligation-9/10 fixtures can use 6 symbols --
+    AMENDMENT 2 pins `cross_sectional_rank`'s `min_names=5` floor, so a
+    restricted universe used to demonstrate L4 must retain >= 5 symbols, which
+    requires starting from >= 6.
+    """
+    return np.linspace(-effect, effect, n_symbols, dtype=np.float64)
 
 
 def _close_from_log_returns(returns: np.ndarray) -> np.ndarray:
@@ -438,36 +447,71 @@ def test_ob8_criterion5_reason_carries_uncalibrated_threshold_marker(
 # ---------------------------------------------------------------------------
 
 
+_UNIVERSE_SYMBOLS = ("Q1", "Q2", "Q3", "Q4", "Q5", "Q6")
+_UNIVERSE_VOLUME = (2e3, 2e4, 2e5, 2e6, 2e7, 2e8)
+# Excludes Q6, the single largest-magnitude (+edge) symbol. 5 symbols remain,
+# meeting cross_sectional_rank's min_names=5 floor (AMENDMENT 2) -- restricting
+# below that floor makes every row all-NaN and degrades the comparison to
+# "a working answer versus no answer", which proves nothing about restriction.
+_RESTRICTED_UNIVERSE = ("Q1", "Q2", "Q3", "Q4", "Q5")
+
+
 def _universe_test_panel() -> Panel:
-    # Symbol means by construction: Q1=-0.01, Q2=-0.005, Q3=0.0, Q4=0.005,
-    # Q5=+0.01 (the single largest-magnitude, positive edge). Restricting the
-    # universe to exclude Q5 removes the extreme positive-return name from
-    # the cross-sectional ranking used by expectancy() -- this changes both
-    # which symbols populate each rank bucket and spread_bps.
+    # Symbol means by construction: Q1=-0.01, Q2=-0.006, Q3=-0.002, Q4=0.002,
+    # Q5=0.006, Q6=+0.01 (the single largest-magnitude, positive edge). Six
+    # symbols so that restricting the universe to exclude Q6 still leaves 5 --
+    # >= cross_sectional_rank's min_names=5 (AMENDMENT 2) -- while still
+    # removing the extreme positive-return name from the cross-sectional
+    # ranking used by expectancy(), changing which symbols populate each rank
+    # bucket and spread_bps.
     return _build_panel(
-        {2024: [1, 6]}, bars_per_session=250, effect=0.01, sigma=0.0005, seed=11
+        {2024: [1, 6]},
+        bars_per_session=250,
+        effect=0.01,
+        sigma=0.0005,
+        symbols=_UNIVERSE_SYMBOLS,
+        volume_profile=_UNIVERSE_VOLUME,
+        seed=11,
     )
 
 
 def test_ob9_universe_restriction_computes_statistics_on_restricted_set() -> None:
     panel = _universe_test_panel()
-    restricted_universe = ("Q1", "Q2", "Q3", "Q4")  # excludes Q5, the extreme +edge symbol
 
     full_lens = Lens(panel, seed=0)
-    restricted_lens = Lens(panel, universe=restricted_universe, seed=0)
+    restricted_lens = Lens(panel, universe=_RESTRICTED_UNIVERSE, seed=0)
 
     full_exp = full_lens.expectancy("return_1", 1, n_buckets=5, method="cross_sectional_rank")
     restricted_exp = restricted_lens.expectancy(
         "return_1", 1, n_buckets=5, method="cross_sectional_rank"
     )
 
-    # Non-vacuousness check: dropping Q5 from the ranking is NOT a no-op.
+    # Non-vacuousness check: dropping Q6 from the ranking is NOT a no-op.
     # Confirmed directly (independently of Lens.universe wiring) that a panel
-    # built with exactly these four symbols produces a materially different
-    # spread_bps (0.0, vs ~199.9 for the full five-symbol panel) -- i.e. a
-    # correct restriction must change the observed answer here.
+    # built with these six symbols yields a materially different spread_bps
+    # once restricted to the 5 named above (~159.9 bps) vs the full six
+    # (~179.9 bps) -- i.e. a correct restriction must change the observed
+    # answer here. This is the effect check; it is the stronger of the two
+    # assertions in this test because it demonstrates the restriction was
+    # actually applied to the statistics, not merely recorded.
     assert restricted_exp.spread_bps != full_exp.spread_bps
-    assert restricted_exp.n_total < full_exp.n_total
+
+    # n_total is a ROW count (expectancy.py: fwd.n_defined), not a symbol
+    # count -- dropping one of six always-present symbols leaves every row
+    # still defined, so n_total is correctly unchanged and must NOT be used
+    # here (AMENDMENT 2). The symbol count itself is only recorded on
+    # HypothesisVerdict as n_symbols_used (obligation 10's field), so confirm
+    # the restriction's effect on symbol count via a verdict() call instead.
+    full_verdict = _call_verdict(
+        panel, hypothesis_id="H_ob9_full", latency_profile={0: 1.0, 1: 0.6, 2: 0.55}
+    )
+    restricted_verdict = _call_verdict(
+        panel,
+        hypothesis_id="H_ob9_restricted",
+        latency_profile={0: 1.0, 1: 0.6, 2: 0.55},
+        universe=_RESTRICTED_UNIVERSE,
+    )
+    assert restricted_verdict.n_symbols_used < full_verdict.n_symbols_used
 
 
 # ---------------------------------------------------------------------------
@@ -477,7 +521,6 @@ def test_ob9_universe_restriction_computes_statistics_on_restricted_set() -> Non
 
 def test_ob10_verdict_records_symbol_count_actually_used() -> None:
     panel = _universe_test_panel()
-    restricted_universe = ("Q1", "Q2", "Q3", "Q4")
 
     full_verdict = _call_verdict(
         panel,
@@ -488,8 +531,8 @@ def test_ob10_verdict_records_symbol_count_actually_used() -> None:
         panel,
         hypothesis_id="H_restricted_universe",
         latency_profile={0: 1.0, 1: 0.6, 2: 0.55},
-        universe=restricted_universe,
+        universe=_RESTRICTED_UNIVERSE,
     )
 
-    assert full_verdict.n_symbols_used == 5
-    assert restricted_verdict.n_symbols_used == 4
+    assert full_verdict.n_symbols_used == 6
+    assert restricted_verdict.n_symbols_used == 5

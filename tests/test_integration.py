@@ -32,6 +32,7 @@ from nifty_quant.strategy.plugins.volume_breakout import (
     VolumeBreakoutStrategy,
 )
 from nifty_quant.universe.static import equity_symbols
+from tests.contract_fixtures import minimal_contract
 
 _IST = ZoneInfo("Asia/Kolkata")
 BARS_PER_DAY = 375
@@ -357,7 +358,7 @@ def test_all_registered_plugins_run_end_to_end(plugin_name: str) -> None:
         BacktestConfig(
             cost_model=NSEIntradayEquityCosts(),
             fill_model=FillModel(slippage=SqrtImpactSlippage()),
-        ),
+        ), contract=minimal_contract()
     )
 
     assert result.equity_curve.size > 0
@@ -374,7 +375,7 @@ def test_absent_symbols_do_not_crash(plugin_name: str) -> None:
         BacktestConfig(
             cost_model=NSEIntradayEquityCosts(),
             fill_model=FillModel(slippage=SqrtImpactSlippage()),
-        ),
+        ), contract=minimal_contract()
     )
 
     # xsec_zscore's signal is only valid at the decision row itself, not at
@@ -390,7 +391,7 @@ def test_absent_symbols_do_not_crash(plugin_name: str) -> None:
 def test_absent_symbol_positions_are_zero() -> None:
     panel = _make_synthetic_panel_with_absent_symbols()
     strategy = _FixedWeightStrategy()
-    result = run_backtest(strategy, panel, BacktestConfig())
+    result = run_backtest(strategy, panel, BacktestConfig(), contract=minimal_contract())
 
     absent_idx = 0  # symbol 0 is fully absent
     assert np.all(result.positions[:, absent_idx] == 0.0)
@@ -402,7 +403,7 @@ def test_gross_renormalization_with_absent_symbol() -> None:
     config = BacktestConfig(
         capital=1_000_000.0, sizer=GrossNotionalSizer(max_weight=0.20)
     )
-    result = run_backtest(strategy, panel, config)
+    result = run_backtest(strategy, panel, config, contract=minimal_contract())
 
     # decision time is "10:00", i.e. row offset 45 within each session; the
     # resulting order fills one bar later (decision_latency_bars=0 by default),
@@ -439,7 +440,7 @@ def test_accounting_invariant_with_absent_symbols() -> None:
     # run_backtest already enforces the accounting identity via guards at
     # Strictness.FULL on every row; a ContractViolation escaping this call fails
     # the test naturally.
-    result = run_backtest(strategy, panel, BacktestConfig())
+    result = run_backtest(strategy, panel, BacktestConfig(), contract=minimal_contract())
 
     assert result.equity_curve.size > 0
     assert np.all(np.isfinite(result.equity_curve))
@@ -457,7 +458,7 @@ def test_signals_arrive_1d_at_cursor(plugin_name: str) -> None:
         BacktestConfig(
             cost_model=NSEIntradayEquityCosts(),
             fill_model=FillModel(slippage=SqrtImpactSlippage()),
-        ),
+        ), contract=minimal_contract()
     )
 
     assert result.equity_curve.size > 0
@@ -475,7 +476,7 @@ def test_gross_vs_net_costs_reconcile() -> None:
         BacktestConfig(
             cost_model=ZeroCost(),
             fill_model=FillModel(slippage=SqrtImpactSlippage()),
-        ),
+        ), contract=minimal_contract()
     )
     net_result = run_backtest(
         net_strategy,
@@ -483,7 +484,7 @@ def test_gross_vs_net_costs_reconcile() -> None:
         BacktestConfig(
             cost_model=NSEIntradayEquityCosts(),
             fill_model=FillModel(slippage=SqrtImpactSlippage()),
-        ),
+        ), contract=minimal_contract()
     )
 
     assert net_result.total_costs > 0.0
@@ -501,7 +502,7 @@ def test_accounting_invariant_holds_across_full_run() -> None:
     # run_backtest already enforces the accounting identity via guards at
     # Strictness.FULL on every row; a ContractViolation escaping this call fails
     # the test naturally, which is the whole point of this test.
-    result = run_backtest(strategy, panel, BacktestConfig())
+    result = run_backtest(strategy, panel, BacktestConfig(), contract=minimal_contract())
 
     assert result.equity_curve.size > 0
 
@@ -517,7 +518,7 @@ def test_square_off_flat_no_forced_liquidation(plugin_name: str) -> None:
         BacktestConfig(
             cost_model=NSEIntradayEquityCosts(),
             fill_model=FillModel(slippage=SqrtImpactSlippage()),
-        ),
+        ), contract=minimal_contract()
     )
 
     assert result.forced_eod_liquidation_days == 0
@@ -538,7 +539,7 @@ def test_square_off_on_abbreviated_session_no_forced_liquidation() -> None:
         BacktestConfig(
             cost_model=NSEIntradayEquityCosts(),
             fill_model=FillModel(slippage=SqrtImpactSlippage()),
-        ),
+        ), contract=minimal_contract()
     )
 
     assert result.forced_eod_liquidation_days == 0
@@ -557,7 +558,7 @@ def test_metrics_pipeline_never_returns_inf() -> None:
         BacktestConfig(
             cost_model=NSEIntradayEquityCosts(),
             fill_model=FillModel(slippage=SqrtImpactSlippage()),
-        ),
+        ), contract=minimal_contract()
     )
     flat_metrics = compute_metrics(flat_result.returns)
     assert not math.isinf(flat_metrics.sharpe)
@@ -566,7 +567,7 @@ def test_metrics_pipeline_never_returns_inf() -> None:
     # Part B: a real fixed-weight run has nonzero returns and must stay finite.
     panel = _make_synthetic_panel(n_sym=6, n_days=3)
     strategy = _FixedWeightStrategy()
-    result = run_backtest(strategy, panel, BacktestConfig())
+    result = run_backtest(strategy, panel, BacktestConfig(), contract=minimal_contract())
     metrics = compute_metrics(result.returns)
     assert math.isfinite(metrics.sharpe)
     assert math.isfinite(metrics.max_drawdown)
@@ -612,7 +613,7 @@ def test_real_2024_volume_breakout_end_to_end() -> None:
             capital=1_000_000.0,
             cost_model=NSEIntradayEquityCosts(),
             fill_model=FillModel(slippage=SqrtImpactSlippage()),
-        ),
+        ), contract=minimal_contract()
     )
 
     assert result.n_trades > 0
@@ -664,7 +665,7 @@ def test_real_2024_volume_breakout_full_universe_absent_symbols() -> None:
             capital=1_000_000.0,
             cost_model=NSEIntradayEquityCosts(),
             fill_model=FillModel(slippage=SqrtImpactSlippage()),
-        ),
+        ), contract=minimal_contract()
     )
 
     assert result.n_trades > 0

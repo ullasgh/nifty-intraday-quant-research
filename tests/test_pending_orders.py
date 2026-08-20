@@ -18,6 +18,7 @@ from nifty_quant.strategy.base import (
     Strategy,
     TargetPortfolio,
 )
+from tests.contract_fixtures import minimal_contract
 from tests.test_engine import (
     BARS_PER_DAY,
     N_DAYS,
@@ -101,6 +102,7 @@ def test_latency_zero_behaviour_unchanged():
         ),
         make_dense_panel(),
         _dense_config(0),
+        contract=minimal_contract(),
     )
 
     expected_equity = np.array([
@@ -136,6 +138,7 @@ def test_no_double_ordering_at_latency_one():
         ),
         make_dense_panel(),
         _dense_config(1),
+        contract=minimal_contract(),
     )
 
     max_abs = np.max(np.abs(result.positions))
@@ -153,6 +156,7 @@ def test_position_magnitude_does_not_grow_with_latency():
             ),
             make_dense_panel(),
             _dense_config(latency),
+            contract=minimal_contract(),
         )
         max_abs_by_latency.append(np.max(np.abs(result.positions)))
 
@@ -181,6 +185,7 @@ def test_partial_fill_removes_dropped_remainder_from_in_flight():
         ),
         panel,
         config,
+        contract=minimal_contract(),
     )
 
     aaa_trades = result.trades[
@@ -216,6 +221,7 @@ def test_rejected_order_clears_in_flight():
         panel,
         config,
         tradable=tradable,
+        contract=minimal_contract(),
     )
 
     max_aaa_position = np.max(result.positions[:, 0])
@@ -241,6 +247,7 @@ def test_eod_liquidation_still_flattens_at_latency():
             ),
             panel,
             config,
+            contract=minimal_contract(),
         )
 
         for day in range(N_DAYS):
@@ -271,6 +278,7 @@ def test_trade_count_does_not_explode_with_latency():
                 ),
                 panel,
                 config,
+                contract=minimal_contract(),
             )
         )
 

@@ -160,3 +160,141 @@ Dual independent suites per rule 1, from this spec alone.
 13. IC aggregate SEs come from the overlap-aware path — assert they differ from the naive iid SE
     on an overlapping-horizon fixture.
 14. `vwap_reversion` uses `market.bars_since_open` and no longer defines its own.
+
+---
+
+# AMENDMENT 1 — 2026-08-20. Five unspecified interfaces, pinned.
+
+A test author reported five places where this spec named a thing without specifying it. Each one
+forced a guess, and two independent guesses become two suites that cannot both pass. Pinning all
+five, plus module placement, which I omitted entirely.
+
+## 1. Garman-Klass and Rogers-Satchell formulas
+
+Named but never given, unlike every other formula in this spec. Pinned, both as VARIANCE per bar,
+averaged over the window and then square-rooted, matching `parkinson_volatility`'s existing
+convention for scaling, NaN propagation and `day_offsets` handling:
+
+    GK:  sigma_sq = mean_over_window[ 0.5 * ln(H/L)**2 - (2*ln(2) - 1) * ln(C/O)**2 ]
+    RS:  sigma_sq = mean_over_window[ ln(H/C)*ln(H/O) + ln(L/C)*ln(L/O) ]
+
+Garman-Klass can go NEGATIVE on a single bar (the subtracted term can dominate when open and close
+straddle a narrow range). Clip the WINDOW MEAN at zero before the square root, never the individual
+bar terms — clipping per bar biases the estimator upward, and this estimator's whole selling point
+is efficiency relative to close-to-close.
+
+## 2. Module placement — omitted entirely, my error
+
+    features/persistence.py :  stitch_overnight_gaps, hurst_on_stitched
+    features/core.py        :  breakout_strength, garman_klass_volatility,
+                               rogers_satchell_volatility, efficiency_ratio,
+                               sigma_risk, SIGMA_FLOOR
+    research/ic.py          :  information_coefficient, ic_decay   (already named in the spec)
+
+An unnamed module means a RED suite fails on `ImportError` at a guessed path, which is
+indistinguishable from a genuine gap — the same failure mode already recorded in
+`specs/research_contract.md` AMENDMENT 1 item 2. I made the identical omission again here.
+
+## 3. `SIGMA_FLOOR` and `sigma_risk`
+
+    core.SIGMA_FLOOR   -- module-level constant, DERIVED, with the derivation recorded beside it
+                          in the style of lens.py:24-50 (CONCENTRATION_RATIO_THRESHOLD)
+    core.sigma_risk(sigma_ewma, *, floor=SIGMA_FLOOR) -> np.ndarray   # elementwise max
+
+Rule 8 governs `SIGMA_FLOOR`: derive it from the measured distribution of realised per-symbol
+volatility on real data, and justify the chosen percentile by the position size it implies for the
+inverse-vol sizer. A round number is a rule-8 violation regardless of how sensible it looks.
+
+## 4. `efficiency_ratio` window convention
+
+`window` counts BARS INCLUSIVE, matching `rolling_max` / `rolling_std` / `parkinson_volatility`:
+
+    efficiency_ratio[t] = abs(close[t] - close[t - window + 1])
+                          / sum(abs(diff(close))[t - window + 2 : t + 1])
+
+so the numerator spans `window` bars and the denominator sums `window - 1` first differences.
+Session-bounded via `day_offsets`; the first `window - 1` rows of each session are NaN.
+
+## 5. `information_coefficient` needs `horizon`, and both return types are pinned
+
+The signature in the spec body has no `horizon`, yet obligation 13 requires overlap-aware SEs,
+which cannot be computed without knowing the label horizon. That is a genuine contradiction in my
+text. Pinned:
+
+    information_coefficient(feature, fwd, day_offsets, *, horizon,
+                            method="pearson"|"spearman") -> ICResult
+        ICResult:  .mean  .se  .n_bars  .method  .horizon
+
+    ic_decay(feature, close, day_offsets, *, horizons) -> ICDecay
+        ICDecay:   .horizons  .ic  .se  .half_life
+
+`ICResult.se` MUST come from the overlap-aware machinery in `specs/overlap_se.md` — that spec is
+now implemented and verified (false-positive rate 34% -> 7%), so there is no excuse for a naive iid
+SE here. Obligation 13 asserts the two differ on an overlapping-horizon fixture.
+
+## Note on how these were found
+
+Every one of the five was reported rather than guessed silently, with the assumption documented
+in the test's own docstring. That is what makes them cheap to fix now instead of expensive to
+discover when two suites disagree.
+
+## AMENDMENT 1, addendum — obligation 13's DIRECTION is pinned, not just "differs"
+
+A test author asserted `result.se > naive_se` and flagged it as stronger than the obligation's
+"must differ" text, noting they could not verify the direction from the spec. The direction is
+sound and is now pinned.
+
+Overlapping forward labels induce POSITIVE dependence between adjacent observations: two labels
+sharing `horizon - 1` bars of their return window move together by construction. An iid SE assumes
+independence, so it divides by an effective sample size larger than the truth, and therefore
+**understates**. An overlap-aware SE must exceed it.
+
+    obligation 13:  result.se > naive_se     (not merely !=)
+
+This is also the direction the implemented `specs/overlap_se.md` work already confirmed from the
+other end: the pre-fix estimator's understated SE inflated `spread_t` and drove a 34% false-positive
+rate, which fell to 7% once the SE was computed with dependence respected.
+
+An implementation producing a SMALLER SE than naive on an overlapping-horizon fixture is wrong, and
+this obligation should say so rather than accept any difference.
+
+---
+
+# AMENDMENT 2 — 2026-08-20. Obligation 13's "reuse the overlap machinery" was under-specified.
+
+A test author fed IC values through `_compute_bucket_stats` and got back essentially the naive SE.
+Diagnosis, and it is correct: that machinery is built for **bps-scaled price returns partitioned
+into buckets**, not for a **correlation-coefficient series**. The spec said "reuse the corrected
+overlap-aware machinery" without saying which part, and the two parts have very different
+generality.
+
+## The resolution: reuse the RESAMPLER, not the bucket-stats wrapper
+
+The block bootstrap itself is unit-agnostic — it resamples rows of a 2-D array while respecting
+session boundaries, and it does not care whether those rows are basis points or correlations. The
+bucket-stats layer above it is what encodes bps semantics and a two-bucket spread.
+
+    REUSE:  the moving-block resampler, its DERIVED block length (horizon + 5, measured), its
+            within-session drawing, and its skipped-session accounting
+    DO NOT REUSE: _compute_bucket_stats, which is bucket-and-bps specific
+
+`research/ic.py` builds its own aggregator on top of the shared resampler: resample the per-bar
+cross-sectional IC series, take the mean per replicate, and take the standard deviation across
+replicates. Same dependence handling, correct units.
+
+**Required refactor:** the resampler must be importable independently of the bucket-stats wrapper.
+If it is currently only reachable through `_compute_bucket_stats`, extract it — with a single
+implementation, not a copy. Two block bootstraps that could drift apart is precisely the
+near-duplicate hazard already recorded twice in this program (`filled_frac`, `config_hash`).
+
+**The block length is shared and stays derived.** `horizon + 5`, from the measured ACF of
+same-session 1-minute log returns. Do NOT re-derive a separate constant for IC without measuring
+it; if the IC series' own dependence structure turns out to differ materially, that is a
+measurement to make and record, not a number to pick.
+
+## Why the naive-SE result was the right thing to report
+
+Getting back "essentially the naive SE" is the exact signature of dependence handling silently not
+applying — the same class as the `min_names=5` all-NaN trap and the iid fallback. It looked like a
+working pipeline and was not. Reporting it instead of accepting the number is what kept obligation
+13 meaningful, and the strict `se != naive_se` assertion should stay strict.

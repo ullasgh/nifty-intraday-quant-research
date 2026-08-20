@@ -147,3 +147,40 @@ passed criterion 3 marginally.
 Note for the record: this finding came from an audit brief whose stated premise was wrong. The
 agent checked the premise instead of accepting it, refuted it, and found the deeper defect. That is
 the behaviour the dual-suite rule exists to produce, and it is worth more than agreement.
+
+---
+
+## L7/L8 — FIXED and VERIFIED, 2026-08-20
+
+Measured on the SAME fixture, before and after the fix:
+
+| quantity | pre-fix | post-fix | nominal / truth |
+|---|---|---|---|
+| false-positive rate (persistent feature, rho=0.9613, horizon=20) | **34%** | **7%** | alpha = 5% |
+| SE ratio vs independently resimulated empirical SE, AR(1) rho=0.6 | 47.9x raw / 0.71x as-fed | **0.977** | 1.0 |
+| bootstrap SE vs analytic iid SE on iid data | 29.5x | within tolerance | 1.0 |
+
+A 34% false-positive rate means roughly one in three null results would have been reported as
+significant at `t > 1.96`. Post-fix it is 7% against a nominal 5% — close enough that the residual
+is consistent with finite-sample noise rather than a systematic error.
+
+**What the fix comprised**, and note the second item was NOT where this spec originally said the
+defect lived:
+
+1. The moving-block bootstrap now tiles blocks to the full series length instead of returning one
+   block per replicate, drawing only within sessions and reporting the count of sessions skipped
+   for being shorter than the block.
+2. `ExpectancyTable.spread_t` was never computed from `BucketStat.se_bps` at all —
+   `conditional_expectancy` recomputed a separate spread SE as `std_bps / sqrt(n_effective)`, and
+   that is where the over-correction actually reached the statistic `lens.py` criterion 3 reads.
+   It now combines the two extreme buckets' `se_bps` in quadrature.
+3. `n_effective` is reporting-only: `(std_bps / se_bps) ** 2`, never feeding back.
+4. Block length DERIVED, not defaulted to `horizon`: `horizon + 5`, where 5 comes from measured
+   lag-1..30 ACF of same-session 1-minute log returns across 10 liquid names over 2024Q1 (all
+   showing the bid-ask-bounce negative lag-1 ACF, -0.040 to -0.066, decaying below 0.02 within
+   2-5 bars; p95 decay lag = 5).
+
+**Consequence that must not be forgotten:** every result previously gated on criterion 3
+(`abs(spread_t) > 1.96`) was computed on the broken SE. Those verdicts are not automatically wrong,
+but they are unverified. Recomputing them is a separate deliberate step and has NOT been done — the
+implementation was explicitly instructed not to silently re-run and overwrite recorded numbers.

@@ -75,6 +75,7 @@ from nifty_quant.strategy.base import (
     Strategy,
     TargetPortfolio,
 )
+from tests.contract_fixtures import minimal_contract
 
 # Tolerant imports for new symbols that do not exist yet (RED).
 try:
@@ -247,7 +248,7 @@ def test_01_partial_square_off_retries_to_flat():
 
     strategy = ConstantWeightStrategy({"AAA": 0.05})
     config = BacktestConfig(capital=1e7, square_off_time="15:20")
-    result = run_backtest(strategy, panel, config)
+    result = run_backtest(strategy, panel, config, contract=minimal_contract())
 
     assert result.forced_eod_liquidation_days == 0
     eod_exit_fills = result.trades[result.trades["intent"] == OrderIntent.EOD_EXIT]
@@ -266,7 +267,7 @@ def test_02_repeated_partial_square_off_monotonic():
 
     strategy = ConstantWeightStrategy({"AAA": 0.05})
     config = BacktestConfig(capital=1e7, square_off_time="15:20")
-    result = run_backtest(strategy, panel, config)
+    result = run_backtest(strategy, panel, config, contract=minimal_contract())
 
     assert result.forced_eod_liquidation_days == 0
     eod_fills = result.trades[result.trades["intent"] == OrderIntent.EOD_EXIT]
@@ -310,7 +311,7 @@ def test_03_forced_eod_when_cannot_finish():
 
     strategy = ConstantWeightStrategy({"AAA": 0.05})
     config = BacktestConfig(capital=1e7, square_off_time="15:20")
-    result = run_backtest(strategy, panel, config)
+    result = run_backtest(strategy, panel, config, contract=minimal_contract())
 
     assert result.forced_eod_liquidation_days == 1
     eod_fills = result.trades[result.trades["intent"] == OrderIntent.EOD_EXIT]
@@ -344,7 +345,7 @@ def test_04_no_reopening_after_square_off():
 
     strategy = ScheduledWeightStrategy(schedule)
     config = BacktestConfig(capital=1e7, square_off_time="15:20")
-    result = run_backtest(strategy, panel, config)
+    result = run_backtest(strategy, panel, config, contract=minimal_contract())
 
     sq_row = _square_off_row(panel.day_offsets, 0)
     entry_trades = result.trades[result.trades["intent"] == OrderIntent.ENTRY]
@@ -374,7 +375,7 @@ def test_05_in_flight_invariant_every_row():
     strategy = ConstantWeightStrategy({"AAA": 0.05, "BBB": 0.02})
     config = BacktestConfig(capital=1e7, square_off_time="15:20")
 
-    result = run_backtest(strategy, panel, config)
+    result = run_backtest(strategy, panel, config, contract=minimal_contract())
 
     assert result.n_trades > 0
 
@@ -421,7 +422,7 @@ def test_05b_in_flight_guard_fires_on_injected_desync(monkeypatch):
     assert patched_any
 
     with pytest.raises(guards.ContractViolation):
-        run_backtest(strategy, panel, config)
+        run_backtest(strategy, panel, config, contract=minimal_contract())
 
 
 def test_06_append_not_overwrite_both_intents():
@@ -442,7 +443,7 @@ def test_06_append_not_overwrite_both_intents():
 
     strategy = ScheduledWeightStrategy(schedule)
     config = BacktestConfig(capital=1e7, square_off_time="15:20", decision_latency_bars=5)
-    result = run_backtest(strategy, panel, config)
+    result = run_backtest(strategy, panel, config, contract=minimal_contract())
 
     # Find the fill row where ENTRY and EOD_EXIT collide
     sq_row = _square_off_row(panel.day_offsets, 0)
@@ -496,7 +497,7 @@ def test_07_intent_tagging_valid_and_risk_exit():
 
     strategy = StopRiskStrategy({"AAA": 0.05}, stop_price=95.0)
     config = BacktestConfig(capital=1e7, square_off_time="15:20")
-    result = run_backtest(strategy, panel, config)
+    result = run_backtest(strategy, panel, config, contract=minimal_contract())
 
     # Every trade has a valid OrderIntent
     valid_intents = set(OrderIntent)
@@ -508,7 +509,7 @@ def test_07_intent_tagging_valid_and_risk_exit():
     prices_drop = prices.copy()
     prices_drop[100:110, 0] = 90.0  # Drop below stop price
     panel_drop = _make_panel(n_days, prices_drop, prices_drop, prices_drop, prices_drop, volumes)
-    result_drop = run_backtest(strategy, panel_drop, config)
+    result_drop = run_backtest(strategy, panel_drop, config, contract=minimal_contract())
     assert any(intent == OrderIntent.RISK_EXIT for intent in result_drop.trades["intent"])
 
     # Normal session produces EOD_EXIT and zero FORCED_EOD
@@ -528,7 +529,7 @@ def test_08_composed_forced_eod_costs():
 
     strategy = ConstantWeightStrategy({"AAA": 0.05})
     config = BacktestConfig(capital=1e7, square_off_time="15:20")
-    result = run_backtest(strategy, panel, config)
+    result = run_backtest(strategy, panel, config, contract=minimal_contract())
 
     forced_trades = result.trades[result.trades["intent"] == OrderIntent.FORCED_EOD]
     assert len(forced_trades) >= 1
@@ -568,7 +569,7 @@ def test_09_ordinary_path_unchanged():
         cost_model=ZeroCost(),
         fill_model=FillModel(slippage=ZeroSlippage()),
     )
-    result = run_backtest(strategy, panel, config)
+    result = run_backtest(strategy, panel, config, contract=minimal_contract())
 
     # Price never moves, costs zero -> equity invariant at capital
     assert np.allclose(result.equity_curve, 1e7)
@@ -588,7 +589,7 @@ def test_10_accounting_invariant_throughout():
 
     strategy = ConstantWeightStrategy({"AAA": 0.05})
     config = BacktestConfig(capital=1e7, square_off_time="15:20")
-    result = run_backtest(strategy, panel, config)
+    result = run_backtest(strategy, panel, config, contract=minimal_contract())
 
     assert result.forced_eod_liquidation_days == 0
 

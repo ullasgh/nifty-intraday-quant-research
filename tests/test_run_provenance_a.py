@@ -75,6 +75,12 @@ the body wherever the two disagree; this file was written against the amended sp
    `ruined`, `ruin_index`) -- i.e. "provenance" means identity/lineage only, not a full
    record dump. Not a defect, just noted so the exact-key-set assertion below isn't
    mistaken for an oversight.
+
+7. Since this spec was written, `TrialRecord` gained a `contract_hash` field (spec C4,
+   `specs/research_contract.md`) distinct from `config_hash`, and it is written into
+   `metrics.json["provenance"]` alongside the original 16 keys. Verified populated
+   (non-null) on a real recorded run, not merely present-but-None on the dataclass, so
+   `PROVENANCE_KEYS` below is 17 keys, not 16.
 """
 
 from __future__ import annotations
@@ -104,10 +110,12 @@ from nifty_quant.universe.static import Universe
 runner = CliRunner()
 _IST = ZoneInfo("Asia/Kolkata")
 
-# The exact 16-key provenance set, amendment item 6, verbatim.
+# The exact 17-key provenance set, amendment item 6, verbatim, plus contract_hash
+# (TrialRecord gained this field distinct from config_hash; verified populated below).
 PROVENANCE_KEYS = frozenset(
     {
         "config_hash",
+        "contract_hash",
         "git_sha",
         "code_version",
         "data_fingerprint",
@@ -644,9 +652,10 @@ def test_item6_registry_write_failed_is_false_on_normal_run(monkeypatch, tmp_pat
 
 
 # ================================ item 7 ================================
-# Amendment item 6: metrics.json["provenance"] has EXACTLY the 16 keys, null
-# permitted only for seed/parent_trial_id; and the 39 existing performance keys must
-# be untouched (rule: provenance ADDS keys, never renames/removes).
+# Amendment item 6: metrics.json["provenance"] has EXACTLY the 16 keys named by the
+# amendment plus the later-added `contract_hash` (17 total, see docstring note 7),
+# null permitted only for seed/parent_trial_id; and the 39 existing performance keys
+# must be untouched (rule: provenance ADDS keys, never renames/removes).
 
 
 def test_item7_metrics_json_provenance_block_exact_key_set(monkeypatch, tmp_path: Path) -> None:

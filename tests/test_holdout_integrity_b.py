@@ -240,7 +240,7 @@ def _patch_common(monkeypatch, tmp_path, panel, all_dates):
     monkeypatch.setattr(
         engine_mod,
         "run_backtest",
-        lambda strat, panel, config, *, tradable=None: _fake_result(n=3),
+        lambda strat, panel, config, *, tradable=None, **kwargs: _fake_result(n=3),
     )
     monkeypatch.setattr(settings_mod, "RESULTS_ROOT", tmp_path)
     monkeypatch.setattr(

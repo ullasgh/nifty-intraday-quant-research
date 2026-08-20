@@ -1364,9 +1364,14 @@ class TestItem7MetricsJsonProvenance:
 
     metrics.json["provenance"] contains EXACTLY these keys (all present, null allowed
     only for seed and parent_trial_id):
-    config_hash, git_sha, code_version, data_fingerprint, panel_hash, universe_name,
-    universe_hash, seed, start, end, cost_model_id, slippage_model_id, fill_model_id,
-    embargo_components, parent_trial_id, feature_version
+    config_hash, contract_hash, git_sha, code_version, data_fingerprint, panel_hash,
+    universe_name, universe_hash, seed, start, end, cost_model_id, slippage_model_id,
+    fill_model_id, embargo_components, parent_trial_id, feature_version
+
+    `contract_hash` was added after amendment item 6 was written (spec C4,
+    `specs/research_contract.md`), distinct from the pre-existing `config_hash`; it is
+    verified populated (non-null) on a real recorded run, not merely present on the
+    dataclass.
     """
 
     def test_provenance_block_exact_key_set_on_disk(
@@ -1388,11 +1393,14 @@ class TestItem7MetricsJsonProvenance:
         # Must have provenance object
         assert "provenance" in metrics, "metrics.json must have provenance block"
 
+        # 16 keys named by amendment item 6, plus `contract_hash` -- TrialRecord gained
+        # this field (distinct from config_hash) under spec C4 (research_contract.md)
+        # after this amendment was written; verified populated (non-null) below.
         required_keys = {
-            "config_hash", "git_sha", "code_version", "data_fingerprint", "panel_hash",
-            "universe_name", "universe_hash", "seed", "start", "end", "cost_model_id",
-            "slippage_model_id", "fill_model_id", "embargo_components", "parent_trial_id",
-            "feature_version"
+            "config_hash", "contract_hash", "git_sha", "code_version", "data_fingerprint",
+            "panel_hash", "universe_name", "universe_hash", "seed", "start", "end",
+            "cost_model_id", "slippage_model_id", "fill_model_id", "embargo_components",
+            "parent_trial_id", "feature_version"
         }
 
         provenance = metrics["provenance"]
@@ -1449,20 +1457,21 @@ class TestItem7MetricsJsonProvenance:
         assert "provenance" in metrics
         provenance = metrics["provenance"]
 
-        # All sixteen fields must exist as keys
+        # 16 fields named by amendment item 6, plus `contract_hash` (see comment on
+        # test_provenance_block_exact_key_set_on_disk above) -- 17 fields must exist.
         required_keys = {
-            "config_hash", "git_sha", "code_version", "data_fingerprint", "panel_hash",
-            "universe_name", "universe_hash", "seed", "start", "end", "cost_model_id",
-            "slippage_model_id", "fill_model_id", "embargo_components", "parent_trial_id",
-            "feature_version"
+            "config_hash", "contract_hash", "git_sha", "code_version", "data_fingerprint",
+            "panel_hash", "universe_name", "universe_hash", "seed", "start", "end",
+            "cost_model_id", "slippage_model_id", "fill_model_id", "embargo_components",
+            "parent_trial_id", "feature_version"
         }
 
         for key in required_keys:
             assert key in provenance, f"Provenance must have key '{key}'"
 
-        # Exactly sixteen fields, no more, no less
-        assert len(provenance) == 16, (
-            f"Provenance must have exactly 16 keys, found {len(provenance)}"
+        # Exactly seventeen fields, no more, no less
+        assert len(provenance) == 17, (
+            f"Provenance must have exactly 17 keys, found {len(provenance)}"
         )
 
 

@@ -50,6 +50,7 @@ from nifty_quant.backtest.orders import OrderIntent
 from nifty_quant.data.panel import Panel
 from nifty_quant.execution.fills import FillModel, FillResult, ZeroSlippage
 from nifty_quant.strategy.base import DataRequest, Strategy, TargetPortfolio
+from tests.contract_fixtures import minimal_contract
 
 SYMBOLS = ("AAA", "BBB", "CCC")
 _IST = ZoneInfo("Asia/Kolkata")
@@ -243,7 +244,7 @@ def test_shortfall_bps_forced_zero_when_decision_price_nonfinite():
     config = BacktestConfig(decision_latency_bars=0, fill_model=FillModel(slippage=ZeroSlippage()))
     strategy = _EnterOnceStrategy(_EmptyParams(), entry_row_ts=ts[0], weight=0.1, symbol_idx=0)
 
-    result = run_backtest(strategy, panel, config)
+    result = run_backtest(strategy, panel, config, contract=minimal_contract())
 
     aaa_trades = result.trades[result.trades["symbol"] == "AAA"]
     buy_trades = aaa_trades[aaa_trades["qty"] > 0]
@@ -285,7 +286,7 @@ def test_participation_forced_zero_when_bar_traded_value_zero_at_direct_fill():
     )
     strategy = _EnterOnceStrategy(_EmptyParams(), entry_row_ts=ts[0], weight=0.1, symbol_idx=0)
 
-    result = run_backtest(strategy, panel, config)
+    result = run_backtest(strategy, panel, config, contract=minimal_contract())
 
     aaa_trades = result.trades[result.trades["symbol"] == "AAA"]
     sell_trades = aaa_trades[aaa_trades["qty"] < 0]
@@ -318,7 +319,7 @@ def test_filled_frac_forced_zero_for_phantom_fill_with_zero_desired_order():
     )
     strategy = _EnterOnceStrategy(_EmptyParams(), entry_row_ts=ts[0], weight=0.1, symbol_idx=1)
 
-    result = run_backtest(strategy, panel, config)
+    result = run_backtest(strategy, panel, config, contract=minimal_contract())
 
     # The ghost model's phantom fill is a REAL fill from the portfolio's point of view (it
     # goes through apply_fills like any other), so the resulting 37-share AAA position is
@@ -368,7 +369,7 @@ def test_intrabar_stop_skipped_zero_position():
     config = BacktestConfig(decision_latency_bars=2, fill_model=FillModel(slippage=ZeroSlippage()))
     strategy = _ZeroWeightWithStopStrategy(_EmptyParams(), entry_row_ts=ts[0], stop_price=95.0)
 
-    result = run_backtest(strategy, panel, config)
+    result = run_backtest(strategy, panel, config, contract=minimal_contract())
 
     assert result.n_trades == 0
     assert result.forced_eod_liquidation_days == 0
@@ -400,7 +401,7 @@ def test_intrabar_short_stop_nonfinite_open():
     config = BacktestConfig(decision_latency_bars=0, fill_model=FillModel(slippage=ZeroSlippage()))
     strategy = _ShortWithStopStrategy(_EmptyParams(), entry_row_ts=ts[0], stop_price=105.0)
 
-    result = run_backtest(strategy, panel, config)
+    result = run_backtest(strategy, panel, config, contract=minimal_contract())
 
     aaa_trades = result.trades[result.trades["symbol"] == "AAA"]
     cover_trades = aaa_trades[aaa_trades["qty"] > 0]
@@ -456,7 +457,7 @@ def test_square_off_dropped_when_position_opens_on_last_row():
         _EmptyParams(), entry_row_ts=ts[3], weight=0.1, symbol_idx=0
     )
 
-    result = run_backtest(strategy, panel, config)
+    result = run_backtest(strategy, panel, config, contract=minimal_contract())
 
     # No ENTRY ever queued: the scripted decision's cursor ts (ts[3]) fires at
     # decision row t=4, which is >= square_off_row_for_day[0]==3, so the decision
@@ -495,7 +496,7 @@ def test_muhurat_short_session_uses_immediate_square_off():
     config = BacktestConfig(decision_latency_bars=0, fill_model=FillModel(slippage=ZeroSlippage()))
     strategy = _EnterOnceStrategy(_EmptyParams(), entry_row_ts=ts[0], weight=0.1, symbol_idx=0)
 
-    result = run_backtest(strategy, panel, config)
+    result = run_backtest(strategy, panel, config, contract=minimal_contract())
 
     assert result.forced_eod_liquidation_days == 0
     assert result.positions[-1, 0] == 0.0
@@ -529,7 +530,9 @@ def test_present_does_not_imply_tradable():
     config = BacktestConfig(decision_latency_bars=0, fill_model=FillModel(slippage=ZeroSlippage()))
     strategy = _EnterOnceStrategy(_EmptyParams(), entry_row_ts=ts[0], weight=0.1, symbol_idx=0)
 
-    result = run_backtest(strategy, panel, config, tradable=tradable)
+    result = run_backtest(
+        strategy, panel, config, tradable=tradable, contract=minimal_contract()
+    )
 
     aaa_trades = result.trades[result.trades["symbol"] == "AAA"]
     assert len(aaa_trades) == 0

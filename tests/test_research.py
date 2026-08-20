@@ -4,13 +4,14 @@ from pathlib import Path
 import numpy as np
 import pytest
 
+from nifty_quant.research.contract import canonical_hash
 from nifty_quant.research.registry import TrialRecord, TrialRegistry
 from nifty_quant.research.splits import (
     EmbargoTooShortError,
     HoldoutLock,
     WalkForwardSplitter,
 )
-from nifty_quant.research.sweep import config_hash, expand
+from nifty_quant.research.sweep import expand
 
 
 def _trading_dates() -> list[date]:
@@ -236,10 +237,10 @@ def test_sweep_constraint_security():
 
 
 def test_config_hash():
-    assert config_hash({"a": 1, "b": 2}) == config_hash({"b": 2, "a": 1})
+    assert canonical_hash({"a": 1, "b": 2}) == canonical_hash({"b": 2, "a": 1})
 
-    h = config_hash({"a": 1})
+    h = canonical_hash({"a": 1})
     assert len(h) == 16
     assert all(c in "0123456789abcdef" for c in h)
 
-    assert config_hash({"a": 1}) != config_hash({"a": 2})
+    assert canonical_hash({"a": 1}) != canonical_hash({"a": 2})

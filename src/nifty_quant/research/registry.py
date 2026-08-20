@@ -46,6 +46,13 @@ class TrialRecord:
     embargo_components: str = "{}"
     parent_trial_id: str | None = None
     feature_version: str = ""
+    # ---- specs/research_contract.md: contract_hash, distinct from config_hash. The
+    # pre-existing `config_hash` field above keeps its name and column (many callers
+    # already key/query on it); this field is the ResearchContract's own hash, set
+    # by `run_backtest`/`run_tilt` writers to the SAME value as `config_hash` once a
+    # contract is used, so both a legacy `config_hash` lookup and a
+    # `record.contract_hash == contract.contract_hash` check succeed. ----
+    contract_hash: str | None = None
 
 
 @dataclass(frozen=True)
@@ -164,6 +171,7 @@ class TrialRegistry:
                 embargo_components TEXT,
                 parent_trial_id TEXT,
                 feature_version TEXT,
+                contract_hash TEXT,
                 UNIQUE(config_hash, split_id)
             )
             """
@@ -212,6 +220,10 @@ class TrialRegistry:
                 )
         if "seed" not in existing_columns:
             self._conn.execute("ALTER TABLE trials ADD COLUMN seed INTEGER")
+
+        # specs/research_contract.md: contract_hash, distinct from config_hash.
+        if "contract_hash" not in existing_columns:
+            self._conn.execute("ALTER TABLE trials ADD COLUMN contract_hash TEXT")
 
         self._conn.commit()
 

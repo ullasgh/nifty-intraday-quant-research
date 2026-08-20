@@ -2,9 +2,7 @@
 
 from __future__ import annotations
 
-import hashlib
 import itertools
-import json
 import operator
 import re
 from collections.abc import Mapping, Sequence
@@ -115,13 +113,3 @@ def load_sweep_yaml(path: Path) -> tuple[str, list[dict[str, Any]]]:
         raise ValueError("constraints must be a list of strings")
 
     return strategy, expand(base_params, sweep, constraints)
-
-
-def canonical_json(obj: Any) -> str:
-    return json.dumps(obj, sort_keys=True, separators=(",", ":"), default=str)
-
-
-def config_hash(cfg: Any) -> str:
-    return hashlib.blake2s(
-        canonical_json(cfg).encode("utf-8"), digest_size=8
-    ).hexdigest()

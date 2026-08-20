@@ -22,6 +22,7 @@ from nifty_quant.strategy.base import (
     Strategy,
     TargetPortfolio,
 )
+from tests.contract_fixtures import minimal_contract
 
 from .test_causality import assert_precompute_is_causal
 
@@ -307,8 +308,8 @@ def test_leaky_peek_survives_engine_lag_and_beats_causal_twin() -> None:
         sizer=GrossNotionalSizer(),
     )
 
-    leaky_result = run_backtest(leaky, panel, config)
-    twin_result = run_backtest(twin, panel, config)
+    leaky_result = run_backtest(leaky, panel, config, contract=minimal_contract())
+    twin_result = run_backtest(twin, panel, config, contract=minimal_contract())
 
     leaky_sharpe = float(sharpe_ratio(leaky_result.returns))
     twin_sharpe = float(sharpe_ratio(twin_result.returns))

@@ -130,13 +130,23 @@ class HypothesisVerdict:
     """Verdict on a hypothesis after applying all Phase 3 kill criteria."""
 
     hypothesis_id: str
-    survived: bool
+    outcome: Literal["SURVIVED", "KILLED", "INCONCLUSIVE"]
     any_not_evaluated: bool
     reasons: tuple[str, ...]  # one line per criterion, always all 7
     expectancy: expectancy.ExpectancyTable
     stability: StabilityReport
     cost_hurdle_bps: float
     seed: int
+    n_symbols_used: int
+
+    @property
+    def survived(self) -> bool:
+        """True iff every one of the seven criteria was evaluated and PASSed.
+
+        Must equal ``outcome == "SURVIVED"`` exactly: an INCONCLUSIVE or KILLED
+        outcome can never read as survived, per specs/lens_verdict_integrity.md L1.
+        """
+        return self.outcome == "SURVIVED"
 
     def _se_method_name(self) -> str:
         """Standard-error method used, or 'N/A' when no bucket was produced.
@@ -162,19 +172,17 @@ class HypothesisVerdict:
         for reason in self.reasons:
             lines.append(reason)
         lines.append("")
-        verdict_token = "SURVIVED" if self.survived else "KILLED"
         if self.any_not_evaluated:
             lines.append(
-                f"Final verdict: {verdict_token} "
+                f"Final verdict: {self.outcome} "
                 "(INCOMPLETE: one or more criteria NOT_EVALUATED)"
             )
         else:
-            lines.append(f"Final verdict: {verdict_token}")
+            lines.append(f"Final verdict: {self.outcome}")
         return "\n".join(lines)
 
     def to_markdown(self) -> str:
         """Return markdown representation for committed results/hypotheses/<id>/verdict.md."""
-        verdict_token = "SURVIVED" if self.survived else "KILLED"
         verdict_suffix = (
             " (INCOMPLETE: one or more criteria NOT_EVALUATED)"
             if self.any_not_evaluated
@@ -183,7 +191,7 @@ class HypothesisVerdict:
         lines = [
             f"# {self.hypothesis_id}",
             "",
-            f"**Verdict:** {verdict_token}{verdict_suffix}",
+            f"**Verdict:** {self.outcome}{verdict_suffix}",
             "",
             "## Kill Criteria",
             "",
@@ -231,12 +239,21 @@ class Lens:
         seed : int
             Random seed for reproducibility. Defaults to 0.
         """
+        # L4 fix (specs/lens_verdict_integrity.md): restrict the panel to the
+        # requested universe ONCE, here, at construction -- before any feature,
+        # expectancy, or stability statistic is computed. Every downstream
+        # attribute (day_offsets, minute_of_day, symbols) is then derived from
+        # the restricted panel, so a restricted universe cannot silently have
+        # no effect.
+        if universe is not None:
+            panel = panel.sub(symbols=tuple(universe))
         self.panel = panel
         self.day_offsets = panel.day_offsets
         self.minute_of_day = panel.minute_of_day()
         self.symbols = panel.symbols
         self.cost_model = cost_model or NSEIntradayEquityCosts()
-        self.universe = universe or panel.symbols
+        self.universe = panel.symbols
+        self.n_symbols_used = len(panel.symbols)
         self.seed = seed
 
         # Feature cache: (name, params_tuple) -> Feature
@@ -769,25 +786,46 @@ class Lens:
             c5_result = "NOT_EVALUATED"
             reasons.append(f"5. Latency profile criterion: {c5_result}")
         else:
-            # Check if edge is retained at lags 1 and 2
+            # L3 fix (specs/lens_verdict_integrity.md): retention is computed on
+            # MAGNITUDE, with sign agreement checked separately. The old code
+            # branched on `lag_0_edge > 0` and hard-FAILed any negative edge --
+            # rejecting a reversal signal for having the sign it is supposed to
+            # have (H2's measured edge is -24.30 bps, negative by construction).
+            # The 0.5 threshold below is UNMEASURED (rule 8) and reported as such.
             lag_0_edge = latency_profile.get(0, 1.0)
             lag_1_edge = latency_profile.get(1, 0.0)
             lag_2_edge = latency_profile.get(2, 0.0)
 
-            # Retain >= 50% of lag-0 edge magnitude at lags 1 and 2
-            if lag_0_edge > 0:
-                lag_1_ratio = lag_1_edge / lag_0_edge
-                lag_2_ratio = lag_2_edge / lag_0_edge
-                if lag_1_ratio >= 0.5 and lag_2_ratio >= 0.5:
+            if not np.isfinite(lag_0_edge) or lag_0_edge == 0:
+                c5_result = "FAIL"
+                reasons.append(
+                    f"5. Latency profile criterion: {c5_result} "
+                    "(no edge to retain at lag 0 -- UNCALIBRATED threshold=0.5) "
+                    f"(lags: {latency_profile})"
+                )
+            else:
+                retention_1 = abs(lag_1_edge) / abs(lag_0_edge)
+                retention_2 = abs(lag_2_edge) / abs(lag_0_edge)
+                sign_holds_1 = np.sign(lag_1_edge) == np.sign(lag_0_edge)
+                sign_holds_2 = np.sign(lag_2_edge) == np.sign(lag_0_edge)
+
+                if (
+                    retention_1 >= 0.5
+                    and sign_holds_1
+                    and retention_2 >= 0.5
+                    and sign_holds_2
+                ):
                     c5_result = "PASS"
                 else:
                     c5_result = "FAIL"
-            else:
-                c5_result = "FAIL"
 
-            reasons.append(
-                f"5. Latency profile criterion: {c5_result} (lags: {latency_profile})"
-            )
+                reasons.append(
+                    f"5. Latency profile criterion: {c5_result} "
+                    f"(retention_1={retention_1:.3f}, sign_holds_1={sign_holds_1}, "
+                    f"retention_2={retention_2:.3f}, sign_holds_2={sign_holds_2}, "
+                    "UNCALIBRATED threshold=0.5) "
+                    f"(lags: {latency_profile})"
+                )
 
         # Criterion 6: Deflated Sharpe
         if strategy_returns is None:
@@ -898,23 +936,38 @@ class Lens:
                 f"excluded partial years: {excluded_desc})"
             )
 
-        # Determine if survived
+        # L1 fix (specs/lens_verdict_integrity.md): a criterion that was never
+        # evaluated must not silently vanish from the conjunction. The old code
+        # dropped NOT_EVALUATED tokens before the `all(...)` check, so
+        # `survived=True` was reachable with criteria that never ran -- which
+        # was the actual state of both committed H2 and H3 verdicts. The
+        # outcome is now tri-state: KILLED (any evaluated FAIL, decisive
+        # regardless of what else ran) beats INCONCLUSIVE (no failure, but at
+        # least one NOT_EVALUATED) beats SURVIVED (all seven evaluated and PASS).
         reason_tokens = [
             r.split(":")[1].strip().split()[0] for r in reasons
         ]  # Extract PASS/FAIL/NOT_EVALUATED
         any_not_evaluated = any(
             token == "NOT_EVALUATED" for token in reason_tokens
         )
-        evaluated_results = [t for t in reason_tokens if t != "NOT_EVALUATED"]
-        survived = all(r == "PASS" for r in evaluated_results)
+        any_fail = any(token == "FAIL" for token in reason_tokens)
+
+        outcome: Literal["SURVIVED", "KILLED", "INCONCLUSIVE"]
+        if any_fail:
+            outcome = "KILLED"
+        elif any_not_evaluated:
+            outcome = "INCONCLUSIVE"
+        else:
+            outcome = "SURVIVED"
 
         return HypothesisVerdict(
             hypothesis_id=hypothesis_id,
-            survived=survived,
+            outcome=outcome,
             any_not_evaluated=any_not_evaluated,
             reasons=tuple(reasons),
             expectancy=exp_table,
             stability=stab_report,
             cost_hurdle_bps=cost_hurdle_bps,
             seed=self.seed,
+            n_symbols_used=self.n_symbols_used,
         )

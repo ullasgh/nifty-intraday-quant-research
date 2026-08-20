@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import hashlib
 import json
 from datetime import date, datetime
 from pathlib import Path
@@ -70,5 +69,16 @@ def canonical_json(obj: Any) -> str:
 
 
 def config_hash(cfg: Any) -> str:
-    """Return a deterministic 16-hex-char blake2s hash of `cfg`'s canonical JSON."""
-    return hashlib.blake2s(canonical_json(cfg).encode("utf-8"), digest_size=8).hexdigest()
+    """Return a deterministic 16-hex-char blake2s hash of `cfg`'s canonical JSON.
+
+    Thin wrapper delegating to `nifty_quant.research.contract.canonical_hash`
+    (specs/research_contract.md: "REPLACES the three config_hash functions"). A
+    pydantic `BaseModel` (e.g. `RunConfig`) is first converted via
+    `model_dump(mode="python")` so nested `date` fields stay real `date` objects
+    before canonicalisation, matching this module's prior behaviour exactly.
+    """
+    from nifty_quant.research.contract import canonical_hash
+
+    if isinstance(cfg, BaseModel):
+        cfg = cfg.model_dump(mode="python")
+    return canonical_hash(cfg)

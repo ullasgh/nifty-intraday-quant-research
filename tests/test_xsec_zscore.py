@@ -20,6 +20,7 @@ from nifty_quant.strategy.plugins.xsec_zscore import (
     _cross_sectional_return_zscore,
     _select_and_weight,
 )
+from tests.contract_fixtures import minimal_contract
 
 IST = ZoneInfo("Asia/Kolkata")
 
@@ -495,7 +496,7 @@ def test_strategy_actually_opens_positions_through_run_backtest():
     dates = [dt.date(2024, 1, d) for d in range(5, 10)]
     panel = _build_dense_ohlcv_panel(dates, symbols, seed=42)
     strategy = XSecZScoreStrategy(params=XSecZScoreParams(min_names=4))
-    result = run_backtest(strategy, panel, BacktestConfig())
+    result = run_backtest(strategy, panel, BacktestConfig(), contract=minimal_contract())
     assert result.n_trades > 0
 
 

@@ -73,6 +73,7 @@ from nifty_quant.execution.costs import (
 )
 from nifty_quant.execution.fills import FillModel, ZeroSlippage
 from nifty_quant.strategy.base import DataRequest, Strategy, TargetPortfolio
+from tests.contract_fixtures import minimal_contract
 
 BARS_PER_DAY = 375
 CAPITAL = 10_000_000.0
@@ -333,7 +334,7 @@ def _run(
         fill_model=fill_model,
         decision_latency_bars=decision_latency_bars,
     )
-    return run_backtest(strategy, panel, config)
+    return run_backtest(strategy, panel, config, contract=minimal_contract())
 
 
 def _expected_target_shares(

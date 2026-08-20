@@ -465,8 +465,21 @@ def test_verdict_criterion_4_bucket_dominance() -> None:
 # ==============================================================================
 
 
-def test_verdict_criterion_5_negative_lag_0_edge() -> None:
-    """Criterion 5 with negative lag_0_edge (short signal)."""
+def test_verdict_criterion_5_negative_lag_0_edge_that_retains_PASSES() -> None:
+    """Criterion 5 with a negative lag_0_edge (a short/reversal signal) must PASS.
+
+    ADJUDICATED, specs/lens_verdict_integrity.md L3. This test previously asserted
+    FAIL "because lag_0_edge is not > 0" -- which was the DEFECT stated as intent.
+    Criterion 5 branched on `if lag_0_edge > 0:` and hard-FAILed anything negative.
+
+    H2's measured edge is -24.30 bps, negative BY CONSTRUCTION because it is a
+    reversal signal traded short-side. The old rule would have rejected the only
+    live signal family in this program for having the sign it is supposed to have.
+
+    Retention is now computed on MAGNITUDE with sign agreement checked separately:
+    here |−0.6|/|−1.0| = 0.6 and |−0.55|/|−1.0| = 0.55, both >= 0.5, and the sign
+    holds at both lags -- so this is a surviving edge.
+    """
     panel = _build_small_panel(seed=42)
     lens = Lens(panel)
     feature = lens.feature("return_1")
@@ -476,8 +489,9 @@ def test_verdict_criterion_5_negative_lag_0_edge() -> None:
 
     c5_line = next((r for r in verdict.reasons if r.startswith("5.")), None)
     assert c5_line is not None
-    # Should FAIL because lag_0_edge is not > 0
-    assert "FAIL" in c5_line or "NOT_EVALUATED" in c5_line
+    assert "PASS" in c5_line, c5_line
+    assert "retention_1=0.600" in c5_line and "retention_2=0.550" in c5_line
+    assert "sign_holds_1=True" in c5_line and "sign_holds_2=True" in c5_line
 
 
 def test_verdict_criterion_5_weak_retention() -> None:

@@ -778,7 +778,7 @@ def test_backtest_breakeven_nan_no_trades_branch(monkeypatch, tmp_path) -> None:
         universe_mod, "load_universe", lambda name: Universe(name="ab", symbols=("A", "B"))
     )
     monkeypatch.setattr(
-        engine_mod, "run_backtest", lambda strat, panel, config, *, tradable=None: fake
+        engine_mod, "run_backtest", lambda strat, panel, config, *, tradable=None, **kwargs: fake
     )
     monkeypatch.setattr(settings_mod, "RESULTS_ROOT", tmp_path)
 
@@ -796,7 +796,7 @@ def test_backtest_latency_sensitivity_note_signal_dies(monkeypatch, tmp_path) ->
     session_dates = [datetime.date(2024, 1, 1), datetime.date(2024, 1, 2)]
     panel = _make_ohlcv_panel(session_dates, [3, 3])
 
-    def stub_run_backtest(strat, panel, config, *, tradable=None):
+    def stub_run_backtest(strat, panel, config, *, tradable=None, **kwargs):
         if config.decision_latency_bars == 0:
             return _fake_result(
                 n=3, gross=np.array([0.02, 0.015, 0.025]), net=np.array([0.02, 0.015, 0.025])
@@ -826,7 +826,7 @@ def test_backtest_latency_sensitivity_exception_branch(monkeypatch, tmp_path) ->
     session_dates = [datetime.date(2024, 1, 1), datetime.date(2024, 1, 2)]
     panel = _make_ohlcv_panel(session_dates, [3, 3])
 
-    def stub_run_backtest(strat, panel, config, *, tradable=None):
+    def stub_run_backtest(strat, panel, config, *, tradable=None, **kwargs):
         if config.decision_latency_bars != 0:
             raise RuntimeError("latency boom")
         return _fake_result(
@@ -865,7 +865,7 @@ def test_backtest_manifest_load_failure_is_nonfatal(monkeypatch, tmp_path) -> No
         universe_mod, "load_universe", lambda name: Universe(name="ab", symbols=("A", "B"))
     )
     monkeypatch.setattr(
-        engine_mod, "run_backtest", lambda strat, panel, config, *, tradable=None: fake
+        engine_mod, "run_backtest", lambda strat, panel, config, *, tradable=None, **kwargs: fake
     )
     monkeypatch.setattr(settings_mod, "RESULTS_ROOT", tmp_path)
     monkeypatch.setattr(
@@ -888,7 +888,7 @@ def test_backtest_engine_failure_fallback_record_succeeds(monkeypatch, tmp_path)
     session_dates = [datetime.date(2024, 1, 1), datetime.date(2024, 1, 2)]
     panel = _make_ohlcv_panel(session_dates, [3, 3])
 
-    def stub_run_backtest(strat, panel, config, *, tradable=None):
+    def stub_run_backtest(strat, panel, config, *, tradable=None, **kwargs):
         raise RuntimeError("engine boom")
 
     monkeypatch.setattr(panel_mod, "load_panel", lambda spec: panel)
@@ -913,7 +913,7 @@ def test_backtest_engine_failure_fallback_record_also_fails(monkeypatch, tmp_pat
     session_dates = [datetime.date(2024, 1, 1), datetime.date(2024, 1, 2)]
     panel = _make_ohlcv_panel(session_dates, [3, 3])
 
-    def stub_run_backtest(strat, panel, config, *, tradable=None):
+    def stub_run_backtest(strat, panel, config, *, tradable=None, **kwargs):
         raise RuntimeError("engine boom")
 
     monkeypatch.setattr(panel_mod, "load_panel", lambda spec: panel)
@@ -1295,7 +1295,7 @@ def test_walkforward_manifest_load_raises_nonfatal(monkeypatch, tmp_path) -> Non
         monkeypatch,
         tmp_path,
         panel,
-        lambda strat, panel, config, *, tradable=None: _fake_result(),
+        lambda strat, panel, config, *, tradable=None, **kwargs: _fake_result(),
     )
     result = runner.invoke(app, _walkforward_args())
     assert result.exit_code == 0
@@ -1308,7 +1308,7 @@ def test_walkforward_breakeven_warning_printed(monkeypatch, tmp_path) -> None:
         monkeypatch,
         tmp_path,
         panel,
-        lambda strat, panel, config, *, tradable=None: _fake_result(
+        lambda strat, panel, config, *, tradable=None, **kwargs: _fake_result(
             gross=np.full(3, -0.02, dtype=np.float64), turnover=np.full(3, 1.0, dtype=np.float64)
         ),
     )
@@ -1324,7 +1324,7 @@ def test_walkforward_breakeven_warning_not_printed(monkeypatch, tmp_path) -> Non
         monkeypatch,
         tmp_path,
         panel,
-        lambda strat, panel, config, *, tradable=None: _fake_result(
+        lambda strat, panel, config, *, tradable=None, **kwargs: _fake_result(
             gross=np.full(3, 0.05, dtype=np.float64), turnover=np.full(3, 1.0, dtype=np.float64)
         ),
     )
@@ -1336,7 +1336,7 @@ def test_walkforward_breakeven_warning_not_printed(monkeypatch, tmp_path) -> Non
 def test_walkforward_latency_signal_dies(monkeypatch, tmp_path) -> None:
     panel = _make_ohlcv_panel(ALL_DATES, [5] * len(ALL_DATES))
 
-    def _latency_stub(strat, panel, config, *, tradable=None):
+    def _latency_stub(strat, panel, config, *, tradable=None, **kwargs):
         lat = getattr(config, "decision_latency_bars", 0)
         if lat == 0:
             return _fake_result(
@@ -1387,7 +1387,7 @@ def test_walkforward_pooled_net_size_lt_2(monkeypatch, tmp_path) -> None:
         monkeypatch,
         tmp_path,
         panel,
-        lambda strat, panel, config, *, tradable=None: _fake_result(daily=_empty_daily()),
+        lambda strat, panel, config, *, tradable=None, **kwargs: _fake_result(daily=_empty_daily()),
     )
     result = runner.invoke(app, _walkforward_args())
     assert result.exit_code == 0
@@ -1396,7 +1396,7 @@ def test_walkforward_pooled_net_size_lt_2(monkeypatch, tmp_path) -> None:
 def test_walkforward_engine_raises_fallback_succeeds(monkeypatch, tmp_path) -> None:
     panel = _make_ohlcv_panel(ALL_DATES, [5] * len(ALL_DATES))
 
-    def _raise_engine(strat, panel, config, *, tradable=None):
+    def _raise_engine(strat, panel, config, *, tradable=None, **kwargs):
         raise RuntimeError("wf engine boom")
 
     _patch_walkforward_common(
@@ -1415,7 +1415,7 @@ def test_walkforward_engine_raises_fallback_fails(monkeypatch, tmp_path) -> None
 
     panel = _make_ohlcv_panel(ALL_DATES, [5] * len(ALL_DATES))
 
-    def _raise_engine(strat, panel, config, *, tradable=None):
+    def _raise_engine(strat, panel, config, *, tradable=None, **kwargs):
         raise RuntimeError("wf engine boom")
 
     _patch_walkforward_common(
@@ -1590,7 +1590,7 @@ def test_sweep_manifest_load_raises_nonfatal(monkeypatch, tmp_path) -> None:
         monkeypatch,
         tmp_path,
         panel,
-        run_backtest_stub=lambda strat, panel, cfg: _fake_result(),
+        run_backtest_stub=lambda strat, panel, cfg, **kwargs: _fake_result(),
     )
     monkeypatch.setattr(
         manifest_mod.Manifest,
@@ -1610,7 +1610,7 @@ def test_sweep_per_param_failure_records_and_continues(monkeypatch, tmp_path) ->
     panel = _make_ohlcv_panel(session_dates, [3, 3])
     config_path = _write_sweep_yaml(tmp_path, sweep_values=(2.0, 2.5))
 
-    def _stub(strat, panel, cfg):
+    def _stub(strat, panel, cfg, **kwargs):
         raise RuntimeError("param boom")
 
     _sweep_monkeypatch_set(monkeypatch, tmp_path, panel, run_backtest_stub=_stub)
@@ -1630,7 +1630,7 @@ def test_sweep_per_param_failure_record_also_raises(monkeypatch, tmp_path) -> No
     panel = _make_ohlcv_panel(session_dates, [3, 3])
     config_path = _write_sweep_yaml(tmp_path, sweep_values=(2.0, 2.5))
 
-    def _stub(strat, panel, cfg):
+    def _stub(strat, panel, cfg, **kwargs):
         raise RuntimeError("param boom")
 
     _sweep_monkeypatch_set(monkeypatch, tmp_path, panel, run_backtest_stub=_stub)
@@ -1658,7 +1658,7 @@ def test_sweep_outer_exception_fails(monkeypatch, tmp_path) -> None:
         monkeypatch,
         tmp_path,
         panel,
-        run_backtest_stub=lambda strat, panel, cfg: _fake_result(),
+        run_backtest_stub=lambda strat, panel, cfg, **kwargs: _fake_result(),
     )
     monkeypatch.setattr(
         universe_mod,

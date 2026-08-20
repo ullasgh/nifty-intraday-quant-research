@@ -21,6 +21,7 @@ import nifty_quant.strategy.plugins  # noqa: F401
 from nifty_quant.backtest.engine import BacktestConfig, BacktestResult, run_backtest
 from nifty_quant.backtest.metrics import sharpe_ratio
 from nifty_quant.strategy import registry
+from tests.contract_fixtures import minimal_contract
 
 from .test_causality import _load_strategy, build_irregular_panel
 
@@ -157,7 +158,7 @@ def test_relaxing_selectivity_knob_moves_toward_noise(name: str) -> None:
     # symbol per day) enough sessions to clear MIN_TRADES_FOR_SENSITIVITY on both the baseline
     # and the relaxed run; verified empirically against this exact seed.
     panel = build_irregular_panel(n_repeats=3)
-    baseline_result = run_backtest(baseline_strategy, panel, config)
+    baseline_result = run_backtest(baseline_strategy, panel, config, contract=minimal_contract())
     p0 = baseline_strategy.params
 
     tested_any = False
@@ -189,7 +190,7 @@ def test_relaxing_selectivity_knob_moves_toward_noise(name: str) -> None:
             if perturbed is None:
                 continue
             direction_results[direction] = run_backtest(
-                strategy_cls(params=perturbed), panel, config
+                strategy_cls(params=perturbed), panel, config, contract=minimal_contract()
             )
 
         if not direction_results:

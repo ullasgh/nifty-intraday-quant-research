@@ -28,6 +28,7 @@ from nifty_quant.strategy.base import (
     Strategy,
     TargetPortfolio,
 )
+from tests.contract_fixtures import minimal_contract
 
 SYMBOLS = ("AAA", "BBB", "CCC")
 N_DAYS = 5
@@ -236,7 +237,7 @@ def test_trade_recording_with_nan_fill_price() -> None:
         fill_model=FillModel(slippage=ZeroSlippage()),
     )
 
-    result = run_backtest(strategy, panel, config)
+    result = run_backtest(strategy, panel, config, contract=minimal_contract())
 
     # The trade should have been rejected at row 5 due to NaN open
     # but the backtest should not crash
@@ -300,7 +301,7 @@ def test_intrabar_stop_long_position_fills_at_low() -> None:
         fill_model=FillModel(slippage=ZeroSlippage()),
     )
 
-    result = run_backtest(strategy, panel, config)
+    result = run_backtest(strategy, panel, config, contract=minimal_contract())
 
     # Should have executed the stop-loss (or rejected if not tradable)
     assert isinstance(result.trades, pd.DataFrame)
@@ -401,7 +402,7 @@ def test_intrabar_stop_short_position_fills_at_high() -> None:
         fill_model=FillModel(slippage=ZeroSlippage()),
     )
 
-    result = run_backtest(strategy, panel, config)
+    result = run_backtest(strategy, panel, config, contract=minimal_contract())
 
     assert isinstance(result.trades, pd.DataFrame)
     symbol_0_trades = result.trades[result.trades["symbol"] == "AAA"]
@@ -461,7 +462,7 @@ def test_stop_order_with_non_finite_open_uses_stop_price() -> None:
         fill_model=FillModel(slippage=ZeroSlippage()),
     )
 
-    result = run_backtest(strategy, panel, config)
+    result = run_backtest(strategy, panel, config, contract=minimal_contract())
 
     # Backtest should not crash even with NaN open
     assert isinstance(result.trades, pd.DataFrame)
@@ -527,7 +528,7 @@ def test_pending_order_fill_row_collision_executes_as_sum() -> None:
         fill_model=FillModel(slippage=ZeroSlippage()),
     )
 
-    result = run_backtest(strategy, panel, config)
+    result = run_backtest(strategy, panel, config, contract=minimal_contract())
 
     collision_row = int(day_offsets[0]) + 366
     collision_ts = int(ts[collision_row])
@@ -588,7 +589,7 @@ def test_square_off_queued_direct_fill_on_last_row() -> None:
         fill_model=FillModel(slippage=ZeroSlippage()),
     )
 
-    result = run_backtest(strategy, panel, config)
+    result = run_backtest(strategy, panel, config, contract=minimal_contract())
 
     # All positions should be square off by session end
     assert result.positions[-1, 0] == 0.0
@@ -656,7 +657,7 @@ def test_eod_liquidation_uses_delivery_costs() -> None:
         fill_model=FillModel(slippage=ZeroSlippage()),
     )
 
-    result = run_backtest(strategy, panel, config)
+    result = run_backtest(strategy, panel, config, contract=minimal_contract())
 
     assert result.forced_eod_liquidation_days == 0
     assert result.positions[-1, 0] == 0.0
@@ -685,7 +686,9 @@ def test_eod_liquidation_uses_delivery_costs() -> None:
             cost_model=cost_model,
             fill_model=FillModel(slippage=ZeroSlippage()),
         )
-        forced_result = run_backtest(forced_strategy, thin_panel, forced_config)
+        forced_result = run_backtest(
+            forced_strategy, thin_panel, forced_config, contract=minimal_contract()
+        )
 
         assert forced_result.forced_eod_liquidation_days >= 1
         forced_trades = forced_result.trades[
@@ -759,7 +762,7 @@ def test_square_off_queued_not_on_last_row() -> None:
         fill_model=FillModel(slippage=ZeroSlippage()),
     )
 
-    result = run_backtest(strategy, panel, config)
+    result = run_backtest(strategy, panel, config, contract=minimal_contract())
 
     # Positions should become zero after square_off_time
     # but due to queued execution, they may persist until the next bar

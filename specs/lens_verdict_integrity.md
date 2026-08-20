@@ -159,3 +159,72 @@ It stays, as a permanent regression test: once L3 is fixed to compute retention 
 partial fix that accepts sign flips would newly break it. A test that is green for the wrong reason
 today but guards the right thing tomorrow is worth keeping — provided the reason is written down,
 which it now is.
+
+---
+
+# AMENDMENT 2 — 2026-08-20. The L1 defect was defended by TEN tests, not one.
+
+The implementer reported that `tests/test_lens.py:819-836` is not alone: **ten** tests in that file
+assert the L1 behaviour as intended. The root cause is a fixture property, and it is worse than a
+count of ten suggests.
+
+## What was actually happening
+
+`_call_verdict`'s defaults leave `strategy_returns=None`, so criterion 6 is NOT_EVALUATED. And
+`_build_panel` places every session in January of one year, so criterion 7 (which needs two
+complete years) is NOT_EVALUATED too.
+
+**So every "PASS" fixture in `test_lens.py` was really INCONCLUSIVE — two of seven criteria never
+ran — and asserted `survived is True` anyway, which the dropped-conjunction bug obligingly
+returned.** The file's `test_verdict_criterion_{1..6}[PASS]` cases were not testing that a
+hypothesis passes seven criteria. They were testing that it passes five and that two vanish.
+
+That is the defect and its defence in one place: the bug made the fixtures look correct, and the
+fixtures made the bug look intended.
+
+## Adjudication (lead): STRENGTHEN the fixtures, do not weaken the assertions
+
+The tempting fix is to change the ten assertions to expect `INCONCLUSIVE`. **Do not.** That would
+enshrine an under-powered fixture as the contract and lose the only tests covering a genuine
+seven-of-seven pass.
+
+Required instead:
+- `_call_verdict` supplies `strategy_returns` and a real `effective_n_trials` so criterion 6
+  EVALUATES.
+- `_build_panel` spans at least two complete calendar years so criterion 7 EVALUATES.
+- The ten tests then legitimately assert `survived is True` / `outcome == "SURVIVED"`, and they
+  mean it for the first time.
+
+`test_construction_wiring_explicit_universe_and_cost_model` (`:226-238`) is separate: it asserts
+`lens.panel is panel` and `lens.symbols == panel.symbols` while passing a restricted
+`universe=("S01","S04")`. That is the L4 defect asserted as intended behaviour. Rewrite it to
+assert the restriction DID take effect.
+
+## The `min_names = 5` trap, third occurrence
+
+Four failures in the new suites are not defects in the implementation. `cross_sectional_rank`
+enforces `min_names = 5` (`features/core.py:472`); with fewer symbols it returns all-NaN, every
+criterion degrades to FAIL, and the verdict is KILLED regardless of whether the L1 fix is correct.
+Suite A's `_build_test_panel()` uses 3 symbols, and its obligation-9 restricted universe is 3
+symbols.
+
+This is the THIRD time this trap has been hit today (twice in `specs/overlap_se.md`, now here). It
+is a property of the repo, not of any one spec.
+
+**Required of both suites: every fixture that reaches `cross_sectional_rank` uses >= 5 symbols, and
+a restricted universe used to demonstrate L4 must ALSO retain >= 5 symbols** — otherwise the
+comparison is "a working answer versus no answer", not "a different answer", and it proves nothing
+about restriction.
+
+## `n_total` is a row count, not a symbol count
+
+Suite B's obligation 9 asserts `n_total` strictly decreases when the universe is restricted. It does
+not, by design: `n_total = fwd.n_defined` counts ROWS with any finite value
+(`expectancy.py:33-34, 95`), so dropping one of five always-present symbols leaves it unchanged.
+That is correct behaviour being asserted wrongly.
+
+Assert on **`n_symbols_used`** instead — the field this spec adds for exactly this purpose.
+
+Note the good half of that same test already passes: `spread_bps` DOES differ between full and
+restricted universes, which confirms L4's fix works. The test was right about the effect and wrong
+about the instrument.

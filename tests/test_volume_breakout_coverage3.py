@@ -27,6 +27,7 @@ from nifty_quant.strategy.plugins.volume_breakout import (
     _edge_trigger,
     _volume_breakout_core,
 )
+from tests.contract_fixtures import minimal_contract
 
 _IST = ZoneInfo("Asia/Kolkata")
 
@@ -268,7 +269,7 @@ def test_gross_weight_clipping_exact_boundary() -> None:
         fill_model=FillModel(slippage=ZeroSlippage()),
     )
 
-    result = run_backtest(strategy, panel, config)
+    result = run_backtest(strategy, panel, config, contract=minimal_contract())
 
     # Check that all portfolio weights sum to <= gross (within tolerance)
     # The engine uses the weights returned by on_decision
@@ -307,7 +308,7 @@ def test_cooldown_state_machine_blocks_reentry() -> None:
         fill_model=FillModel(slippage=ZeroSlippage()),
     )
 
-    result = run_backtest(strategy, panel, config)
+    result = run_backtest(strategy, panel, config, contract=minimal_contract())
 
     # Backtest exercises the state machine through multiple bars
     # Trades should show entries, holds, exits, and cooldown gaps
@@ -351,7 +352,7 @@ def test_cooldown_counts_down_correctly() -> None:
         fill_model=FillModel(slippage=ZeroSlippage()),
     )
 
-    result = run_backtest(strategy, panel, config)
+    result = run_backtest(strategy, panel, config, contract=minimal_contract())
 
     # Backtest runs through the entire panel, cycling through bars
     # The cooldown_remaining dict should be decremented as expected
@@ -388,7 +389,7 @@ def test_cooldown_long_vs_short_side_tracking() -> None:
         fill_model=FillModel(slippage=ZeroSlippage()),
     )
 
-    result = run_backtest(strategy, panel, config)
+    result = run_backtest(strategy, panel, config, contract=minimal_contract())
 
     # After exiting a long position, cooldown_side should be 1
     # After exiting a short position, cooldown_side should be -1
@@ -427,7 +428,7 @@ def test_state_reinit_on_symbol_set_change() -> None:
         fill_model=FillModel(slippage=ZeroSlippage()),
     )
 
-    run_backtest(strategy, panel, config)
+    run_backtest(strategy, panel, config, contract=minimal_contract())
 
     # State dicts should be initialized after first on_decision call
     assert strategy._bars_in_position is not None
@@ -469,7 +470,7 @@ def test_exit_mode_dispatch_branches() -> None:
             fill_model=FillModel(slippage=ZeroSlippage()),
         )
 
-        result = run_backtest(strategy, panel, config)
+        result = run_backtest(strategy, panel, config, contract=minimal_contract())
         assert isinstance(result.trades, pd.DataFrame)
 
 
@@ -503,7 +504,7 @@ def test_exit_mode_opposite_signal() -> None:
         fill_model=FillModel(slippage=ZeroSlippage()),
     )
 
-    result = run_backtest(strategy, panel, config)
+    result = run_backtest(strategy, panel, config, contract=minimal_contract())
 
     # Trades should reflect exits triggered by opposite signals, not time
     assert isinstance(result.trades, pd.DataFrame)
@@ -539,7 +540,7 @@ def test_exit_mode_stop_target_fallback() -> None:
         fill_model=FillModel(slippage=ZeroSlippage()),
     )
 
-    result = run_backtest(strategy, panel, config)
+    result = run_backtest(strategy, panel, config, contract=minimal_contract())
 
     # Exits should occur after hold_bars, similar to "time" mode
     assert isinstance(result.trades, pd.DataFrame)

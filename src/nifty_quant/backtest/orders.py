@@ -41,8 +41,13 @@ class PendingOrder:
 
     ``intent`` is restricted in practice to ``OrderIntent.ENTRY`` or
     ``OrderIntent.EOD_EXIT`` -- see module docstring.
+
+    ``order_id`` (spec ``tca_record.md`` AMENDMENT 1 item 2): a monotonically
+    increasing int64 assigned at order creation (when this ``PendingOrder`` is
+    built), stable across every fill row the order produces.
     """
 
     intent: OrderIntent
     shares: np.ndarray  # float64, length n_symbols, signed
     queued_row: int
+    order_id: int

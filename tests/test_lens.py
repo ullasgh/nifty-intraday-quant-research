@@ -28,6 +28,24 @@ _ALL_SIGNAL_YEARS = set(_ALL_YEARS)
 _PASS_LATENCY = {0: 1.0, 1: 0.6, 2: 0.55}
 _FAIL_LATENCY = {0: 1.0, 1: 0.6, 2: 0.4}
 
+# AMENDMENT 2 (specs/lens_verdict_integrity.md): criterion 7 needs at least two
+# COMPLETE calendar years (all 12 months present), which `_build_panel`'s plain
+# "N sessions in January" date grid can never produce regardless of how many
+# distinct years it spans. These two years get one session per month instead
+# (see `full_year_span` on `_build_panel`) so criterion 7 actually evaluates.
+_FULL_YEAR_COMPLETE_YEARS: frozenset[int] = frozenset({2024, 2025})
+_FULL_YEAR_SESSIONS_PER_YEAR: dict[int, int] = {
+    year: (12 if year in _FULL_YEAR_COMPLETE_YEARS else 2) for year in _ALL_YEARS
+}
+
+# AMENDMENT 2: deterministic strategy_returns for criterion 6 (deflated Sharpe).
+# sr0 = expected_max_sharpe(2, var_trial_sharpes=1.0) ~= 0.5198; this array's
+# raw per-period SR is ~= 4.3, so deflated_sharpe saturates to 1.0 -- well
+# above DSR_SIGNIFICANCE=0.95 -- deterministically (fixed seed), not by luck.
+_PASS_STRATEGY_RETURNS: np.ndarray = np.random.default_rng(0).normal(
+    0.002, 0.0006, size=60
+)
+
 
 def _session_grid(
     dates: list[dt.date], bars_per_session: int
@@ -47,8 +65,10 @@ def _session_grid(
     return ts, day_offsets, dates_arr
 
 
-def _signal_means(effect: float) -> np.ndarray:
-    return np.array([-effect, -effect / 2.0, 0.0, effect / 2.0, effect], dtype=np.float64)
+def _signal_means(effect: float, n_symbols: int = _N_SYMBOLS) -> np.ndarray:
+    # linspace(-effect, effect, 5) == [-effect, -effect/2, 0, effect/2, effect],
+    # i.e. this is an exact generalization of the original 5-symbol literal.
+    return np.linspace(-effect, effect, n_symbols, dtype=np.float64)
 
 
 def _close_prices_from_log_returns(returns: np.ndarray) -> np.ndarray:
@@ -70,9 +90,27 @@ def _build_panel(
     effect_window_bars: tuple[int, int] | None = None,
     volume_profile: tuple[float, ...] = _DEFAULT_VOLUME,
     seed: int = 0,
+    symbols: tuple[str, ...] = _SYMBOLS,
+    full_year_span: frozenset[int] | set[int] | None = None,
 ) -> Panel:
+    """Build a synthetic Panel fixture.
+
+    `full_year_span` (AMENDMENT 2, specs/lens_verdict_integrity.md): a set of
+    years for which sessions are placed one-per-month (12 sessions required for
+    that year) instead of consecutive January days, so criterion 7's
+    "two complete calendar years" check can actually evaluate. Years not in
+    this set keep the original January-only placement -- existing callers that
+    never pass `full_year_span` get byte-identical dates to before this change.
+    """
     if signal_years is None:
         signal_years = set(years)
+
+    n_symbols = len(symbols)
+    if len(volume_profile) != n_symbols:
+        raise ValueError(
+            f"volume_profile has {len(volume_profile)} entries, expected "
+            f"{n_symbols} to match symbols"
+        )
 
     if isinstance(sessions_per_year, int):
         year_sessions = {year: sessions_per_year for year in years}
@@ -81,31 +119,41 @@ def _build_panel(
 
     dates: list[dt.date] = []
     for year in years:
-        for session_idx in range(year_sessions[year]):
-            dates.append(dt.date(year, 1, 2 + session_idx))
+        n_sessions = year_sessions[year]
+        if full_year_span and year in full_year_span:
+            if n_sessions != 12:
+                raise ValueError(
+                    f"full_year_span requires exactly 12 sessions for year "
+                    f"{year} (one per month), got {n_sessions}"
+                )
+            for month in range(1, 13):
+                dates.append(dt.date(year, month, 2))
+        else:
+            for session_idx in range(n_sessions):
+                dates.append(dt.date(year, 1, 2 + session_idx))
 
     n_rows = len(dates) * bars_per_session
     rng = np.random.default_rng(seed)
-    returns = np.zeros((n_rows, _N_SYMBOLS), dtype=np.float64)
+    returns = np.zeros((n_rows, n_symbols), dtype=np.float64)
 
     row = 0
     for date in dates:
         year = date.year
         if year in signal_years:
-            means = _signal_means(effect)
+            means = _signal_means(effect, n_symbols)
             if effect_window_bars is None:
                 block_means = np.tile(means, (bars_per_session, 1))
             else:
                 start, end = effect_window_bars
-                block_means = np.zeros((bars_per_session, _N_SYMBOLS), dtype=np.float64)
+                block_means = np.zeros((bars_per_session, n_symbols), dtype=np.float64)
                 if end > start:
                     block_means[start:end, :] = means
             block_sigma = sigma
         else:
-            block_means = np.zeros((bars_per_session, _N_SYMBOLS), dtype=np.float64)
+            block_means = np.zeros((bars_per_session, n_symbols), dtype=np.float64)
             block_sigma = flat_sigma
 
-        noise = rng.normal(0.0, block_sigma, size=(bars_per_session, _N_SYMBOLS))
+        noise = rng.normal(0.0, block_sigma, size=(bars_per_session, n_symbols))
         returns[row : row + bars_per_session] = block_means + noise
         row += bars_per_session
 
@@ -115,7 +163,7 @@ def _build_panel(
     ts, day_offsets, dates_arr = _session_grid(dates, bars_per_session)
     return Panel(
         fields={"close": close.astype(np.float32), "volume": volume.astype(np.float32)},
-        symbols=_SYMBOLS,
+        symbols=symbols,
         ts=ts,
         day_offsets=day_offsets,
         dates=dates_arr,
@@ -144,8 +192,13 @@ def _call_verdict(
     hypothesis_id: str = "H001_close_reversion",
     *,
     latency_profile: dict[int, float] | None = _PASS_LATENCY,
-    effective_n_trials: int = 1,
-    strategy_returns: np.ndarray | None = None,
+    # AMENDMENT 2: default to a real, PASS-producing criterion-6 evaluation
+    # (real effective_n_trials + real strategy_returns) instead of the old
+    # effective_n_trials=1/strategy_returns=None combination that always left
+    # criterion 6 NOT_EVALUATED. Callers exercising criterion 6 directly still
+    # override both explicitly.
+    effective_n_trials: int = 2,
+    strategy_returns: np.ndarray | None = _PASS_STRATEGY_RETURNS,
     seed: int = 0,
     horizon: int = 1,
 ) -> HypothesisVerdict:
@@ -195,12 +248,13 @@ def _assert_bucket_equal(
 def _all_pass_panel(seed: int = 0) -> Panel:
     return _build_panel(
         _ALL_YEARS,
-        sessions_per_year=2,
+        sessions_per_year=_FULL_YEAR_SESSIONS_PER_YEAR,
         bars_per_session=240,
         signal_years=_ALL_SIGNAL_YEARS,
         effect=0.01,
         sigma=0.0005,
         seed=seed,
+        full_year_span=_FULL_YEAR_COMPLETE_YEARS,
     )
 
 
@@ -224,18 +278,53 @@ def _make_killed_verdict() -> HypothesisVerdict:
 
 
 def test_construction_wiring_explicit_universe_and_cost_model() -> None:
-    panel = _build_small_panel(seed=0)
+    # AMENDMENT 2 (specs/lens_verdict_integrity.md): the original version of
+    # this test asserted `lens.panel is panel` and `lens.symbols ==
+    # panel.symbols` while passing a restricted `universe` -- i.e. it asserted
+    # that restriction had NO effect, which is the L4 defect as intended
+    # behaviour. Rewritten to assert restriction DID take effect, using >= 5
+    # symbols in both the full (8) and restricted (5) sets per the min_names=5
+    # trap (cross_sectional_rank silently returns all-NaN below 5 names).
+    full_symbols = tuple(f"S{i:02d}" for i in range(8))
+    restricted_universe = tuple(f"S{i:02d}" for i in (1, 2, 3, 4, 5))
+    volume_profile = tuple(1e4 for _ in range(8))
+    panel = _build_panel(
+        (2024,),
+        sessions_per_year=5,
+        bars_per_session=30,
+        signal_years={2024},
+        effect=0.01,
+        sigma=0.0005,
+        seed=0,
+        symbols=full_symbols,
+        volume_profile=volume_profile,
+    )
     cost_model = NSEIntradayEquityCosts(brokerage_flat=15.0)
-    universe = ("S01", "S04")
-    lens = Lens(panel, universe=universe, cost_model=cost_model, seed=42)
+    lens_full = Lens(panel, cost_model=cost_model, seed=42)
+    lens_restricted = Lens(panel, universe=restricted_universe, cost_model=cost_model, seed=42)
 
-    assert lens.panel is panel
-    assert np.array_equal(lens.day_offsets, panel.day_offsets)
-    assert lens.seed == 42
-    assert lens.symbols == panel.symbols
-    assert lens.cost_model is cost_model
-    assert lens.universe == universe
-    assert np.array_equal(lens.minute_of_day, panel.minute_of_day())
+    # Restriction happened once at construction (L4): the restricted Lens no
+    # longer holds the original unrestricted panel, and its recorded symbol
+    # count and universe reflect the restriction.
+    assert lens_restricted.panel is not panel
+    assert lens_restricted.n_symbols_used == 5
+    assert lens_full.n_symbols_used == 8
+    assert lens_restricted.symbols == restricted_universe
+    assert lens_restricted.universe == restricted_universe
+    assert lens_restricted.seed == 42
+    assert lens_restricted.cost_model is cost_model
+    # Row/day structure is unaffected by a symbol-axis restriction.
+    assert np.array_equal(lens_restricted.day_offsets, panel.day_offsets)
+    assert np.array_equal(lens_restricted.minute_of_day, panel.minute_of_day())
+
+    # The restriction is not merely recorded, it visibly changes the computed
+    # answer: excluding S00, S06, S07 (which carry the most extreme signal
+    # means) from the top/bottom quintile buckets changes spread_bps. A test
+    # that passed whether or not restriction happened would prove nothing.
+    kwargs = dict(method="cross_sectional_rank", n_buckets=5, n_boot=100)
+    table_full = lens_full.expectancy("return_1", 1, **kwargs)
+    table_restricted = lens_restricted.expectancy("return_1", 1, **kwargs)
+    assert table_full.spread_bps != table_restricted.spread_bps
 
 
 def test_construction_defaults_universe_cost_model_seed() -> None:
@@ -609,31 +698,39 @@ def test_stability_thin_year_included_without_raising() -> None:
 def test_verdict_criterion_1_edge_vs_costs(
     panel_kwargs: dict[str, float], expected_token: str
 ) -> None:
+    # AMENDMENT 2: full_year_span + _call_verdict's new defaults make criteria
+    # 6 and 7 genuinely evaluate, so the PASS case is a real seven-of-seven
+    # SURVIVED rather than a five-of-seven verdict with two criteria silently
+    # dropped (specs/lens_verdict_integrity.md AMENDMENT 2).
     panel = _build_panel(
         _ALL_YEARS,
-        sessions_per_year=2,
+        sessions_per_year=_FULL_YEAR_SESSIONS_PER_YEAR,
         bars_per_session=240,
         signal_years=_ALL_SIGNAL_YEARS,
+        full_year_span=_FULL_YEAR_COMPLETE_YEARS,
         **panel_kwargs,
     )
     verdict = _call_verdict(panel)
 
     assert expected_token in verdict.reasons[0]
     assert verdict.survived is (expected_token == "PASS")
+    assert verdict.outcome == ("SURVIVED" if expected_token == "PASS" else "KILLED")
 
 
 @pytest.mark.parametrize(
-    "years, sessions_per_year, signal_years, expected_token",
+    "years, sessions_per_year, signal_years, full_year_span, expected_token",
     [
-        (_ALL_YEARS, 2, _ALL_SIGNAL_YEARS, "PASS"),
-        ((2024,), 2, {2024}, "FAIL"),
+        (_ALL_YEARS, _FULL_YEAR_SESSIONS_PER_YEAR, _ALL_SIGNAL_YEARS,
+         _FULL_YEAR_COMPLETE_YEARS, "PASS"),
+        ((2024,), 2, {2024}, frozenset(), "FAIL"),
     ],
     ids=["PASS", "FAIL"],
 )
 def test_verdict_criterion_2_sign_stability(
     years: tuple[int, ...],
-    sessions_per_year: int,
+    sessions_per_year: int | dict[int, int],
     signal_years: set[int],
+    full_year_span: frozenset[int],
     expected_token: str,
 ) -> None:
     panel = _build_panel(
@@ -643,11 +740,13 @@ def test_verdict_criterion_2_sign_stability(
         signal_years=signal_years,
         effect=0.01,
         sigma=0.0005,
+        full_year_span=full_year_span,
     )
     verdict = _call_verdict(panel)
 
     assert expected_token in verdict.reasons[1]
     assert verdict.survived is (expected_token == "PASS")
+    assert verdict.outcome == ("SURVIVED" if expected_token == "PASS" else "KILLED")
 
 
 @pytest.mark.parametrize(
@@ -667,20 +766,26 @@ def test_verdict_criterion_3_overlap_correction(
     # "uncorrected". The FAIL case has zero injected effect (not merely a smaller one),
     # since a real edge tends to stay significant even after correction: mean forward
     # return grows linearly with horizon while its noise only grows as sqrt(horizon),
-    # so a genuine edge's t-stat rises with horizon rather than falling. Measured
-    # (seed=0): spread_t=-0.339, spread_bps=-0.280, survived=False.
+    # so a genuine edge's t-stat rises with horizon rather than falling. The
+    # exact spread_t/spread_bps this comment historically quoted are no longer
+    # reproduced here verbatim: AMENDMENT 2's full_year_span changes the date
+    # grid (and therefore the row count) so criteria 6/7 evaluate, which
+    # shifts those exact figures without changing the FAIL outcome they
+    # supported.
     panel = _build_panel(
         _ALL_YEARS,
-        sessions_per_year=2,
+        sessions_per_year=_FULL_YEAR_SESSIONS_PER_YEAR,
         bars_per_session=240,
         signal_years=_ALL_SIGNAL_YEARS,
         effect=effect,
         sigma=sigma,
+        full_year_span=_FULL_YEAR_COMPLETE_YEARS,
     )
     verdict = _call_verdict(panel, horizon=10)
 
     assert expected_token in verdict.reasons[2]
     assert verdict.survived is (expected_token == "PASS")
+    assert verdict.outcome == ("SURVIVED" if expected_token == "PASS" else "KILLED")
 
 
 @pytest.mark.parametrize(
@@ -696,17 +801,19 @@ def test_verdict_criterion_4_concentration(
 ) -> None:
     panel = _build_panel(
         _ALL_YEARS,
-        sessions_per_year=2,
+        sessions_per_year=_FULL_YEAR_SESSIONS_PER_YEAR,
         bars_per_session=240,
         signal_years=_ALL_SIGNAL_YEARS,
         effect=0.01,
         sigma=0.0005,
         effect_window_bars=effect_window,
+        full_year_span=_FULL_YEAR_COMPLETE_YEARS,
     )
     verdict = _call_verdict(panel)
 
     assert expected_token in verdict.reasons[3]
     assert verdict.survived is (expected_token == "PASS")
+    assert verdict.outcome == ("SURVIVED" if expected_token == "PASS" else "KILLED")
 
 
 @pytest.mark.parametrize(
@@ -725,6 +832,7 @@ def test_verdict_criterion_5_latency_profile(
 
     assert expected_token in verdict.reasons[4]
     assert verdict.survived is (expected_token == "PASS")
+    assert verdict.outcome == ("SURVIVED" if expected_token == "PASS" else "KILLED")
 
 
 @pytest.mark.parametrize(
@@ -749,11 +857,12 @@ def test_verdict_criterion_6_deflated_sharpe(
     against fwd.values as the old (buggy) test did.
 
     effect/sigma are unchanged from the original test's panel, so criteria
-    1-5 still all PASS on their own; criterion 7 is NOT_EVALUATED on
-    _build_panel's January-only 2-session/year date grid regardless of which
-    branch runs (see this module's docstring landmine on `_all_pass_panel`,
-    which applies identically here since `_build_panel` places every session
-    in January), so it never blocks `survived`.
+    1-5 still all PASS on their own. AMENDMENT 2 (specs/lens_verdict_
+    integrity.md): criterion 7 now ALSO evaluates via `full_year_span` --
+    under the corrected tri-state contract a NOT_EVALUATED criterion no
+    longer vanishes from the conjunction, so leaving criterion 7 unevaluated
+    here (as the January-only grid used to do) would make `verdict.survived`
+    INCONCLUSIVE-false rather than a real PASS/FAIL comparison on criterion 6.
 
     Measured directly against `deflated_sharpe`/`expected_max_sharpe`
     (nifty_quant.backtest.metrics, both pre-existing/untouched):
@@ -767,11 +876,12 @@ def test_verdict_criterion_6_deflated_sharpe(
     """
     panel = _build_panel(
         _ALL_YEARS,
-        sessions_per_year=2,
+        sessions_per_year=_FULL_YEAR_SESSIONS_PER_YEAR,
         bars_per_session=240,
         signal_years=_ALL_SIGNAL_YEARS,
         effect=0.005,
         sigma=0.010,
+        full_year_span=_FULL_YEAR_COMPLETE_YEARS,
     )
     strategy_returns = np.random.default_rng(seed).normal(mean, 0.001, size=500)
     verdict = _call_verdict(
@@ -780,6 +890,7 @@ def test_verdict_criterion_6_deflated_sharpe(
 
     assert expected_token in verdict.reasons[5]
     assert verdict.survived is (expected_token == "PASS")
+    assert verdict.outcome == ("SURVIVED" if expected_token == "PASS" else "KILLED")
 
 
 def test_verdict_reports_all_criteria_even_multiple_fail() -> None:
@@ -817,6 +928,14 @@ def test_verdict_reports_all_criteria_even_multiple_fail() -> None:
 
 
 def test_verdict_criterion5_not_evaluated_without_latency_profile() -> None:
+    # AMENDMENT 2 (specs/lens_verdict_integrity.md): this is the L1 regression
+    # test. This call deliberately omits BOTH latency_profile (criterion 5)
+    # and strategy_returns (criterion 6, since it calls lens.verdict directly
+    # rather than through _call_verdict) -- criteria 1-4 and 7 still PASS on
+    # `_all_pass_panel`. Under the corrected tri-state contract, one or more
+    # NOT_EVALUATED criteria with no FAIL is INCONCLUSIVE, and
+    # `survived is False`, never True: an incomplete evaluation must never
+    # read as a pass.
     panel = _all_pass_panel()
     lens = Lens(panel)
 
@@ -833,18 +952,27 @@ def test_verdict_criterion5_not_evaluated_without_latency_profile() -> None:
 
     assert "NOT_EVALUATED" in verdict.reasons[4]
     assert "PASS" not in verdict.reasons[4]
-    assert verdict.survived is True
+    assert "NOT_EVALUATED" in verdict.reasons[5]
+    assert verdict.outcome == "INCONCLUSIVE"
+    assert verdict.survived is False
 
 
 def test_verdict_all_evaluated_pass_and_flip_one_criterion() -> None:
+    # AMENDMENT 2: no longer overrides effective_n_trials=1 (which forced
+    # criterion 6 to NOT_EVALUATED) -- both calls now use _call_verdict's
+    # default (effective_n_trials=2, real strategy_returns), so pass_verdict
+    # is a genuine seven-of-seven SURVIVED, not five PASSes with two criteria
+    # silently dropped.
     panel = _all_pass_panel()
 
-    pass_verdict = _call_verdict(panel, latency_profile=_PASS_LATENCY, effective_n_trials=1)
+    pass_verdict = _call_verdict(panel, latency_profile=_PASS_LATENCY)
     assert pass_verdict.survived is True
+    assert pass_verdict.outcome == "SURVIVED"
     assert "PASS" in pass_verdict.reasons[4]
 
-    flip_verdict = _call_verdict(panel, latency_profile=_FAIL_LATENCY, effective_n_trials=1)
+    flip_verdict = _call_verdict(panel, latency_profile=_FAIL_LATENCY)
     assert flip_verdict.survived is False
+    assert flip_verdict.outcome == "KILLED"
     assert "FAIL" in flip_verdict.reasons[4]
 
 
@@ -878,11 +1006,17 @@ def test_explain_contains_hypothesis_id() -> None:
 
 
 def test_markdown_survived_and_killed_tokens() -> None:
+    # AMENDMENT 2: _make_all_pass_verdict now goes through a genuinely
+    # seven-of-seven-evaluated verdict (full_year_span + real strategy_returns
+    # via _call_verdict's defaults), so this is a real SURVIVED, not a
+    # five-of-seven verdict that happened to render "SURVIVED".
     passed_verdict = _make_all_pass_verdict()
+    assert passed_verdict.outcome == "SURVIVED"
     passed_markdown = passed_verdict.to_markdown()
     assert "SURVIVED" in passed_markdown
 
     killed_verdict = _make_killed_verdict()
+    assert killed_verdict.outcome == "KILLED"
     killed_markdown = killed_verdict.to_markdown()
     assert "KILLED" in killed_markdown
     assert "SURVIVED" not in killed_markdown

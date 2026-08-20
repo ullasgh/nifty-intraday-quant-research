@@ -22,6 +22,7 @@ from nifty_quant.strategy.plugins.volume_breakout import (
     VolumeBreakoutParams,
     VolumeBreakoutStrategy,
 )
+from tests.contract_fixtures import minimal_contract
 
 _IST = ZoneInfo("Asia/Kolkata")
 
@@ -172,7 +173,7 @@ def test_cooldown_same_side_suppression_long() -> None:
         fill_model=FillModel(slippage=ZeroSlippage()),
     )
 
-    result = run_backtest(strategy, panel, config)
+    result = run_backtest(strategy, panel, config, contract=minimal_contract())
 
     # The cooldown suppression should be reflected in fewer trades or delayed entry
     assert isinstance(result.trades, pd.DataFrame)
@@ -212,7 +213,7 @@ def test_cooldown_same_side_suppression_short() -> None:
         fill_model=FillModel(slippage=ZeroSlippage()),
     )
 
-    result = run_backtest(strategy, panel, config)
+    result = run_backtest(strategy, panel, config, contract=minimal_contract())
 
     # Verify the backtest completes; state machine transitions prevent re-entry
     assert isinstance(result.trades, pd.DataFrame)
@@ -279,7 +280,7 @@ def test_exit_mode_stop_target_abs_sum_clipping() -> None:
         fill_model=FillModel(slippage=ZeroSlippage()),
     )
 
-    result = run_backtest(strategy, panel, config)
+    result = run_backtest(strategy, panel, config, contract=minimal_contract())
 
     # With low gross, positions should be clipped to respect gross weight limit
     if len(result.trades) > 0:
@@ -323,7 +324,7 @@ def test_multi_symbol_cooldown_isolation() -> None:
         fill_model=FillModel(slippage=ZeroSlippage()),
     )
 
-    result = run_backtest(strategy, panel, config)
+    result = run_backtest(strategy, panel, config, contract=minimal_contract())
 
     # Both symbols should generate trades independently
     assert isinstance(result.trades, pd.DataFrame)

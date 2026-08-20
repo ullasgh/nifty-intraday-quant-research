@@ -38,6 +38,7 @@ from nifty_quant.data.panel import Panel
 from nifty_quant.execution.costs import NSEIntradayEquityCosts
 from nifty_quant.research.splits import HoldoutLock
 from nifty_quant.research.tilt import TiltConfig, run_tilt
+from tests.contract_fixtures import minimal_contract
 
 _IST = ZoneInfo("Asia/Kolkata")
 _N_SYMBOLS = 5
@@ -149,8 +150,8 @@ def test_capital_changes_cost_but_not_gross() -> None:
         seed=0,
     )
 
-    result_1l = run_tilt(panel, config_1l)
-    result_10l = run_tilt(panel, config_10l)
+    result_1l = run_tilt(panel, config_1l, contract=minimal_contract())
+    result_10l = run_tilt(panel, config_10l, contract=minimal_contract())
 
     assert result_1l.total.gross_bps == pytest.approx(result_10l.total.gross_bps, abs=1e-9)
     assert result_1l.round_trip_bps > result_10l.round_trip_bps
@@ -177,7 +178,7 @@ def test_one_leg_cost_identity() -> None:
         capital=250_000.0,
         seed=0,
     )
-    result = run_tilt(panel, config)
+    result = run_tilt(panel, config, contract=minimal_contract())
 
     # A 2x (long/short-spread) cost convention fails the first assertion directly; it is the
     # single most important test in this file per the spec.
@@ -239,10 +240,10 @@ def test_custom_checkpoints_honoured_and_decoy_not_read() -> None:
         seed=0,
     )
 
-    result_a = run_tilt(panel_a, config_custom)
-    result_b = run_tilt(panel_b, config_custom)
-    result_c = run_tilt(panel_c, config_custom)
-    result_default = run_tilt(panel_a, config_default)
+    result_a = run_tilt(panel_a, config_custom, contract=minimal_contract())
+    result_b = run_tilt(panel_b, config_custom, contract=minimal_contract())
+    result_c = run_tilt(panel_c, config_custom, contract=minimal_contract())
+    result_default = run_tilt(panel_a, config_default, contract=minimal_contract())
 
     assert result_a.total.gross_bps == pytest.approx(result_b.total.gross_bps, abs=1e-6)
     assert abs(result_a.total.gross_bps - result_c.total.gross_bps) > 1.0
@@ -273,7 +274,7 @@ def test_missing_checkpoint_session_dropped_and_warned() -> None:
         capital=1_000_000.0,
         seed=0,
     )
-    result = run_tilt(panel, config)
+    result = run_tilt(panel, config, contract=minimal_contract())
 
     assert result.total.n_sessions == 2
     assert len(result.warnings) >= 1
@@ -297,7 +298,7 @@ def test_date_range_respected_and_years_partition_exactly() -> None:
         capital=1_000_000.0,
         seed=0,
     )
-    result = run_tilt(panel, config)
+    result = run_tilt(panel, config, contract=minimal_contract())
 
     assert sum(row.n_sessions for row in result.per_year) == result.total.n_sessions
     assert {row.year for row in result.per_year} == {2022, 2023}
@@ -334,8 +335,8 @@ def test_smoothing_reduces_turnover_and_a_equals_one_is_daily_rebalance() -> Non
         seed=0,
     )
 
-    result_full = run_tilt(panel, config_full)
-    result_smoothed = run_tilt(panel, config_smoothed)
+    result_full = run_tilt(panel, config_full, contract=minimal_contract())
+    result_smoothed = run_tilt(panel, config_smoothed, contract=minimal_contract())
 
     assert result_full.total.n_sessions == 6
     assert result_full.total.turnover == pytest.approx((1.0 + 2.0 * 5) / 6.0, rel=1e-6)
@@ -366,7 +367,7 @@ def test_turnover_never_exceeds_long_only_normalised_bound() -> None:
         capital=1_000_000.0,
         seed=0,
     )
-    result = run_tilt(panel, config_full)
+    result = run_tilt(panel, config_full, contract=minimal_contract())
 
     for row in (*result.per_year, result.total):
         assert row.turnover <= 2.0 + 1e-9
@@ -401,7 +402,7 @@ def test_holdout_window_is_protected() -> None:
     # over-fitting a test to an unspecified message format; this is reported as an ambiguity
     # separately, not resolved by guessing a format.
     with pytest.raises(ValueError, match=r"(?i)holdout"):
-        run_tilt(panel, config)
+        run_tilt(panel, config, contract=minimal_contract())
 
 
 def test_degenerate_inputs_raise() -> None:
@@ -418,7 +419,7 @@ def test_degenerate_inputs_raise() -> None:
         seed=0,
     )
     with pytest.raises(ValueError):
-        run_tilt(panel, config_start_gt_end)
+        run_tilt(panel, config_start_gt_end, contract=minimal_contract())
 
     config_no_overlap = TiltConfig(
         start=datetime.date(1999, 1, 1),
@@ -429,7 +430,7 @@ def test_degenerate_inputs_raise() -> None:
         seed=0,
     )
     with pytest.raises(ValueError):
-        run_tilt(panel, config_no_overlap)
+        run_tilt(panel, config_no_overlap, contract=minimal_contract())
 
     panel_3sym = _build_panel(
         [
@@ -453,7 +454,7 @@ def test_degenerate_inputs_raise() -> None:
         seed=0,
     )
     with pytest.raises(ValueError):
-        run_tilt(panel_3sym, config_3sym)
+        run_tilt(panel_3sym, config_3sym, contract=minimal_contract())
 
 
 def test_determinism_same_config_and_seed_gives_identical_table() -> None:
@@ -469,7 +470,7 @@ def test_determinism_same_config_and_seed_gives_identical_table() -> None:
         capital=1_000_000.0,
         seed=0,
     )
-    result_a = run_tilt(panel_a, config_a)
+    result_a = run_tilt(panel_a, config_a, contract=minimal_contract())
 
     panel_b = _cycling_aggressive_panel(dates, loser_of_day)
     config_b = TiltConfig(
@@ -480,7 +481,7 @@ def test_determinism_same_config_and_seed_gives_identical_table() -> None:
         capital=1_000_000.0,
         seed=0,
     )
-    result_b = run_tilt(panel_b, config_b)
+    result_b = run_tilt(panel_b, config_b, contract=minimal_contract())
 
     assert result_a.to_table() == result_b.to_table()
 
@@ -502,7 +503,7 @@ def test_to_table_contains_per_year_rows_and_all_row_with_matching_count() -> No
         capital=1_000_000.0,
         seed=0,
     )
-    result = run_tilt(panel, config)
+    result = run_tilt(panel, config, contract=minimal_contract())
 
     assert result.total.n_sessions == sum(row.n_sessions for row in result.per_year)
 

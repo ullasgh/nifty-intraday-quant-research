@@ -34,6 +34,7 @@ from nifty_quant.backtest.orders import OrderIntent, PendingOrder
 from nifty_quant.backtest.portfolio import GrossNotionalSizer, Portfolio, SizingResult
 from nifty_quant.data.panel import Panel
 from nifty_quant.execution.costs import (
+    Charges,
     CompositeCostModel,
     CostModel,
     FillBatch,
@@ -41,6 +42,7 @@ from nifty_quant.execution.costs import (
     NSEIntradayEquityCosts,
 )
 from nifty_quant.execution.fills import FillModel, SqrtImpactSlippage
+from nifty_quant.research.contract import ResearchContract
 from nifty_quant.strategy.base import ArrayMarketView, PortfolioState, Strategy
 
 
@@ -165,6 +167,31 @@ def _parse_hhmm(value: str) -> int:
     return int(hour_str) * 60 + int(minute_str)
 
 
+def compute_filled_frac(filled_qty: np.ndarray, desired_qty: np.ndarray) -> np.ndarray:
+    """Vectorised, divide-by-zero-guarded ``filled_qty / desired_qty`` ratio (spec
+    `tca_record.md` AMENDMENT 3 item 2). The sole definition of ``filled_frac`` --
+    ``_record_trade`` calls this directly for its ``filled_frac`` column, so there
+    is exactly one implementation of this quantity.
+
+    ``desired_qty == 0`` IS reachable through the real engine: a pluggable fill
+    model can report a PHANTOM fill for a symbol with no desired order, and the
+    engine records it as a real trade via ``apply_fills`` like any other. Two
+    pre-existing tests exercise exactly this
+    (``test_engine_coverage.py::test_filled_frac_zero_for_phantom_fill_with_zero_desired_order``,
+    ``test_engine_coverage3.py::test_filled_frac_forced_zero_for_phantom_fill_with_zero_desired_order``)
+    and require ``filled_frac == 0.0`` -- finite, not NaN -- for a zero
+    denominator, so that is the pinned semantics here (not NaN, despite the
+    aggregation argument for NaN elsewhere in the spec).
+    """
+    filled = np.asarray(filled_qty, dtype=np.float64)
+    desired = np.asarray(desired_qty, dtype=np.float64)
+    denom = np.abs(desired)
+    finite_denom = np.isfinite(denom) & (denom > 0.0)
+    safe_denom = np.where(finite_denom, denom, 1.0)
+    ratio = np.abs(filled) / safe_denom
+    return np.where(finite_denom, ratio, 0.0)
+
+
 def _compute_returns(equity: np.ndarray, initial_capital: float) -> tuple[np.ndarray, int]:
     """Return (returns, first_ruin_index).
 
@@ -231,8 +258,16 @@ def run_backtest(
     panel: Panel,
     config: BacktestConfig,
     *,
+    contract: ResearchContract,
     tradable: np.ndarray | None = None,
 ) -> BacktestResult:
+    """Run a backtest.
+
+    `contract` is a required, defaultless keyword-only argument
+    (specs/research_contract.md, Enforcement gate 1): omitting it raises
+    `TypeError` before any backtest work happens. Gating only this entry point,
+    and not `run_tilt()`, is the P1 failure this contract exists to prevent.
+    """
     with guards.strictness(guards.Strictness.FULL):
         req = strategy.data_request()
 
@@ -343,6 +378,19 @@ def run_backtest(
         row_day_vals: list[int] = []
         notional_since_snapshot = 0.0
 
+        # order_id (spec `tca_record.md` AMENDMENT 1 item 2): monotonically
+        # increasing int64, assigned once per order-creation event (one
+        # `_queue_pending` call for ENTRY/EOD_EXIT, one `_execute_direct_fill`
+        # call for RISK_EXIT/FORCED_EOD), shared across every symbol that same
+        # creation event later produces a fill row for.
+        next_order_id = 0
+
+        def _new_order_id() -> int:
+            nonlocal next_order_id
+            oid = next_order_id
+            next_order_id += 1
+            return oid
+
         trade_columns = (
             "ts",
             "symbol",
@@ -357,6 +405,19 @@ def run_backtest(
             "participation",
             "filled_frac",
             "intent",
+            "order_id",
+            "signal_ts",
+            "decision_ts",
+            "order_ts",
+            "fill_ts",
+            "desired_qty",
+            "filled_qty",
+            "arrival_price",
+            "mid",
+            "spread_bps",
+            "impact_bps",
+            "fees_bps",
+            "slippage_bps",
         )
 
         def _record_trade(
@@ -367,6 +428,10 @@ def run_backtest(
             charges: float,
             desired_qty: float,
             intent: OrderIntent,
+            order_id: int,
+            decision_row: int,
+            spread_bps: float,
+            impact_bps: float,
         ) -> None:
             qty_f = float(qty)
             price_f = float(price)
@@ -390,11 +455,57 @@ def run_backtest(
                 participation = 0.0
 
             desired_qty_f = float(desired_qty)
-            denom = abs(desired_qty_f)
-            if np.isfinite(qty_f) and np.isfinite(denom) and denom > 0.0:
-                filled_frac = abs(qty_f) / denom
-            else:
-                filled_frac = 0.0
+            # Single implementation (spec `tca_record.md` AMENDMENT 3 item 2): call
+            # `compute_filled_frac` rather than re-deriving the ratio inline, so
+            # there is exactly one definition of `filled_frac` in the module.
+            filled_frac = float(
+                compute_filled_frac(
+                    np.array([qty_f], dtype=np.float64),
+                    np.array([desired_qty_f], dtype=np.float64),
+                )[0]
+            )
+
+            # Timestamps (spec `tca_record.md`, AMENDMENT 1 item 1): bars are
+            # left-labelled, each timestamp is the LABEL of the bar the event
+            # belongs to. `order_ts == fill_ts` always in this engine -- a
+            # PendingOrder fills exactly once, at the same row it becomes live
+            # (multi-bar splitting is out of scope, AMENDMENT 1 item 3). The
+            # mandatory one-bar execution lag lives between decision_ts and
+            # order_ts (`fill_row = t + 1 + decision_latency_bars` for ENTRY, or
+            # the equivalent for EOD_EXIT / immediate for RISK_EXIT/FORCED_EOD).
+            decision_ts = int(panel.ts[decision_row])
+            signal_ts = decision_ts
+            order_ts = int(panel.ts[t])
+            fill_ts = order_ts
+
+            # arrival_price (AMENDMENT 1 item 4): open of the bar labelled
+            # order_ts -- the first price available once the order is live.
+            arrival_price = float(open_exec[t, sym_idx])
+
+            # mid (spec section "Prices"): no genuine mid exists in this
+            # 1-minute-OHLCV dataset. Rule 6's spirit applies: never fabricate
+            # one from close, never forward-fill -- always NaN.
+            mid = float("nan")
+
+            # fees_bps: wire `Charges.as_bps_of` (costs.py:116), which had zero
+            # call sites before this. Build a single-row Charges whose `.total`
+            # reproduces this row's own `charges` figure exactly (all in
+            # `brokerage`, the rest zero -- `.total` is an elementwise sum so
+            # the split across components doesn't matter to `as_bps_of`).
+            _zero1 = np.zeros(1, dtype=np.float64)
+            fees_bps = float(
+                Charges(
+                    brokerage=np.array([charges], dtype=np.float64),
+                    stt=_zero1,
+                    exchange_txn=_zero1,
+                    sebi=_zero1,
+                    ipft=_zero1,
+                    stamp_duty=_zero1,
+                    gst=_zero1,
+                ).as_bps_of(np.array([notional], dtype=np.float64))[0]
+            )
+
+            slippage_bps = float(spread_bps) + float(impact_bps)
 
             records.append(
                 {
@@ -413,6 +524,19 @@ def run_backtest(
                     # AMENDMENT 2 item 2: parquet-safe -- store the enum's `.value`
                     # (a plain str), never the enum member or an int.
                     "intent": intent.value,
+                    "order_id": int(order_id),
+                    "signal_ts": signal_ts,
+                    "decision_ts": decision_ts,
+                    "order_ts": order_ts,
+                    "fill_ts": fill_ts,
+                    "desired_qty": desired_qty_f,
+                    "filled_qty": qty_f,
+                    "arrival_price": arrival_price,
+                    "mid": mid,
+                    "spread_bps": float(spread_bps),
+                    "impact_bps": float(impact_bps),
+                    "fees_bps": fees_bps,
+                    "slippage_bps": slippage_bps,
                 }
             )
 
@@ -422,17 +546,20 @@ def run_backtest(
 
         def _net_pending(
             pending_list: list[PendingOrder],
-        ) -> tuple[np.ndarray, list[OrderIntent | None]]:
+        ) -> tuple[np.ndarray, list[OrderIntent | None], list[int | None], list[int | None]]:
             """Sum a fill row's queued orders in queue order into one net share
-            vector, and compute the per-symbol "dominant" intent for the blotter:
-            the largest-absolute-contribution order for that symbol, ties resolved
-            to the later-queued order (spec section B rule 4). This is purely a
-            reporting convention -- the netted quantity is what is executed either
-            way, regardless of which intent is recorded.
+            vector, and compute the per-symbol "dominant" intent, order_id and
+            decision row (`queued_row`) for the blotter: the largest-absolute-
+            contribution order for that symbol, ties resolved to the later-queued
+            order (spec section B rule 4). This is purely a reporting convention --
+            the netted quantity is what is executed either way, regardless of
+            which intent/order_id/decision row is recorded.
             """
             net = np.zeros(n_sym, dtype=np.float64)
             best_abs = np.zeros(n_sym, dtype=np.float64)
             dominant: list[OrderIntent | None] = [None] * n_sym
+            dominant_order_id: list[int | None] = [None] * n_sym
+            dominant_decision_row: list[int | None] = [None] * n_sym
             for po in pending_list:
                 shares = np.asarray(po.shares, dtype=np.float64)
                 net = net + shares
@@ -441,7 +568,9 @@ def run_backtest(
                     if abs_shares[sym_idx] >= best_abs[sym_idx]:
                         best_abs[sym_idx] = abs_shares[sym_idx]
                         dominant[sym_idx] = po.intent
-            return net, dominant
+                        dominant_order_id[sym_idx] = po.order_id
+                        dominant_decision_row[sym_idx] = po.queued_row
+            return net, dominant, dominant_order_id, dominant_decision_row
 
         def _queue_pending(
             fill_row: int, order: np.ndarray, intent: OrderIntent, t: int, day_idx: int
@@ -460,8 +589,9 @@ def run_backtest(
                 return
 
             order = np.asarray(order, dtype=np.float64)
+            order_id = _new_order_id()
             pending_orders.setdefault(fill_row, []).append(
-                PendingOrder(intent=intent, shares=order, queued_row=t)
+                PendingOrder(intent=intent, shares=order, queued_row=t, order_id=order_id)
             )
             in_flight = in_flight + order
 
@@ -473,7 +603,11 @@ def run_backtest(
             )
 
         def _execute_model_fill(
-            order: np.ndarray, t: int, intents: list[OrderIntent | None]
+            order: np.ndarray,
+            t: int,
+            intents: list[OrderIntent | None],
+            order_ids: list[int | None],
+            decision_rows: list[int | None],
         ) -> float:
             nonlocal n_submitted, n_rejected, sum_unfilled, sum_desired
 
@@ -491,8 +625,35 @@ def run_backtest(
             total_charges = float(np.sum(charges_arr.total))
             portfolio.apply_fills(filled, fill_price_arr, total_charges)
 
+            # Cost decomposition (spec `tca_record.md`, "Cost decomposition"):
+            # reconstruct the participation-capped notional each traded symbol was
+            # actually charged slippage on (abs(filled_qty) * pre-slippage price
+            # == capped_notional, by construction of `FillModel.fill`), and feed
+            # it through the SAME `SlippageModel.components()` used to derive
+            # `bps()` -- one call, not a re-derivation, so spread_bps + impact_bps
+            # cannot drift from what the fill actually charged. A pluggable
+            # fill_model without a `.slippage` attribute/`.components()` (test
+            # doubles such as `_GhostFillModel`) falls back to zero components
+            # rather than raising -- no slippage model to attribute a
+            # decomposition to.
+            slippage_model = getattr(config.fill_model, "slippage", None)
+            if slippage_model is not None and hasattr(slippage_model, "components"):
+                notional_for_slip = np.abs(filled) * prices
+                comps = slippage_model.components(notional_for_slip, bar_traded_value)
+                # Only symbols with filled != 0 are read out below; a symbol with
+                # filled == 0 can carry an intentionally +inf spread_bps (the
+                # "invalid, can never fill" sentinel from `SqrtImpactSlippage`)
+                # without ever reaching the blotter.
+                spread_bps_arr = np.asarray(comps.spread_bps, dtype=np.float64)
+                impact_bps_arr = np.asarray(comps.impact_bps, dtype=np.float64)
+            else:
+                spread_bps_arr = np.zeros(n_sym, dtype=np.float64)
+                impact_bps_arr = np.zeros(n_sym, dtype=np.float64)
+
             for sym_idx in np.flatnonzero(filled != 0):
                 intent = intents[sym_idx]
+                order_id = order_ids[sym_idx]
+                decision_row = decision_rows[sym_idx]
                 if intent is None:
                     # No queued PendingOrder contributed any shares for this symbol
                     # (order[sym_idx] == 0), yet the fill model reported a nonzero
@@ -502,8 +663,14 @@ def run_backtest(
                     # least-wrong default since it is the only intent that can
                     # legitimately appear standalone (unlike EOD_EXIT, which only
                     # ever appears alongside a non-flat book this queue already
-                    # knows about).
+                    # knows about). Same reasoning for order_id/decision_row: no
+                    # order was ever created for this symbol, so mint a fresh
+                    # order_id and treat this row itself as its own decision row.
                     intent = OrderIntent.ENTRY
+                if order_id is None:
+                    order_id = _new_order_id()
+                if decision_row is None:
+                    decision_row = t
                 _record_trade(
                     t,
                     int(sym_idx),
@@ -512,6 +679,10 @@ def run_backtest(
                     float(charges_arr.total[sym_idx]),
                     float(order[sym_idx]),
                     intent,
+                    int(order_id),
+                    int(decision_row),
+                    float(spread_bps_arr[sym_idx]),
+                    float(impact_bps_arr[sym_idx]),
                 )
 
             fill_notional = float(np.sum(np.abs(filled) * fill_price_arr))
@@ -547,6 +718,13 @@ def run_backtest(
             total_charges = float(np.sum(charges_arr.total))
             portfolio.apply_fills(order, price_arr, total_charges)
 
+            # RISK_EXIT/FORCED_EOD/last-row EOD_EXIT decide and fill in the same
+            # row t (no queueing, no lag) -- one order_id per call, shared across
+            # every symbol it fills, decision_row == fill row. No slippage model
+            # is applied to a direct fill (the price is a fixed reference: stop
+            # price or close[t]), so spread_bps/impact_bps are honestly zero here
+            # rather than attributing a model that was never used.
+            order_id = _new_order_id()
             for sym_idx in np.flatnonzero(order != 0):
                 _record_trade(
                     t,
@@ -556,6 +734,10 @@ def run_backtest(
                     float(charges_arr.total[sym_idx]),
                     float(order[sym_idx]),
                     intent,
+                    order_id,
+                    t,
+                    0.0,
+                    0.0,
                 )
 
             fill_notional = float(np.sum(np.abs(order) * price_arr))
@@ -650,12 +832,14 @@ def run_backtest(
 
             pending_list = pending_orders.pop(t, None)
             if pending_list is not None:
-                net_order, dominant_intents = _net_pending(pending_list)
+                net_order, dominant_intents, dominant_order_ids, dominant_decision_rows = (
+                    _net_pending(pending_list)
+                )
                 in_flight = in_flight - net_order
                 if not pending_orders:
                     in_flight[:] = 0.0
                 notional_since_snapshot += _execute_model_fill(
-                    net_order, t, dominant_intents
+                    net_order, t, dominant_intents, dominant_order_ids, dominant_decision_rows
                 )
 
             if req.needs_intrabar_risk:
@@ -1005,6 +1189,19 @@ def run_backtest(
                 "participation": np.float64,
                 "filled_frac": np.float64,
                 "intent": object,
+                "order_id": np.int64,
+                "signal_ts": np.int64,
+                "decision_ts": np.int64,
+                "order_ts": np.int64,
+                "fill_ts": np.int64,
+                "desired_qty": np.float64,
+                "filled_qty": np.float64,
+                "arrival_price": np.float64,
+                "mid": np.float64,
+                "spread_bps": np.float64,
+                "impact_bps": np.float64,
+                "fees_bps": np.float64,
+                "slippage_bps": np.float64,
             }
         )
 

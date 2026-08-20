@@ -18,6 +18,7 @@ from nifty_quant.strategy.base import (
     Strategy,
     TargetPortfolio,
 )
+from tests.contract_fixtures import minimal_contract
 
 SYMBOLS = ("AAA", "BBB", "CCC")
 N_DAYS = 1
@@ -267,8 +268,12 @@ def test_capacity_uses_cursor_bar_not_decision_bar() -> None:
         )
     )
 
-    result_baseline = run_backtest(strategy_baseline, panel_baseline, config)
-    result_poisoned = run_backtest(strategy_poisoned, panel_poisoned, config)
+    result_baseline = run_backtest(
+        strategy_baseline, panel_baseline, config, contract=minimal_contract()
+    )
+    result_poisoned = run_backtest(
+        strategy_poisoned, panel_poisoned, config, contract=minimal_contract()
+    )
 
     assert np.array_equal(result_baseline.positions, result_poisoned.positions)
     assert len(result_baseline.trades) == len(result_poisoned.trades)

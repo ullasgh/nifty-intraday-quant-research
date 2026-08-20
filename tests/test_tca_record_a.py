@@ -77,6 +77,7 @@ from nifty_quant.strategy.base import (
     Strategy,
     TargetPortfolio,
 )
+from tests.contract_fixtures import minimal_contract
 
 _IST = ZoneInfo("Asia/Kolkata")
 CAPITAL = 1_000_000.0
@@ -215,7 +216,7 @@ def _simple_single_fill_result(*, latency: int = 0, n_bars: int = 20, decision_h
     script = {int(ts[row_at(day_offsets, 0, decision_hhmm) - 1]): target}
     strategy = TsScriptStrategy(_EmptyParams(), script, decision_times=(decision_hhmm,))
     config = default_config(decision_latency_bars=latency)
-    result = run_backtest(strategy, panel, config)
+    result = run_backtest(strategy, panel, config, contract=minimal_contract())
     return result, ts, day_offsets
 
 
@@ -323,7 +324,7 @@ def test_obligation3_order_ts_advances_by_latency_plus_one_along_short_session()
     script = {int(ts[decision_row - 1]): target}
     strategy = TsScriptStrategy(_EmptyParams(), script, decision_times=(decision_hhmm,))
     config = default_config(decision_latency_bars=latency)
-    result = run_backtest(strategy, panel, config)
+    result = run_backtest(strategy, panel, config, contract=minimal_contract())
 
     aaa = result.trades[result.trades["symbol"] == "AAA"]
     assert len(aaa) > 0
@@ -423,12 +424,24 @@ def test_obligation6_partial_fill_desired_qty_greater_than_filled_and_remainder_
     )
     strategy = TsScriptStrategy(_EmptyParams(), script, decision_times=("09:20",))
     config = default_config(fill_model=FillModel(slippage=ZeroSlippage(), max_participation=0.02))
-    result = run_backtest(strategy, panel, config)
+    result = run_backtest(strategy, panel, config, contract=minimal_contract())
 
     trades = result.trades
     aaa = trades[trades["symbol"] == "AAA"]
     assert len(aaa) > 0
-    row = aaa.iloc[0]
+
+    # AMENDMENT 3 item 3: a 20-bar session never reaches square_off_time="15:20"
+    # from a 09:20 decision, so `square_off_row_for_day` clamps to the session's
+    # last row (engine.py:329-338) and the engine's mandatory session-end
+    # flattening emits a SECOND, structurally-required row for this symbol
+    # (qty=-1.0, intent="eod_exit" -- measured directly; not the terminal
+    # FORCED_EOD safety-net path, which only fires if EOD_EXIT itself fails to
+    # reach flat) in addition to the partial-fill entry row. Select the entry
+    # order by intent, not by symbol, so this test asserts exactly one row for
+    # THAT order rather than assuming the symbol has only one row at all.
+    entry_rows = aaa[aaa["intent"] == "entry"]
+    assert len(entry_rows) == 1
+    row = entry_rows.iloc[0]
 
     assert row["desired_qty"] > row["filled_qty"]
     assert row["filled_frac"] < 1.0
@@ -439,9 +452,12 @@ def test_obligation6_partial_fill_desired_qty_greater_than_filled_and_remainder_
     # semantics is how a blotter stops being trustworthy.
     assert row["filled_frac"] == pytest.approx(row["filled_qty"] / row["desired_qty"], rel=1e-9)
 
-    # AMENDMENT 1 item 3: the current engine fills a PendingOrder exactly once --
-    # a partial fill must show up as exactly one row, not several.
-    assert len(aaa) == 1
+    # A partially-filled position must still end the session flat: the
+    # session-end flattening row must exist, making this assertion STRONGER than
+    # the count it replaces rather than simply dropping it.
+    eod_rows = aaa[aaa["intent"] == "eod_exit"]
+    assert len(eod_rows) == 1
+    assert eod_rows.iloc[0]["qty"] == pytest.approx(-1.0)
 
 
 # --------------------------------------------------------------------------------
@@ -504,7 +520,7 @@ def test_arrival_price_pinned_to_open_at_order_ts():
     target = TargetPortfolio(weights=np.array([0.10, 0.0]), meta={})
     script = {int(ts[decision_row - 1]): target}
     strategy = TsScriptStrategy(_EmptyParams(), script, decision_times=("09:20",))
-    result = run_backtest(strategy, panel, default_config())
+    result = run_backtest(strategy, panel, default_config(), contract=minimal_contract())
 
     aaa = result.trades[result.trades["symbol"] == "AAA"]
     assert len(aaa) > 0
@@ -533,7 +549,7 @@ def test_obligation8_mid_is_nan_and_never_equals_close():
     target = TargetPortfolio(weights=np.array([0.10, 0.0]), meta={})
     script = {int(ts[row_at(day_offsets, 0, "09:20") - 1]): target}
     strategy = TsScriptStrategy(_EmptyParams(), script, decision_times=("09:20",))
-    result = run_backtest(strategy, panel, default_config())
+    result = run_backtest(strategy, panel, default_config(), contract=minimal_contract())
 
     trades = result.trades
     assert "mid" in trades.columns
@@ -657,14 +673,19 @@ def test_obligation10_blotter_roundtrip_parquet_preserves_values_and_dtypes(tmp_
 # --------------------------------------------------------------------------------
 
 
-def test_filled_frac_ratio_is_nan_when_desired_qty_is_zero_unit():
+def test_filled_frac_ratio_is_zero_when_desired_qty_is_zero_unit():
     from nifty_quant.backtest.engine import compute_filled_frac
 
     filled_qty = np.array([0.0, 400.0, -200.0], dtype=np.float64)
     desired_qty = np.array([0.0, 1000.0, -1000.0], dtype=np.float64)
     ratio = compute_filled_frac(filled_qty, desired_qty)
 
-    assert np.isnan(ratio[0]), "desired_qty == 0 must give NaN, not 0.0, not a ZeroDivisionError"
+    # Contract pinned to 0.0 (finite), not NaN -- per spec `tca_record.md` AMENDMENT 4
+    # item 3, retracting AMENDMENT 2's NaN premise. A pluggable fill model can report a
+    # phantom fill for a symbol with no desired order (desired_qty == 0), and the engine
+    # must record that as a real, finite-fraction trade rather than propagate NaN through
+    # the blotter. 0.0 is the pre-existing, deliberately-tested engine behaviour.
+    assert ratio[0] == 0.0, "desired_qty == 0 must give 0.0, not NaN, not a ZeroDivisionError"
     assert ratio[1] == pytest.approx(0.4)
     assert ratio[2] == pytest.approx(0.2)
 
@@ -705,7 +726,7 @@ def test_shortfall_bps_not_forced_equal_to_modeled_slippage_plus_fees():
     config = default_config(
         fill_model=FillModel(slippage=SqrtImpactSlippage(), max_participation=0.02)
     )
-    result = run_backtest(strategy, panel, config)
+    result = run_backtest(strategy, panel, config, contract=minimal_contract())
 
     aaa = result.trades[result.trades["symbol"] == "AAA"]
     assert len(aaa) > 0

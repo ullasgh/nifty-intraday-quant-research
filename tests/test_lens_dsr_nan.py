@@ -65,7 +65,7 @@ def test_criterion6_constant_returns_dsr_nan_reports_not_evaluated_not_fail() ->
     assert "trials=2" in reason
 
 
-def test_criterion6_constant_returns_dsr_nan_marks_verdict_incomplete_not_blocking() -> None:
+def test_criterion6_constant_returns_dsr_nan_marks_verdict_INCONCLUSIVE() -> None:
     """The dsr=nan NOT_EVALUATED result must propagate to `any_not_evaluated` and
     `explain()`'s INCOMPLETE marker, and -- mirroring criterion 5's established
     precedent -- must NOT block `survived`: every other criterion genuinely
@@ -91,9 +91,16 @@ def test_criterion6_constant_returns_dsr_nan_marks_verdict_incomplete_not_blocki
 
     assert verdict.any_not_evaluated is True
     assert "INCOMPLETE" in verdict.explain()
-    assert verdict.survived is True, (
-        "a NOT_EVALUATED criterion 6 must not block survival, same as criterion 5"
-    )
+
+    # ADJUDICATED, specs/lens_verdict_integrity.md L1. This previously asserted
+    # `survived is True`, reasoning that "a NOT_EVALUATED criterion 6 must not block
+    # survival, same as criterion 5" -- which is precisely the defect: unevaluated
+    # criteria were DROPPED from the conjunction, so `survived` could be True with
+    # kill criteria never run. A criterion that vanishes when unsupplied is not a
+    # kill criterion. The verdict is now tri-state and this case is INCONCLUSIVE:
+    # nothing FAILED, but the screen did not finish.
+    assert verdict.outcome == "INCONCLUSIVE"
+    assert verdict.survived is False
 
 
 def test_criterion6_well_behaved_returns_on_same_fixture_gives_real_verdict() -> None:

@@ -251,21 +251,29 @@ def test_criterion6_none_strategy_returns_not_evaluated_names_missing_input() ->
 
 
 def test_criterion6_not_evaluated_is_excluded_from_overall_verdict() -> None:
-    """Spec test 2: NOT_EVALUATED must not count as a PASS in the overall verdict.
+    """Spec test 2, CORRECTED: NOT_EVALUATED must not count as a PASS, and must not
+    silently vanish from the conjunction either -- it makes the overall outcome
+    INCONCLUSIVE (survived=False), never SURVIVED.
 
-    Mirrors the precedent already established for criterion 5
-    (`test_verdict_criterion5_not_evaluated_without_latency_profile` in
-    test_lens.py, and now stated explicitly by the amended spec for every
-    criterion): every OTHER criterion genuinely PASSES on `_isolate_c6_panel()`
-    (verified directly below, not merely assumed), and criterion 6 is
-    NOT_EVALUATED (strategy_returns=None) -- the overall verdict must still be
-    SURVIVED, because NOT_EVALUATED is neither a PASS nor a FAIL, it is excluded
-    from the aggregation entirely.
+    This test previously asserted the L1 defect: `.survived is True` with criterion 6
+    NOT_EVALUATED, on the theory that "neither pass nor fail" meant "excluded from
+    aggregation". `Lens.verdict()` was fixed (see lens.py `outcome` computation: any
+    FAIL -> KILLED, elif any_not_evaluated -> INCONCLUSIVE, else -> SURVIVED) so that a
+    NOT_EVALUATED criterion can never be reached as SURVIVED -- a hypothesis screen
+    that never ran a required check must not report as having passed it. This test is
+    genuinely about the SUBSET behaviour of a single not-evaluated criterion (that is
+    its entire point -- contrasting NOT_EVALUATED with an explicit FAIL below), not
+    about the hypothesis passing the full screen, so per the corrected contract the
+    assertion is INCONCLUSIVE / survived=False, not a strengthened fixture.
+
+    Every OTHER criterion genuinely PASSES on `_isolate_c6_panel()` (verified directly
+    below, not merely assumed), and criterion 6 is NOT_EVALUATED (strategy_returns=None).
 
     To show this is not merely "criterion 6 is ignored" (a bug that would also make
     FAIL disappear), a second call on the SAME panel supplies strategy_returns that
-    genuinely FAIL deflation and flips survived to False -- proving NOT_EVALUATED
-    and an actual FAIL are treated differently, not both silently dropped.
+    genuinely FAIL deflation and flips the outcome to KILLED -- proving NOT_EVALUATED
+    and an actual FAIL are treated differently (INCONCLUSIVE vs KILLED), not both
+    silently collapsed to the same outcome.
     """
     panel = _isolate_c6_panel()
 
@@ -281,7 +289,9 @@ def test_criterion6_not_evaluated_is_excluded_from_overall_verdict() -> None:
             f"isolate criterion 6: {not_evaluated_verdict.reasons[i]!r}"
         )
     assert _criterion_token(not_evaluated_verdict.reasons[5]) == "NOT_EVALUATED"
-    assert not_evaluated_verdict.survived is True
+    # Corrected contract: NOT_EVALUATED makes the outcome INCONCLUSIVE, not SURVIVED.
+    assert not_evaluated_verdict.outcome == "INCONCLUSIVE"
+    assert not_evaluated_verdict.survived is False
 
     failing_returns = np.random.default_rng(2).normal(0.0, 0.001, size=500)
     explicit_fail_verdict = _call_verdict(
@@ -291,6 +301,7 @@ def test_criterion6_not_evaluated_is_excluded_from_overall_verdict() -> None:
         effective_n_trials=2,
     )
     assert _criterion_token(explicit_fail_verdict.reasons[5]) == "FAIL"
+    assert explicit_fail_verdict.outcome == "KILLED"
     assert explicit_fail_verdict.survived is False
 
 

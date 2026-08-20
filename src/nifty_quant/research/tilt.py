@@ -17,15 +17,21 @@ from __future__ import annotations
 
 import dataclasses
 import datetime
+import json
 from collections import defaultdict
+from typing import TYPE_CHECKING
 
 import numpy as np
 
 from nifty_quant.calendar import TradingCalendar
 from nifty_quant.data.panel import Panel
 from nifty_quant.execution.costs import NSEIntradayEquityCosts
+from nifty_quant.research.contract import ResearchContract
 from nifty_quant.research.hypotheses.h2_overnight_reversal import build_overnight_feature
 from nifty_quant.research.splits import HoldoutLock, default_holdout_lock_path
+
+if TYPE_CHECKING:
+    from nifty_quant.research.registry import TrialRegistry
 
 
 @dataclasses.dataclass(frozen=True)
@@ -329,12 +335,32 @@ def _compute_aggressive_weights(feature_valid: np.ndarray) -> np.ndarray:
     return weights
 
 
-def run_tilt(panel: Panel, config: TiltConfig) -> TiltResult:
+def run_tilt(
+    panel: Panel,
+    config: TiltConfig,
+    *,
+    contract: ResearchContract,
+    registry: "TrialRegistry | None" = None,
+) -> TiltResult:
     """Run the parameterised tilt backtest.
 
     Args:
         panel: The 1-minute OHLCV panel (many bars per session).
         config: TiltConfig with start, end, entry/exit times, capital, tilt type, etc.
+        contract: Required, defaultless keyword-only argument
+            (specs/research_contract.md, Enforcement gate 2 / P1): omitting it
+            raises `TypeError` before any tilt computation happens. `tilt` is the
+            only construction in this repo that has beaten the index net of costs,
+            and this is the regression test for `research/tilt.py` previously
+            containing zero references to the research spine.
+        registry: If given, a completed run writes one `TrialRecord` to it whose
+            `contract_hash`/`config_hash` match `contract.contract_hash`, with
+            non-null `seed` and `git_sha` (obligation 7). Chosen deliberately as
+            an explicit, optional, injected dependency rather than a seam
+            `run_tilt` constructs for itself: the CLI `tilt` command supplies its
+            own `TrialRegistry(settings.RESULTS_ROOT / "trials.db")`, and tests can
+            supply an isolated one -- `run_tilt` never reaches for
+            `nifty_quant.settings` itself.
 
     Returns:
         TiltResult with per-year rows, total aggregates, and diagnostics.
@@ -585,7 +611,7 @@ def run_tilt(panel: Panel, config: TiltConfig) -> TiltResult:
     if min_weight_global > 0.99:
         min_weight_global = 0.0  # All weights were zeros
 
-    return TiltResult(
+    tilt_result = TiltResult(
         config=config,
         per_year=tuple(per_year_rows),
         total=total_row,
@@ -598,3 +624,51 @@ def run_tilt(panel: Panel, config: TiltConfig) -> TiltResult:
         max_weight_sum_deviation=max_weight_deviation_global,
         max_n_held=max_n_held_global,
     )
+
+    # specs/research_contract.md, Enforcement gate 2 / obligation 7: a completed
+    # run_tilt() writes a TrialRecord carrying contract_hash, with non-null seed
+    # and git_sha, whenever a registry is supplied.
+    if registry is not None:
+        from nifty_quant import __version__
+        from nifty_quant.research.provenance import get_git_sha
+        from nifty_quant.research.registry import TrialRecord
+
+        chash = contract.contract_hash
+        registry.record(
+            TrialRecord(
+                config_hash=chash,
+                contract_hash=chash,
+                ts=datetime.datetime.now(datetime.timezone.utc).isoformat(
+                    timespec="seconds"
+                ),
+                strategy="tilt",
+                params_json=json.dumps(dataclasses.asdict(config), default=str),
+                split_id="full",
+                purpose="exploration",
+                sharpe_gross=None,
+                sharpe_net=None,
+                n_trades=None,
+                turnover=total_row.turnover,
+                breakeven_bps=None,
+                git_sha=get_git_sha(),
+                data_fingerprint=None,
+                code_version=__version__,
+                wall_s=None,
+                result_path=None,
+                error=None,
+                seed=config.seed,
+                universe_name=config.universe,
+                universe_hash="",
+                panel_hash="",
+                start=config.start.isoformat(),
+                end=config.end.isoformat(),
+                cost_model_id="nse_intraday_default",
+                slippage_model_id="none",
+                fill_model_id="",
+                embargo_components="{}",
+                parent_trial_id=None,
+                feature_version="",
+            )
+        )
+
+    return tilt_result

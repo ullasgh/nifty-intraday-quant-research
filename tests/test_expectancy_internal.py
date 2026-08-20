@@ -266,17 +266,39 @@ def test_block_bootstrap_blocks_never_straddle_session() -> None:
     bucket_returns_2d = fwd.values.reshape((total, n_symbols))
     from nifty_quant.research.expectancy import _block_bootstrap_resampling_2d
 
-    resampled, block_indices = _block_bootstrap_resampling_2d(
+    resampled, block_indices, n_sessions_skipped = _block_bootstrap_resampling_2d(
         bucket_returns_2d, day_offsets, horizon=20, n_boot=50, seed=104
     )
 
-    # Verify resampled shape
+    # Verify resampled shape: (n_boot, n_rows, n_symbols) -- each replicate is a full
+    # tiled-and-truncated series now, not a single <= horizon block.
     assert resampled.shape[0] == 50  # n_boot
+    assert resampled.shape[1] == total  # n_rows
     assert resampled.shape[2] == n_symbols
     # Verify block_indices are returned
     assert isinstance(block_indices, tuple)
     assert len(block_indices) > 0 or len(block_indices) == 0  # May be empty if fallback
-    # Blocks should respect session boundaries
+    # Every session here (50, 75, 60, 40 bars) is >= block_length (20 + 5 = 25), so
+    # none should be skipped.
+    assert n_sessions_skipped == 0
+
+    # Blocks should respect session boundaries: every drawn (start, length) block must
+    # fit entirely inside a single session -- this is the actual invariant, checked
+    # directly against the exposed block indices rather than inferred from NaN presence.
+    session_starts = day_offsets[:-1]
+    session_ends = day_offsets[1:]
+    for start, length in block_indices:
+        containing = [
+            idx
+            for idx in range(len(session_starts))
+            if session_starts[idx] <= start < session_ends[idx]
+        ]
+        assert len(containing) == 1, f"block start {start} not inside exactly one session"
+        sess_idx = containing[0]
+        assert start + length <= session_ends[sess_idx], (
+            f"block ({start}, {length}) straddles session boundary at {session_ends[sess_idx]}"
+        )
+
     # (if a block contains rows from two sessions, that's the bug)
     for b in range(50):
         # Check that each bootstrap sample has finite values
@@ -1346,16 +1368,22 @@ def test_block_bootstrap_fallback_path_directly() -> None:
     values_2d = np.random.default_rng(142).normal(size=(n_rows, n_symbols))
 
     # Call with large horizon to trigger fallback
-    resampled, block_indices = _block_bootstrap_resampling_2d(
+    resampled, block_indices, n_sessions_skipped = _block_bootstrap_resampling_2d(
         values_2d, day_offsets, horizon=10, n_boot=5, seed=42
     )
 
-    # Fallback should produce (0, n_rows) for each bootstrap sample
-    assert len(block_indices) == 5
-    # All should be fallback blocks: (0, n_rows)
-    for start, length in block_indices:
-        assert start == 0
-        assert length == n_rows
+    # block_length = horizon(10) + 5 = 15; all three 3-bar sessions are shorter than
+    # that, so all three should be skipped, and the iid fallback (whole-row resampling,
+    # which drops the dependence correction) is taken -- it never appends a synthetic
+    # (0, n_rows) entry, because no block was actually drawn (AMENDMENT 8).
+    #
+    # `n_sessions_skipped == <total sessions>` together with `len(block_indices) == 0`
+    # IS the fallback signal, pinned per AMENDMENT 8: the iid fallback silently changes
+    # the estimator (no overlap correction is applied), so it must be detectable from
+    # the return value alone, without reading the source. Both conditions are asserted
+    # together below -- neither one alone proves the fallback path was taken.
+    assert len(block_indices) == 0
+    assert n_sessions_skipped == 3
     # Resampled should have valid shape
     assert resampled.shape[0] == 5  # n_boot
     assert resampled.shape[2] == n_symbols
@@ -1664,7 +1692,7 @@ def test_all_nan_bootstrap_sample_produces_nan_not_warning() -> None:
         n_symbols = values_2d.shape[1]
         resampled_all_nan = np.full((n_boot, n_rows_sample, n_symbols), np.nan, dtype=np.float64)
         block_indices = tuple([(0, n_rows_sample)] * n_boot)
-        return resampled_all_nan, block_indices
+        return resampled_all_nan, block_indices, 0
 
     with warnings.catch_warnings(record=True) as w:
         warnings.simplefilter("always")

@@ -38,6 +38,7 @@ from nifty_quant.data.panel import Panel
 from nifty_quant.research.splits import HoldoutLock, Split, WalkForwardSplitter
 from nifty_quant.research.tilt import TiltConfig, run_tilt
 from nifty_quant.universe.static import Universe
+from tests.contract_fixtures import minimal_contract
 
 runner = CliRunner()
 
@@ -524,6 +525,7 @@ def test_item_5_tilt_uses_shared_holdout_lock_path(monkeypatch, tmp_path):
                 start=date(2020, 1, 1),
                 end=date(2025, 9, 1),
             ),
+            contract=minimal_contract(),
         )
 
     # today this records Path('/tmp/nifty_quant_holdout_lock.json').

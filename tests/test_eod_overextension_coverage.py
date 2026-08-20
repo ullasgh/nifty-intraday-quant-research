@@ -19,6 +19,7 @@ from nifty_quant.strategy.plugins.eod_overextension import (
     EODOverExtensionParams,
     EODOverExtensionStrategy,
 )
+from tests.contract_fixtures import minimal_contract
 
 _IST = ZoneInfo("Asia/Kolkata")
 
@@ -187,7 +188,7 @@ def test_overnight_holding_position_carries_to_next_session() -> None:
         fill_model=FillModel(slippage=ZeroSlippage()),
     )
 
-    result = run_backtest(strategy, panel, config)
+    result = run_backtest(strategy, panel, config, contract=minimal_contract())
 
     # Should have trades: entries at EOD + exits at next day open
     assert isinstance(result.trades, pd.DataFrame)
@@ -232,7 +233,7 @@ def test_delivery_cost_model_charged_on_overnight_holdings() -> None:
         fill_model=FillModel(slippage=ZeroSlippage()),
     )
 
-    result_correct = run_backtest(strategy, panel, config_correct)
+    result_correct = run_backtest(strategy, panel, config_correct, contract=minimal_contract())
 
     # Incorrect: use NSEIntradayEquityCosts (would undercount costs)
     config_wrong = BacktestConfig(
@@ -241,7 +242,7 @@ def test_delivery_cost_model_charged_on_overnight_holdings() -> None:
         fill_model=FillModel(slippage=ZeroSlippage()),
     )
 
-    result_wrong = run_backtest(strategy, panel, config_wrong)
+    result_wrong = run_backtest(strategy, panel, config_wrong, contract=minimal_contract())
 
     # Delivery costs should be higher (higher STT 0.1% vs intraday ~0.05%)
     # So total_costs with correct model should be >= total_costs with wrong model
@@ -279,7 +280,7 @@ def test_direction_long_only_enters_long_positions() -> None:
         fill_model=FillModel(slippage=ZeroSlippage()),
     )
 
-    result = run_backtest(strategy, panel, config)
+    result = run_backtest(strategy, panel, config, contract=minimal_contract())
 
     # All trades should be buys (no shorts)
     if result.n_trades > 0:
@@ -315,7 +316,7 @@ def test_direction_short_only_enters_short_positions() -> None:
         fill_model=FillModel(slippage=ZeroSlippage()),
     )
 
-    result = run_backtest(strategy, panel, config)
+    result = run_backtest(strategy, panel, config, contract=minimal_contract())
 
     # All trades should be sells (no longs)
     if result.n_trades > 0:
@@ -351,7 +352,7 @@ def test_direction_both_enters_both_long_and_short() -> None:
         fill_model=FillModel(slippage=ZeroSlippage()),
     )
 
-    result = run_backtest(strategy, panel, config)
+    result = run_backtest(strategy, panel, config, contract=minimal_contract())
 
     # Can have both longs and shorts (or none if signal doesn't trigger)
     assert isinstance(result.trades, pd.DataFrame)
@@ -390,7 +391,7 @@ def test_exit_due_signal_carries_overnight() -> None:
         fill_model=FillModel(slippage=ZeroSlippage()),
     )
 
-    result = run_backtest(strategy, panel, config)
+    result = run_backtest(strategy, panel, config, contract=minimal_contract())
 
     # Positions should exit at 10:00 next day (exit_time)
     # They should not carry all the way to EOD
@@ -429,7 +430,7 @@ def test_unsupported_direction_raises_error() -> None:
     )
 
     with pytest.raises(ValueError, match="Unsupported direction"):
-        run_backtest(strategy, panel, config)
+        run_backtest(strategy, panel, config, contract=minimal_contract())
 
 
 def test_session_return_calculation_spanning_overnight() -> None:
@@ -466,7 +467,7 @@ def test_session_return_calculation_spanning_overnight() -> None:
         fill_model=FillModel(slippage=ZeroSlippage()),
     )
 
-    result = run_backtest(strategy, panel, config)
+    result = run_backtest(strategy, panel, config, contract=minimal_contract())
 
     # Backtest should complete without errors
     assert isinstance(result.trades, pd.DataFrame)
@@ -529,7 +530,7 @@ def test_0915_bar_masked_in_all_calculations() -> None:
         fill_model=FillModel(slippage=ZeroSlippage()),
     )
 
-    result = run_backtest(strategy, panel, config)
+    result = run_backtest(strategy, panel, config, contract=minimal_contract())
 
     # Should not crash due to broken 09:15 bar
     assert isinstance(result.trades, pd.DataFrame)
@@ -566,7 +567,7 @@ def test_position_in_range_calculation_per_session() -> None:
         fill_model=FillModel(slippage=ZeroSlippage()),
     )
 
-    result = run_backtest(strategy, panel, config)
+    result = run_backtest(strategy, panel, config, contract=minimal_contract())
 
     # Verify precompute does not crash with session boundaries
     assert isinstance(result.trades, pd.DataFrame)

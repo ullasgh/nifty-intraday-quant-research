@@ -22,6 +22,7 @@ from nifty_quant.strategy.plugins.eod_overextension import (
     EODOverExtensionParams,
     EODOverExtensionStrategy,
 )
+from tests.contract_fixtures import minimal_contract
 
 _IST = ZoneInfo("Asia/Kolkata")
 
@@ -245,7 +246,7 @@ def test_anchor_row_with_irregular_sessions() -> None:
         fill_model=FillModel(slippage=ZeroSlippage()),
     )
 
-    result = run_backtest(strategy, panel, config)
+    result = run_backtest(strategy, panel, config, contract=minimal_contract())
 
     # Strategy should handle both session lengths without crashing
     assert isinstance(result.trades, pd.DataFrame)
@@ -336,7 +337,7 @@ def test_cross_session_hand_off_positions_persist() -> None:
         fill_model=FillModel(slippage=ZeroSlippage()),
     )
 
-    result = run_backtest(strategy, panel, config)
+    result = run_backtest(strategy, panel, config, contract=minimal_contract())
 
     # Verify overnight holding: entries and exits should be present
     assert isinstance(result.trades, pd.DataFrame)

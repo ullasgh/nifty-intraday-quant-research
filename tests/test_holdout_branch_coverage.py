@@ -850,7 +850,7 @@ def test_tilt_unexpected_exception_is_reported(monkeypatch, tmp_path):
         lambda name: Universe(name="all_equity", symbols=_TILT_SYMBOLS),
     )
 
-    def _boom(panel, config):
+    def _boom(panel, config, **kwargs):
         raise RuntimeError("unexpected boom")
 
     monkeypatch.setattr(tilt_mod, "run_tilt", _boom)

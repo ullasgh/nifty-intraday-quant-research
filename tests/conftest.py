@@ -110,14 +110,16 @@ def _isolated_holdout_lock(request, tmp_path, monkeypatch):
 # would silently stop gating real code, so the list is deliberately explicit rather than a
 # wildcard.
 _PENDING_SUITES = (
-    "test_research_contract_a.py",
-    "test_research_contract_b.py",
-    "test_tca_record_a.py",
-    "test_tca_record_b.py",
-    "test_overlap_se_a.py",
-    "test_overlap_se_b.py",
-    "test_lens_verdict_integrity_a.py",
-    "test_lens_verdict_integrity_b.py",
+    # Phase D. specs/feature_layer.md -- gap-stitched price path, breakout strength,
+    # Garman-Klass / Rogers-Satchell, efficiency ratio, and research/ic.py. No implementation
+    # written yet, so these are RED by design.
+    "test_feature_layer_a.py",
+    "test_feature_layer_b.py",
 )
+
+# Removed as their implementations landed and went green, which is the point of the list being
+# explicit: test_research_contract_{a,b}, test_tca_record_{a,b}, test_overlap_se_{a,b},
+# test_lens_verdict_integrity_{a,b}. An entry left here after implementation would silently stop
+# gating real code -- exactly the failure this list is shaped to prevent.
 
 collect_ignore = list(_PENDING_SUITES) if os.environ.get("NQ_SKIP_PENDING") == "1" else []

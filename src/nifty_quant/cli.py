@@ -75,6 +75,73 @@ def _ensure_plugins_loaded() -> None:
     import nifty_quant.strategy.plugins  # noqa: F401
 
 
+def _build_research_contract(
+    *,
+    panel_id: str,
+    panel_hash: str,
+    start: date,
+    end: date,
+    universe_name: str,
+    universe_hash: str,
+    cost_model_id: str,
+    slippage_model_id: str,
+    decision_latency_bars: int,
+    n_planned_trials: int,
+    holdout_intent: str,
+    seed: int,
+    split_scheme: str = "none",
+    purge_width_bars: int = 0,
+    embargo_width_bars: int = 0,
+    feature_version: str = "",
+) -> Any:
+    """Build the `ResearchContract` every `run_backtest()`/`run_tilt()` call site in
+    this module now requires (specs/research_contract.md, Enforcement). There is no
+    `--contract` CLI flag: the contract is declared from the same inputs the run
+    already takes, matching AMENDMENT 1 point 3's direction not to invent a seam
+    purely to be testable -- the CLI commands remain the single source of truth for
+    what was run, and now additionally declare it as a contract before running.
+    """
+    from nifty_quant.research.contract import ResearchContract
+
+    return ResearchContract(
+        data={
+            "panel_id": panel_id,
+            "panel_hash": panel_hash,
+            "start": start.isoformat(),
+            "end": end.isoformat(),
+            "bar_interval_s": 60,
+            "universe_name": universe_name,
+            "universe_hash": universe_hash,
+        },
+        features={"feature_ids": [], "feature_version": feature_version},
+        label={
+            "horizon_bars": 1,
+            "construction": "forward_return",
+            "overlapping": False,
+        },
+        execution={
+            "cost_model_id": cost_model_id,
+            "slippage_model_id": slippage_model_id,
+            "decision_latency_bars": decision_latency_bars,
+            "participation_cap": 1.0,
+        },
+        portfolio={
+            "sizing_scheme": "gross_notional",
+            "gross_clip": 1.0,
+            "max_weight": 1.0,
+            "target_vol": None,
+        },
+        validation={
+            "split_scheme": split_scheme,
+            "purge_width_bars": purge_width_bars,
+            "embargo_width_bars": embargo_width_bars,
+            "n_planned_trials": n_planned_trials,
+            "holdout_intent": holdout_intent,
+        },
+        seed=seed,
+    )
+
+
 def _write_returns_parquet(
     path: Path,
     ts: "np.ndarray",
@@ -429,7 +496,6 @@ def backtest(
             sharpe_standard_error,
         )
         from nifty_quant.config import RunConfig
-        from nifty_quant.config import config_hash as run_config_hash
         from nifty_quant.data.manifest import Manifest
         from nifty_quant.data.panel import PanelSpec, load_panel
         from nifty_quant.data.validate import tradable_mask
@@ -482,6 +548,58 @@ def backtest(
         # so this changes no backtest numbers.
         slippage_model = SqrtImpactSlippage()
         fill_model = FillModel(slippage=slippage_model)
+
+        # ---- specs/research_contract.md: provenance + ResearchContract, computed
+        # BEFORE run_backtest() so the contract (gate 1) can be passed to it. Moved
+        # earlier than this command's own downstream metrics/TrialRecord code so the
+        # SAME hash values feed both the contract and the record written below. ----
+        run_cfg = RunConfig(
+            strategy=strategy,
+            params=cfg.get("params", {}),
+            universe=universe_name,
+            start=start_d,
+            end=end_d,
+        )
+        manifest_fingerprint = None
+        manifest_adjustments = ""
+        try:
+            _manifest = Manifest.load()
+            manifest_fingerprint = _manifest.fingerprint
+            manifest_adjustments = _manifest.adjustments
+        except Exception:
+            manifest_fingerprint = None
+            manifest_adjustments = ""
+
+        git_sha = get_git_sha()
+        panel_hash = compute_panel_hash(panel, adjustments=manifest_adjustments)
+        universe_hash = compute_universe_hash(
+            name=universe_name, symbols=universe.symbols, n_sessions=panel.n_days()
+        )
+        cost_model_id = canonical_model_id(cost_model)
+        slippage_model_id = canonical_model_id(slippage_model)
+        fill_model_id = canonical_model_id(fill_model)
+        # `backtest` has no walk-forward split, so there is no embargo to size --
+        # all four terms are 0.0 (not a hand-chosen threshold: it is the only value
+        # describing "no embargo applies to a full-sample run").
+        embargo_components = embargo_components_json(
+            feature_lookback=0.0, label_horizon=0.0, holding_period=0.0, execution_horizon=0.0
+        )
+        contract = _build_research_contract(
+            panel_id=str(spec),
+            panel_hash=panel_hash,
+            start=start_d,
+            end=end_d,
+            universe_name=universe_name,
+            universe_hash=universe_hash,
+            cost_model_id=cost_model_id,
+            slippage_model_id=slippage_model_id,
+            decision_latency_bars=0,
+            n_planned_trials=1,
+            holdout_intent="reading_now" if (holdout_intersects and allow_holdout) else "never",
+            seed=run_cfg.seed,
+            feature_version=FEATURE_VERSION,
+        )
+
         t0 = time.monotonic()
 
         result = run_backtest(
@@ -494,6 +612,7 @@ def backtest(
                 cost_model=cost_model,
                 fill_model=fill_model,
             ),
+            contract=contract,
             tradable=tradable_full,
         )
 
@@ -563,6 +682,7 @@ def backtest(
                         cost_model=cost_model,
                         fill_model=fill_model,
                     ),
+                    contract=contract,
                     tradable=tradable_full,
                 )
                 latency_sharpes[latency_bars] = float(
@@ -594,14 +714,7 @@ def backtest(
         typer.echo(f"unfilled_notional_pct: {float(result.unfilled_notional_pct):.3f}")
         typer.echo(f"ruined: {result.ruined}    ruin_index: {result.ruin_index}")
 
-        run_cfg = RunConfig(
-            strategy=strategy,
-            params=cfg.get("params", {}),
-            universe=universe_name,
-            start=start_d,
-            end=end_d,
-        )
-        chash = run_config_hash(run_cfg)
+        chash = contract.contract_hash
         trial_dir = settings.RESULTS_ROOT / "trials" / chash
         trial_dir.mkdir(parents=True, exist_ok=True)
 
@@ -609,35 +722,9 @@ def backtest(
             yaml.safe_dump(run_cfg.model_dump(mode="json")), encoding="utf-8"
         )
 
-        # ---- specs/run_provenance.md: provenance fields, computed before metrics.json
-        # is written so registry_write_failed/provenance can be embedded in it. ----
-        manifest_fingerprint = None
-        manifest_adjustments = ""
-        try:
-            _manifest = Manifest.load()
-            manifest_fingerprint = _manifest.fingerprint
-            manifest_adjustments = _manifest.adjustments
-        except Exception:
-            manifest_fingerprint = None
-            manifest_adjustments = ""
-
-        git_sha = get_git_sha()
-        panel_hash = compute_panel_hash(panel, adjustments=manifest_adjustments)
-        universe_hash = compute_universe_hash(
-            name=universe_name, symbols=universe.symbols, n_sessions=panel.n_days()
-        )
-        cost_model_id = canonical_model_id(cost_model)
-        slippage_model_id = canonical_model_id(slippage_model)
-        fill_model_id = canonical_model_id(fill_model)
-        # `backtest` has no walk-forward split, so there is no embargo to size --
-        # all four terms are 0.0 (not a hand-chosen threshold: it is the only value
-        # describing "no embargo applies to a full-sample run").
-        embargo_components = embargo_components_json(
-            feature_lookback=0.0, label_horizon=0.0, holding_period=0.0, execution_horizon=0.0
-        )
-
         record = TrialRecord(
             config_hash=chash,
+            contract_hash=chash,
             ts=datetime.now(timezone.utc).isoformat(timespec="seconds"),
             strategy=strategy,
             params_json=json.dumps(cfg.get("params", {})),
@@ -656,7 +743,7 @@ def backtest(
             ruined=bool(result.ruined),
             ruin_index=int(result.ruin_index),
             error=None,
-            seed=None,
+            seed=run_cfg.seed,
             universe_name=universe_name,
             universe_hash=universe_hash,
             panel_hash=panel_hash,
@@ -703,13 +790,14 @@ def backtest(
                 "registry_write_failed": registry_write_failed,
                 "provenance": {
                     "config_hash": chash,
+                    "contract_hash": chash,
                     "git_sha": git_sha,
                     "code_version": __version__,
                     "data_fingerprint": manifest_fingerprint,
                     "panel_hash": panel_hash,
                     "universe_name": universe_name,
                     "universe_hash": universe_hash,
-                    "seed": None,
+                    "seed": run_cfg.seed,
                     "start": start_d.isoformat(),
                     "end": end_d.isoformat(),
                     "cost_model_id": cost_model_id,
@@ -969,7 +1057,15 @@ def walkforward(
         from nifty_quant.data.panel import PanelSpec, load_panel
         from nifty_quant.data.validate import tradable_mask
         from nifty_quant.execution.costs import NSEIntradayEquityCosts, breakeven_cost_bps
-        from nifty_quant.research.provenance import get_git_sha
+        from nifty_quant.execution.fills import FillModel, SqrtImpactSlippage
+        from nifty_quant.research.provenance import (
+            FEATURE_VERSION,
+            canonical_model_id,
+            compute_panel_hash,
+            compute_universe_hash,
+            embargo_components_json,
+            get_git_sha,
+        )
         from nifty_quant.research.registry import TrialRecord, TrialRegistry
         from nifty_quant.strategy.registry import config_hash as strategy_config_hash
         from nifty_quant.universe.static import load_universe, survivorship_report
@@ -1005,12 +1101,66 @@ def walkforward(
         )
 
         cost_model = NSEIntradayEquityCosts()
+        # Provenance-only: BacktestConfig's own default_factory already builds an
+        # equivalent fill/slippage model when none is passed below, so instantiating
+        # these here (to derive their canonical ids for the contract/TrialRecords)
+        # changes no backtest numbers -- same rationale as the `backtest` command.
+        wf_slippage_model = SqrtImpactSlippage()
+        wf_fill_model = FillModel(slippage=wf_slippage_model)
 
         manifest_fingerprint = None
+        manifest_adjustments = ""
         try:
-            manifest_fingerprint = Manifest.load().fingerprint
+            _manifest = Manifest.load()
+            manifest_fingerprint = _manifest.fingerprint
+            manifest_adjustments = _manifest.adjustments
         except Exception:
             manifest_fingerprint = None
+            manifest_adjustments = ""
+
+        # ---- specs/research_contract.md: provenance + ResearchContract, computed
+        # BEFORE any run_backtest() call in this command so the contract (gate 1)
+        # can be passed to every one of them (per-split AND the latency-sensitivity
+        # loop below). This is also the fix for P4: these are the SAME values now
+        # populated onto every TrialRecord this command writes, split and pooled. ----
+        wf_panel_hash = compute_panel_hash(panel, adjustments=manifest_adjustments)
+        wf_universe_hash = compute_universe_hash(
+            name=universe_name, symbols=universe.symbols, n_sessions=panel.n_days()
+        )
+        wf_cost_model_id = canonical_model_id(cost_model)
+        wf_slippage_model_id = canonical_model_id(wf_slippage_model)
+        wf_fill_model_id = canonical_model_id(wf_fill_model)
+        wf_embargo_components = embargo_components_json(
+            feature_lookback=resolved_feature_lookback,
+            label_horizon=label_horizon,
+            holding_period=holding_period,
+            execution_horizon=execution_horizon,
+        )
+        wf_contract = _build_research_contract(
+            panel_id=str(spec),
+            panel_hash=wf_panel_hash,
+            start=start_d,
+            end=end_d,
+            universe_name=universe_name,
+            universe_hash=wf_universe_hash,
+            cost_model_id=wf_cost_model_id,
+            slippage_model_id=wf_slippage_model_id,
+            decision_latency_bars=0,
+            n_planned_trials=1,
+            holdout_intent=(
+                "reading_now" if (intersecting_splits and allow_holdout) else "never"
+            ),
+            seed=0,
+            split_scheme="walkforward",
+            purge_width_bars=0,
+            embargo_width_bars=int(
+                math.ceil(
+                    resolved_feature_lookback + label_horizon + holding_period
+                    + execution_horizon
+                )
+            ),
+            feature_version=FEATURE_VERSION,
+        )
 
         trial_registry = TrialRegistry(settings.RESULTS_ROOT / "trials.db")
 
@@ -1028,6 +1178,7 @@ def walkforward(
                 strat,
                 test_panel,
                 BacktestConfig(capital=1e7, cost_model=cost_model),
+                contract=wf_contract,
                 tradable=test_tradable_mask,
             )
             split_daily_gross = res.daily.gross_returns
@@ -1060,6 +1211,7 @@ def walkforward(
             trial_registry.record(
                 TrialRecord(
                     config_hash=wf_chash,
+                    contract_hash=wf_contract.contract_hash,
                     ts=datetime.now(timezone.utc).isoformat(timespec="seconds"),
                     strategy=strategy,
                     params_json=json.dumps(cfg.get("params", {})),
@@ -1078,6 +1230,24 @@ def walkforward(
                     ruined=bool(res.ruined),
                     ruin_index=int(res.ruin_index),
                     error=None,
+                    # ---- specs/research_contract.md AMENDMENT 1 / obligation 10:
+                    # P4 regression fix -- these 12 fields were previously
+                    # unpopulated on every split record this command wrote. ----
+                    seed=wf_contract.seed,
+                    universe_name=universe_name,
+                    universe_hash=wf_universe_hash,
+                    panel_hash=wf_panel_hash,
+                    start=split.test[0].isoformat(),
+                    end=split.test[1].isoformat(),
+                    cost_model_id=wf_cost_model_id,
+                    slippage_model_id=wf_slippage_model_id,
+                    fill_model_id=wf_fill_model_id,
+                    embargo_components=wf_embargo_components,
+                    # Non-null per obligation 10: every split shares one parent --
+                    # the strategy+params identity (`wf_chash`) all of this run's
+                    # splits (and the pooled record below) were evaluated under.
+                    parent_trial_id=wf_chash,
+                    feature_version=FEATURE_VERSION,
                 )
             )
 
@@ -1140,6 +1310,7 @@ def walkforward(
                     decision_latency_bars=latency_bars,
                     cost_model=cost_model,
                 ),
+                contract=wf_contract,
                 tradable=full_tradable_mask,
             )
         latency_sharpes = {
@@ -1268,6 +1439,7 @@ def walkforward(
         trial_registry.record(
             TrialRecord(
                 config_hash=strategy_config_hash(cfg),
+                contract_hash=wf_contract.contract_hash,
                 ts=datetime.now(timezone.utc).isoformat(timespec="seconds"),
                 strategy=strategy,
                 params_json=json.dumps(cfg.get("params", {})),
@@ -1286,6 +1458,25 @@ def walkforward(
                 ruined=bool(full_result.ruined),
                 ruin_index=int(full_result.ruin_index),
                 error=None,
+                # ---- specs/research_contract.md AMENDMENT 1 / obligation 10: P4
+                # regression fix -- the pooled record represents the corrected,
+                # validated verdict a reader would trust most, and previously
+                # carried the WEAKEST provenance of any record this command wrote
+                # (none of these 12 fields). ----
+                seed=wf_contract.seed,
+                universe_name=universe_name,
+                universe_hash=wf_universe_hash,
+                panel_hash=wf_panel_hash,
+                start=start_d.isoformat(),
+                end=end_d.isoformat(),
+                cost_model_id=wf_cost_model_id,
+                slippage_model_id=wf_slippage_model_id,
+                fill_model_id=wf_fill_model_id,
+                embargo_components=wf_embargo_components,
+                # Non-null per obligation 10: the pooled record's parent is the
+                # same strategy+params identity its constituent splits share.
+                parent_trial_id=wf_chash,
+                feature_version=FEATURE_VERSION,
             )
         )
     except Exception as exc:
@@ -1495,6 +1686,27 @@ def sweep(
             feature_lookback=0.0, label_horizon=0.0, holding_period=0.0, execution_horizon=0.0
         )
 
+        # ---- specs/research_contract.md: n_planned_trials is declared BEFORE the
+        # sweep runs, from the already-expanded param_dicts (obligation 8). One
+        # contract governs the whole sweep (data/costs/splits are fixed across
+        # trials; only each trial's own strategy params vary, which is what
+        # config_hash below still disambiguates per trial-directory). ----
+        sweep_contract = _build_research_contract(
+            panel_id=str(spec),
+            panel_hash=sweep_panel_hash,
+            start=start_d,
+            end=end_d,
+            universe_name=universe_name,
+            universe_hash=sweep_universe_hash,
+            cost_model_id=sweep_cost_model_id,
+            slippage_model_id=sweep_slippage_model_id,
+            decision_latency_bars=0,
+            n_planned_trials=len(param_dicts),
+            holdout_intent="reading_now" if (holdout_intersects and allow_holdout) else "never",
+            seed=0,
+            feature_version=FEATURE_VERSION,
+        )
+
         registry_db = TrialRegistry(settings.RESULTS_ROOT / "trials.db")
         n_ok = 0
         n_failed = 0
@@ -1510,12 +1722,14 @@ def sweep(
             cfg = {"strategy": strategy_name, "params": params}
             chash = strategy_config_hash(cfg)
             sweep_chashes.append(chash)
+            sweep_contract.check_trial_count(i + 1)
             try:
                 strat = registry.build(cfg)
                 res = run_backtest(
                     strat,
                     panel,
                     BacktestConfig(capital=1e7, cost_model=cost_model, fill_model=fill_model),
+                    contract=sweep_contract,
                 )
                 sweep_daily_net = res.daily.returns
                 trial_dir = settings.RESULTS_ROOT / "trials" / chash
@@ -1546,6 +1760,7 @@ def sweep(
                 registry_db.record(
                     TrialRecord(
                         config_hash=chash,
+                        contract_hash=sweep_contract.contract_hash,
                         ts=datetime.now(timezone.utc).isoformat(timespec="seconds"),
                         strategy=strategy_name,
                         params_json=json.dumps(params),
@@ -1564,7 +1779,7 @@ def sweep(
                         ruined=bool(res.ruined),
                         ruin_index=int(res.ruin_index),
                         error=None,
-                        seed=None,
+                        seed=sweep_contract.seed,
                         universe_name=universe_name,
                         universe_hash=sweep_universe_hash,
                         panel_hash=sweep_panel_hash,
@@ -1686,7 +1901,15 @@ def tilt(
         )
 
     try:
+        from nifty_quant import settings
+        from nifty_quant.data.manifest import Manifest
         from nifty_quant.data.panel import PanelSpec, load_panel
+        from nifty_quant.research.provenance import (
+            FEATURE_VERSION,
+            compute_panel_hash,
+            compute_universe_hash,
+        )
+        from nifty_quant.research.registry import TrialRegistry
         from nifty_quant.research.tilt import TiltConfig, run_tilt
         from nifty_quant.universe.static import load_universe
 
@@ -1716,7 +1939,40 @@ def tilt(
             seed=seed,
         )
 
-        result = run_tilt(panel, config)
+        # ---- specs/research_contract.md, Enforcement gate 2 / P1: tilt is the only
+        # construction in this repo that has beaten the index net of costs, and
+        # previously bypassed the research spine entirely (zero references to
+        # TrialRegistry/TrialRecord/run_backtest). It now requires a contract and
+        # writes a TrialRecord, same as `backtest`/`walkforward`/`sweep`. `nq tilt`
+        # has no --allow-holdout flag (run_tilt's own internal HoldoutLock check is
+        # unconditional, with no bypass), so holdout_intent is always "never" here. ----
+        manifest_adjustments = ""
+        try:
+            manifest_adjustments = Manifest.load().adjustments
+        except Exception:
+            manifest_adjustments = ""
+        tilt_panel_hash = compute_panel_hash(panel, adjustments=manifest_adjustments)
+        tilt_universe_hash = compute_universe_hash(
+            name=universe_name, symbols=universe.symbols, n_sessions=panel.n_days()
+        )
+        contract = _build_research_contract(
+            panel_id=str(spec),
+            panel_hash=tilt_panel_hash,
+            start=start_d,
+            end=end_d,
+            universe_name=universe_name,
+            universe_hash=tilt_universe_hash,
+            cost_model_id="nse_intraday_default",
+            slippage_model_id="none",
+            decision_latency_bars=0,
+            n_planned_trials=1,
+            holdout_intent="never",
+            seed=seed,
+            feature_version=FEATURE_VERSION,
+        )
+        tilt_registry = TrialRegistry(settings.RESULTS_ROOT / "trials.db")
+
+        result = run_tilt(panel, config, contract=contract, registry=tilt_registry)
         typer.echo("")
         typer.echo(result.to_table())
         typer.echo("")

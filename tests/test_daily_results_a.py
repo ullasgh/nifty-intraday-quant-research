@@ -38,9 +38,9 @@ import datetime as dt
 from zoneinfo import ZoneInfo
 
 import numpy as np
-from nifty_quant.backtest.daily import DailyResult
 from pydantic import BaseModel
 
+from nifty_quant.backtest.daily import DailyResult
 from nifty_quant.backtest.engine import BacktestConfig, run_backtest
 from nifty_quant.backtest.metrics import aggregate_returns_by_group, compute_metrics
 from nifty_quant.data.panel import Panel
@@ -49,6 +49,7 @@ from nifty_quant.strategy.base import (
     Strategy,
     TargetPortfolio,
 )
+from tests.contract_fixtures import minimal_contract
 
 _IST = ZoneInfo("Asia/Kolkata")
 
@@ -189,6 +190,7 @@ def _run_fixed(
         strategy,
         panel,
         BacktestConfig(capital=1_000_000.0),
+        contract=minimal_contract(),
     )
     return result, strategy
 

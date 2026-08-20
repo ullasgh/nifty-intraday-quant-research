@@ -19,6 +19,7 @@ from nifty_quant.strategy.plugins.volume_breakout import (
     VolumeBreakoutParams,
     VolumeBreakoutStrategy,
 )
+from tests.contract_fixtures import minimal_contract
 
 _IST = ZoneInfo("Asia/Kolkata")
 
@@ -145,7 +146,7 @@ def test_state_reinit_when_symbols_change() -> None:
         fill_model=FillModel(slippage=ZeroSlippage()),
     )
 
-    result = run_backtest(strategy, panel, config)
+    result = run_backtest(strategy, panel, config, contract=minimal_contract())
 
     # Verify the backtest completed without assertion errors
     assert isinstance(result.trades, pd.DataFrame)
@@ -184,7 +185,7 @@ def test_exit_mode_time_holds_until_hold_bars() -> None:
         fill_model=FillModel(slippage=ZeroSlippage()),
     )
 
-    result = run_backtest(strategy, panel, config)
+    result = run_backtest(strategy, panel, config, contract=minimal_contract())
 
     # Backtest should complete without errors; signal generation and exits are tested
     # by existing test_volume_breakout.py tests. This test verifies the exit_mode='time'
@@ -224,7 +225,7 @@ def test_exit_mode_opposite_exits_on_opposite_signal() -> None:
         fill_model=FillModel(slippage=ZeroSlippage()),
     )
 
-    result = run_backtest(strategy, panel, config)
+    result = run_backtest(strategy, panel, config, contract=minimal_contract())
 
     # Test verifies the exit_mode='opposite' branch executes without errors
     assert isinstance(result.trades, pd.DataFrame)
@@ -262,7 +263,7 @@ def test_exit_mode_stop_target_uses_holding_period_safety() -> None:
         fill_model=FillModel(slippage=ZeroSlippage()),
     )
 
-    result = run_backtest(strategy, panel, config)
+    result = run_backtest(strategy, panel, config, contract=minimal_contract())
 
     # Test verifies the exit_mode='stop_target' branch executes without errors
     assert isinstance(result.trades, pd.DataFrame)
@@ -298,7 +299,7 @@ def test_direction_continuation_trades_long_on_up_breakout() -> None:
         fill_model=FillModel(slippage=ZeroSlippage()),
     )
 
-    result = run_backtest(strategy, panel, config)
+    result = run_backtest(strategy, panel, config, contract=minimal_contract())
 
     # Continuation should produce positive returns on uptrend
     assert isinstance(result.trades, pd.DataFrame)
@@ -337,7 +338,7 @@ def test_direction_fade_trades_short_on_up_breakout() -> None:
         fill_model=FillModel(slippage=ZeroSlippage()),
     )
 
-    result = run_backtest(strategy, panel, config)
+    result = run_backtest(strategy, panel, config, contract=minimal_contract())
 
     # Fade should short when continuation would go long
     assert isinstance(result.trades, pd.DataFrame)
@@ -374,7 +375,7 @@ def test_use_hurst_gate_false_ignores_hurst() -> None:
         fill_model=FillModel(slippage=ZeroSlippage()),
     )
 
-    result = run_backtest(strategy, panel, config)
+    result = run_backtest(strategy, panel, config, contract=minimal_contract())
 
     assert isinstance(result.trades, pd.DataFrame)
     # Should produce trades even without Hurst filtering
@@ -412,7 +413,7 @@ def test_use_hurst_gate_true_requires_hurst_threshold() -> None:
         fill_model=FillModel(slippage=ZeroSlippage()),
     )
 
-    result = run_backtest(strategy, panel, config)
+    result = run_backtest(strategy, panel, config, contract=minimal_contract())
 
     assert isinstance(result.trades, pd.DataFrame)
     # High Hurst threshold should filter out many trades compared to
@@ -451,7 +452,7 @@ def test_hurst_window_390_bridge_overnight() -> None:
         fill_model=FillModel(slippage=ZeroSlippage()),
     )
 
-    result = run_backtest(strategy, panel, config)
+    result = run_backtest(strategy, panel, config, contract=minimal_contract())
 
     assert isinstance(result.trades, pd.DataFrame)
     # Hurst values at row 390 should be finite (window has filled)
@@ -489,7 +490,7 @@ def test_cooldown_side_tracking_long_vs_short() -> None:
         fill_model=FillModel(slippage=ZeroSlippage()),
     )
 
-    result = run_backtest(strategy, panel, config)
+    result = run_backtest(strategy, panel, config, contract=minimal_contract())
 
     # Cooldown should prevent rapid re-entry on the same side
     assert isinstance(result.trades, pd.DataFrame)
@@ -563,7 +564,7 @@ def test_square_off_time_forces_exit() -> None:
         fill_model=FillModel(slippage=ZeroSlippage()),
     )
 
-    result = run_backtest(strategy, panel, config)
+    result = run_backtest(strategy, panel, config, contract=minimal_contract())
 
     # All positions should be zero by 10:00
     assert isinstance(result.positions, np.ndarray)

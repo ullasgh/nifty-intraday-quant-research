@@ -15,6 +15,7 @@ import pytest
 from nifty_quant.calendar import TradingCalendar
 from nifty_quant.research.splits import HoldoutLock
 from nifty_quant.research.tilt import TiltConfig, run_tilt
+from tests.contract_fixtures import minimal_contract
 
 # Import fixtures from test_tilt_a to reuse panel builders and avoid duplication
 from tests.test_tilt_a import (
@@ -47,7 +48,7 @@ def test_explain_with_warnings_includes_warning_section() -> None:
         capital=1_000_000.0,
         seed=0,
     )
-    result = run_tilt(panel, config)
+    result = run_tilt(panel, config, contract=minimal_contract())
 
     # Result should have warnings because d2 is missing exit checkpoint
     assert len(result.warnings) > 0
@@ -76,7 +77,7 @@ def test_invalid_tilt_type_raises_with_descriptive_error() -> None:
     )
 
     with pytest.raises(ValueError, match=r"tilt must be 'mild' or 'aggressive'"):
-        run_tilt(panel, config)
+        run_tilt(panel, config, contract=minimal_contract())
 
 
 def test_mild_tilt_with_all_features_in_top_half_uses_equal_weight() -> None:
@@ -110,7 +111,7 @@ def test_mild_tilt_with_all_features_in_top_half_uses_equal_weight() -> None:
         capital=1_000_000.0,
         seed=0,
     )
-    result = run_tilt(panel, config)
+    result = run_tilt(panel, config, contract=minimal_contract())
 
     # With all features in top half and mild tilt, equal weights should be assigned
     assert result.total.n_sessions == 5
@@ -148,8 +149,8 @@ def test_rebalance_every_greater_than_one_holds_book_and_drifts() -> None:
         seed=0,
     )
 
-    result_rebalance = run_tilt(panel, config_rebalance_2)
-    result_daily = run_tilt(panel, config_daily)
+    result_rebalance = run_tilt(panel, config_rebalance_2, contract=minimal_contract())
+    result_daily = run_tilt(panel, config_daily, contract=minimal_contract())
 
     # Both should have same number of sessions
     assert result_rebalance.total.n_sessions == result_daily.total.n_sessions
@@ -189,8 +190,8 @@ def test_rebalance_every_three_holds_for_two_sessions() -> None:
         seed=0,
     )
 
-    result_rebalance = run_tilt(panel, config_rebalance_3)
-    result_daily = run_tilt(panel, config_daily)
+    result_rebalance = run_tilt(panel, config_rebalance_3, contract=minimal_contract())
+    result_daily = run_tilt(panel, config_daily, contract=minimal_contract())
 
     # Verify the configuration was honored
     assert result_rebalance.config.rebalance_every == 3
@@ -225,7 +226,7 @@ def test_min_weight_seen_all_zero_weights_adjusted_to_zero() -> None:
         capital=1_000_000.0,
         seed=0,
     )
-    result = run_tilt(panel, config)
+    result = run_tilt(panel, config, contract=minimal_contract())
 
     # Aggressive tilt should have exactly 1 nonzero weight per session
     # So min_weight_seen should be > 0
@@ -265,7 +266,7 @@ def test_missing_checkpoint_day_filtering_and_warning_generation() -> None:
         capital=1_000_000.0,
         seed=0,
     )
-    result = run_tilt(panel, config)
+    result = run_tilt(panel, config, contract=minimal_contract())
 
     # d0, d3, d4, d5 should be usable (4 sessions)
     # But d1 and d2 should be dropped due to missing checkpoints
@@ -302,7 +303,7 @@ def test_breakeven_turnover_infinite_when_gross_negative() -> None:
         capital=1_000_000.0,
         seed=0,
     )
-    result = run_tilt(panel, config)
+    result = run_tilt(panel, config, contract=minimal_contract())
 
     # When gross_bps <= 0, breakeven_turnover should be inf
     if result.total.gross_bps <= 0:
@@ -323,7 +324,7 @@ def test_breakeven_turnover_finite_when_gross_positive() -> None:
         capital=1_000_000.0,
         seed=0,
     )
-    result = run_tilt(panel, config)
+    result = run_tilt(panel, config, contract=minimal_contract())
 
     # With the cycling_aggressive_panel setup, gross should be positive
     assert result.total.gross_bps > 0
@@ -357,7 +358,7 @@ def test_weights_long_only_and_normalized_via_diagnostics() -> None:
         capital=1_000_000.0,
         seed=0,
     )
-    result = run_tilt(panel, config)
+    result = run_tilt(panel, config, contract=minimal_contract())
 
     # Weights must be non-negative (long-only)
     assert result.min_weight_seen >= 0.0
@@ -390,7 +391,7 @@ def test_to_table_without_warnings_no_warning_section() -> None:
         capital=1_000_000.0,
         seed=0,
     )
-    result = run_tilt(panel, config)
+    result = run_tilt(panel, config, contract=minimal_contract())
 
     # This panel should have no missing checkpoints, so no warnings
     assert len(result.warnings) == 0
@@ -424,7 +425,7 @@ def test_aggressive_tilt_bottom_quintile_weighting() -> None:
         capital=1_000_000.0,
         seed=0,
     )
-    result_5 = run_tilt(panel_5, config_5)
+    result_5 = run_tilt(panel_5, config_5, contract=minimal_contract())
 
     # With 5 symbols, aggressive tilt should hold 1 per session
     # max_n_held should be 1
@@ -449,7 +450,7 @@ def test_aggressive_tilt_bottom_quintile_weighting() -> None:
         capital=1_000_000.0,
         seed=0,
     )
-    result_10 = run_tilt(panel_10, config_10)
+    result_10 = run_tilt(panel_10, config_10, contract=minimal_contract())
 
     # With 10 symbols, aggressive tilt should hold 2 per session
     # max_n_held should be 2
@@ -478,7 +479,7 @@ def test_no_usable_sessions_raises_with_descriptive_error() -> None:
     )
 
     with pytest.raises(ValueError, match=r"No sessions with >= 5 valid names"):
-        run_tilt(panel, config)
+        run_tilt(panel, config, contract=minimal_contract())
 
 
 @pytest.mark.holdout_aware
@@ -515,7 +516,7 @@ def test_holdout_boundary_global_not_panel_relative() -> None:
     )
 
     with pytest.raises(ValueError, match=r"(?i)holdout"):
-        run_tilt(panel, config_in_holdout)
+        run_tilt(panel, config_in_holdout, contract=minimal_contract())
 
 
 def test_smoothing_with_rebalance_every_interaction() -> None:
@@ -548,8 +549,8 @@ def test_smoothing_with_rebalance_every_interaction() -> None:
         seed=0,
     )
 
-    result_no_hold = run_tilt(panel, config_smooth_no_hold)
-    result_with_hold = run_tilt(panel, config_smooth_with_hold)
+    result_no_hold = run_tilt(panel, config_smooth_no_hold, contract=minimal_contract())
+    result_with_hold = run_tilt(panel, config_smooth_with_hold, contract=minimal_contract())
 
     # Both should complete successfully
     assert result_no_hold.total.n_sessions == result_with_hold.total.n_sessions
@@ -576,7 +577,7 @@ def test_empty_warning_tuple_vs_populated() -> None:
         seed=0,
     )
 
-    result_good = run_tilt(panel_good, config)
+    result_good = run_tilt(panel_good, config, contract=minimal_contract())
 
     # Good panel should have empty warnings
     assert result_good.warnings == ()
@@ -625,7 +626,7 @@ def test_drift_calculation_on_hold_days_with_valid_names() -> None:
         seed=0,
     )
 
-    result_hold = run_tilt(panel, config_hold)
+    result_hold = run_tilt(panel, config_hold, contract=minimal_contract())
 
     # Should complete without error and produce valid output
     assert result_hold.total.n_sessions == 6
@@ -663,7 +664,7 @@ def test_drift_with_zero_denominator_case() -> None:
         seed=0,
     )
 
-    result_hold = run_tilt(panel, config_hold)
+    result_hold = run_tilt(panel, config_hold, contract=minimal_contract())
 
     # Should complete without error and produce valid output
     assert result_hold.total.n_sessions == 6
@@ -698,7 +699,7 @@ def test_compute_mild_weights_all_features_ranked_above_half() -> None:
         seed=0,
     )
 
-    result = run_tilt(panel, config)
+    result = run_tilt(panel, config, contract=minimal_contract())
 
     # Should have non-zero sessions
     assert result.total.n_sessions > 0
@@ -735,7 +736,7 @@ def test_mild_tilt_with_negative_features() -> None:
         seed=0,
     )
 
-    result = run_tilt(panel, config)
+    result = run_tilt(panel, config, contract=minimal_contract())
 
     # Should have non-zero sessions
     assert result.total.n_sessions > 0
@@ -771,7 +772,7 @@ def test_min_weight_global_adjustment_boundary() -> None:
         seed=0,
     )
 
-    result = run_tilt(panel, config)
+    result = run_tilt(panel, config, contract=minimal_contract())
 
     # min_weight_seen should be >= 0.0
     assert result.min_weight_seen >= 0.0
@@ -798,7 +799,7 @@ def test_rebalance_every_one_is_daily() -> None:
         seed=0,
     )
 
-    result_daily = run_tilt(panel, config_daily)
+    result_daily = run_tilt(panel, config_daily, contract=minimal_contract())
 
     # Daily rebalance should have turnover = 1.0 on average for this alternating setup
     # (changing from one symbol to another each day)
@@ -826,7 +827,7 @@ def test_edge_case_very_large_rebalance_every() -> None:
         seed=0,
     )
 
-    result_large = run_tilt(panel, config_large)
+    result_large = run_tilt(panel, config_large, contract=minimal_contract())
 
     # Should only rebalance on day 0, then hold for all remaining days
     assert result_large.total.n_sessions == 5
@@ -855,7 +856,7 @@ def test_both_negative_and_positive_sessions_in_results() -> None:
         seed=0,
     )
 
-    result = run_tilt(panel, config)
+    result = run_tilt(panel, config, contract=minimal_contract())
 
     # Should have per-year rows for both 2022 and 2023
     assert len(result.per_year) >= 1
@@ -893,7 +894,7 @@ def test_large_price_changes_with_rebalance_hold() -> None:
         seed=0,
     )
 
-    result = run_tilt(panel, config)
+    result = run_tilt(panel, config, contract=minimal_contract())
 
     # Should complete successfully
     assert result.total.n_sessions == 6

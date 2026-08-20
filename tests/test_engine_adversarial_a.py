@@ -28,6 +28,16 @@ D2. Item 16 ("ruin: assert `ruined` is set and `ruin_index` points at the right 
 
 ============================ INVARIANT FAILURES ===============================
 
+STATUS UPDATE 2026-08-20: **all 21 now PASS.** The four failures catalogued below were
+real when written and were subsequently FIXED in the engine (the F1-F13 series; see
+specs/engine_adversarial_invariants.md). This section is retained as the record of what
+was found and why -- it is history, not a live defect list. Do not read "4 FAIL" below as
+the current state, and do not delete the analysis: these tests are now the regression
+guards for exactly those four defects, which is why the findings are worth keeping next
+to them.
+
+Original finding, as written:
+
 21 tests, run against the real engine: 17 PASS, 4 FAIL. Every FAIL below is backed by
 a real, reproduced test run in this file -- not asserted from memory -- and none of
 these tests was weakened or the engine touched to make it pass.
@@ -113,6 +123,7 @@ from nifty_quant.strategy.base import (
     Strategy,
     TargetPortfolio,
 )
+from tests.contract_fixtures import minimal_contract
 
 _IST = ZoneInfo("Asia/Kolkata")
 CAPITAL = 1_000_000.0
@@ -324,7 +335,7 @@ def test_cross_zero_long_to_short():
         script,
         decision_times=("09:20", "09:25", "09:30"),
     )
-    result = run_backtest(strategy, panel, default_config())
+    result = run_backtest(strategy, panel, default_config(), contract=minimal_contract())
 
     assert result.trades.iloc[1]["qty"] == pytest.approx(-2000.0)
     assert result.positions[-2, 0] == pytest.approx(-1000.0)
@@ -369,7 +380,7 @@ def test_short_to_flat():
         script,
         decision_times=("09:20", "09:25"),
     )
-    result = run_backtest(strategy, panel, default_config())
+    result = run_backtest(strategy, panel, default_config(), contract=minimal_contract())
 
     # positions[-2] is the decision-2 SNAPSHOT, taken BEFORE decision 2's own
     # buy-to-cover order fills (it reflects state left by decision 1 only), so it is
@@ -423,7 +434,7 @@ def test_cross_zero_short_to_long():
         script,
         decision_times=("09:20", "09:25", "09:30"),
     )
-    result = run_backtest(strategy, panel, default_config())
+    result = run_backtest(strategy, panel, default_config(), contract=minimal_contract())
 
     assert result.trades.iloc[1]["qty"] == pytest.approx(2000.0)
     assert result.positions[-2, 0] == pytest.approx(1000.0)
@@ -470,7 +481,7 @@ def test_long_flat_long_again_same_session():
         script,
         decision_times=("09:20", "09:25", "09:30"),
     )
-    result = run_backtest(strategy, panel, default_config())
+    result = run_backtest(strategy, panel, default_config(), contract=minimal_contract())
 
     assert len(result.trades) >= 4
     assert result.trades.iloc[0]["qty"] == pytest.approx(1000.0)
@@ -526,7 +537,7 @@ def test_identical_target_emits_no_order():
         script,
         decision_times=("09:20", "09:25"),
     )
-    result = run_backtest(strategy, panel, default_config())
+    result = run_backtest(strategy, panel, default_config(), contract=minimal_contract())
 
     assert_finite_everywhere(result)
     # decision 2's identical target must emit no order and thus produce no trade of
@@ -579,7 +590,7 @@ def test_zero_bar_traded_value_rejects_order():
         script,
         decision_times=("09:20", "09:30"),
     )
-    result = run_backtest(strategy, panel, default_config())
+    result = run_backtest(strategy, panel, default_config(), contract=minimal_contract())
 
     assert len(result.trades) == 0
     assert result.positions[-2, 0] == pytest.approx(0.0)
@@ -631,7 +642,7 @@ def test_repeated_partial_fills():
         script,
         decision_times=("09:20", "09:26"),
     )
-    result = run_backtest(strategy, panel, default_config())
+    result = run_backtest(strategy, panel, default_config(), contract=minimal_contract())
 
     aaa_trades = result.trades[result.trades["symbol"] == "AAA"]
     aaa_rows = np.searchsorted(ts, aaa_trades["ts"].to_numpy())
@@ -686,7 +697,7 @@ def test_rejected_order_does_not_double_next_target():
         script,
         decision_times=("09:20", "09:26"),
     )
-    result = run_backtest(strategy, panel, default_config())
+    result = run_backtest(strategy, panel, default_config(), contract=minimal_contract())
 
     sizing: SizingResult = GrossNotionalSizer().to_shares(
         np.array([0.10, 0.0]),
@@ -749,7 +760,7 @@ def test_zero_and_nan_open_price_reject_not_divide():
         script,
         decision_times=("09:20", "09:30"),
     )
-    result = run_backtest(strategy, panel, default_config())
+    result = run_backtest(strategy, panel, default_config(), contract=minimal_contract())
 
     assert len(result.trades) == 0
     assert result.positions[-2, 0] == pytest.approx(0.0)
@@ -798,7 +809,7 @@ def test_halt_after_entry_forced_liquidation_is_counted():
         strategy,
         panel,
         default_config(square_off_time="09:30"),
-        tradable=tradable,
+        tradable=tradable, contract=minimal_contract()
     )
 
     assert_finite_everywhere(result)
@@ -850,7 +861,7 @@ def test_missing_bar_while_position_open_corrupts_equity():
         decision_times=("09:20", "09:26"),
     )
 
-    result = run_backtest(strategy, panel, default_config())
+    result = run_backtest(strategy, panel, default_config(), contract=minimal_contract())
 
     # EXPECTED TO FAIL: confirmed NaN-in-equity-curve finding, see file docstring
     assert_finite_everywhere(result)
@@ -897,7 +908,7 @@ def test_absent_symbol_never_ordered():
         decision_times=("09:20", "09:25"),
     )
 
-    result = run_backtest(strategy, panel, default_config())
+    result = run_backtest(strategy, panel, default_config(), contract=minimal_contract())
 
     assert "CCC" in result.absent_symbols
     assert result.n_symbols_absent == 1
@@ -944,7 +955,7 @@ def test_extreme_price_move_stays_finite():
         decision_times=("09:20",),
     )
 
-    result = run_backtest(strategy, panel, default_config())
+    result = run_backtest(strategy, panel, default_config(), contract=minimal_contract())
 
     assert_finite_everywhere(result)
     assert_i1_terminal(result)
@@ -993,7 +1004,7 @@ def test_ruin_flag_and_index_at_crash_row():
         default_config(
             capital=100_000.0,
             sizer=GrossNotionalSizer(max_weight=1.0),
-        ),
+        ), contract=minimal_contract()
     )
 
     assert result.equity_curve[9] < 0
@@ -1058,7 +1069,7 @@ def test_undercapitalized_order_drives_cash_negative_and_is_surfaced():
             capital=100_000.0,
             sizer=_HugeSizer(),
             square_off_time="09:30",
-        ),
+        ), contract=minimal_contract()
     )
 
     trades = result.trades
@@ -1109,7 +1120,7 @@ def test_muhurat_and_shortened_sessions_same_panel():
     )
 
     assert panel.n_rows() == 60 + 105 == 165
-    result = run_backtest(strategy, panel, default_config())
+    result = run_backtest(strategy, panel, default_config(), contract=minimal_contract())
 
     assert result.forced_eod_liquidation_days == 0
     assert_i1_terminal(result)
@@ -1151,7 +1162,7 @@ def test_single_row_session_no_crash():
     )
 
     assert panel.n_rows() == 21
-    result = run_backtest(strategy, panel, default_config())
+    result = run_backtest(strategy, panel, default_config(), contract=minimal_contract())
 
     day1_ts = int(ts[row_at(day_offsets, 1, "09:15")])
     assert not np.any(result.trades["ts"].to_numpy() == day1_ts)
@@ -1195,7 +1206,7 @@ def test_square_off_time_absent_from_panel():
     result = run_backtest(
         strategy,
         panel,
-        default_config(square_off_time="15:20"),
+        default_config(square_off_time="15:20"), contract=minimal_contract()
     )
 
     # The clamp-to-last-row contract predicts zero; keep this assertion strict if it differs.
@@ -1255,7 +1266,7 @@ def test_no_stop_state_leak_across_weekend_gap():
         close=close,
         volume=volume,
     )
-    result = run_backtest(strategy, panel, default_config())
+    result = run_backtest(strategy, panel, default_config(), contract=minimal_contract())
 
     assert np.asarray(result.positions)[-2, 0] != 0.0
     assert_i1_terminal(result)
@@ -1307,7 +1318,7 @@ def test_rejected_order_then_different_target_same_day():
         close=close,
         volume=volume,
     )
-    result = run_backtest(strategy, panel, default_config())
+    result = run_backtest(strategy, panel, default_config(), contract=minimal_contract())
 
     expected = GrossNotionalSizer().to_shares(
         np.array([0.20, 0.0]),
@@ -1358,7 +1369,7 @@ def test_last_row_decision_fills_across_session_boundary():
         },
         decision_times=None,
     )
-    result = run_backtest(strategy, panel, default_config())
+    result = run_backtest(strategy, panel, default_config(), contract=minimal_contract())
 
     day1_first_ts = int(ts[row_at(day_offsets, 1, "09:15")])
     # F1 FIXED (spec: order_lifecycle.md section C/D, engine.py session-end drop): the

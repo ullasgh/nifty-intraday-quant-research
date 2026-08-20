@@ -6,11 +6,10 @@ from pathlib import Path
 
 import pytest
 
+from nifty_quant.research.contract import canonical_hash, canonical_json
 from nifty_quant.research.sweep import (
     _evaluate_constraint,
     _parse_literal,
-    canonical_json,
-    config_hash,
     expand,
     load_sweep_yaml,
 )
@@ -579,53 +578,53 @@ class TestCanonicalJson:
 
 
 class TestConfigHash:
-    """Tests for config_hash() hashing."""
+    """Tests for canonical_hash() hashing."""
 
     def test_config_hash_simple_dict(self) -> None:
         cfg = {"a": 1}
-        result = config_hash(cfg)
+        result = canonical_hash(cfg)
         assert isinstance(result, str)
         assert len(result) == 16
 
     def test_config_hash_all_hex_chars(self) -> None:
         cfg = {"a": 1}
-        result = config_hash(cfg)
+        result = canonical_hash(cfg)
         assert all(c in "0123456789abcdef" for c in result)
 
     def test_config_hash_deterministic(self) -> None:
         cfg = {"a": 1, "b": 2}
-        hash1 = config_hash(cfg)
-        hash2 = config_hash(cfg)
+        hash1 = canonical_hash(cfg)
+        hash2 = canonical_hash(cfg)
         assert hash1 == hash2
 
     def test_config_hash_key_order_irrelevant(self) -> None:
         cfg1 = {"a": 1, "b": 2}
         cfg2 = {"b": 2, "a": 1}
-        assert config_hash(cfg1) == config_hash(cfg2)
+        assert canonical_hash(cfg1) == canonical_hash(cfg2)
 
     def test_config_hash_different_values_different_hashes(self) -> None:
         cfg1 = {"a": 1}
         cfg2 = {"a": 2}
-        assert config_hash(cfg1) != config_hash(cfg2)
+        assert canonical_hash(cfg1) != canonical_hash(cfg2)
 
     def test_config_hash_different_keys_different_hashes(self) -> None:
         cfg1 = {"a": 1}
         cfg2 = {"b": 1}
-        assert config_hash(cfg1) != config_hash(cfg2)
+        assert canonical_hash(cfg1) != canonical_hash(cfg2)
 
     def test_config_hash_nested_dict(self) -> None:
         cfg = {"params": {"alpha": 0.5}}
-        result = config_hash(cfg)
+        result = canonical_hash(cfg)
         assert len(result) == 16
 
     def test_config_hash_list_values(self) -> None:
         cfg = {"values": [1, 2, 3]}
-        result = config_hash(cfg)
+        result = canonical_hash(cfg)
         assert len(result) == 16
 
     def test_config_hash_consistent_with_canonical_json(self) -> None:
         cfg = {"z": 1, "a": 2}
-        hash1 = config_hash(cfg)
+        hash1 = canonical_hash(cfg)
         cfg_reordered = {"a": 2, "z": 1}
-        hash2 = config_hash(cfg_reordered)
+        hash2 = canonical_hash(cfg_reordered)
         assert hash1 == hash2

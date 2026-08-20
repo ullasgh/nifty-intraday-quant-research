@@ -23,6 +23,7 @@ from nifty_quant.strategy.base import (
     Strategy,
     TargetPortfolio,
 )
+from tests.contract_fixtures import minimal_contract
 
 SYMBOLS = ("AAA", "BBB", "CCC")
 N_DAYS = 5
@@ -220,7 +221,7 @@ def test_gross_sharpe_ge_net_sharpe_by_construction() -> None:
         cost_model=NSEIntradayEquityCosts(),
         sizer=GrossNotionalSizer(),
     )
-    result = run_backtest(strategy, panel, config)
+    result = run_backtest(strategy, panel, config, contract=minimal_contract())
 
     assert result.total_costs > 0.0
     assert not result.ruined
@@ -265,7 +266,7 @@ def test_trades_frame_has_shortfall_columns() -> None:
         cost_model=ZeroCost(),
         sizer=GrossNotionalSizer(),
     )
-    result = run_backtest(strategy, panel, config)
+    result = run_backtest(strategy, panel, config, contract=minimal_contract())
 
     assert result.n_trades > 0
     expected = {"decision_price", "fill_price", "shortfall_bps", "participation", "filled_frac"}
@@ -286,7 +287,7 @@ def test_shortfall_sign_convention() -> None:
         cost_model=ZeroCost(),
         sizer=GrossNotionalSizer(),
     )
-    buy_result = run_backtest(buy_strategy, buy_panel, buy_config)
+    buy_result = run_backtest(buy_strategy, buy_panel, buy_config, contract=minimal_contract())
     buy_trade = _trade_at_fill_row(buy_result, buy_panel, fill_row, "AAA")
     assert buy_trade["qty"] > 0.0
     assert buy_trade["shortfall_bps"] > 0.0
@@ -298,7 +299,7 @@ def test_shortfall_sign_convention() -> None:
         cost_model=ZeroCost(),
         sizer=GrossNotionalSizer(),
     )
-    sell_result = run_backtest(sell_strategy, sell_panel, sell_config)
+    sell_result = run_backtest(sell_strategy, sell_panel, sell_config, contract=minimal_contract())
     sell_trade = _trade_at_fill_row(sell_result, sell_panel, fill_row, "AAA")
     assert sell_trade["qty"] < 0.0
     assert sell_trade["shortfall_bps"] > 0.0
@@ -315,7 +316,7 @@ def test_decision_price_is_cursor_close_not_fill_price() -> None:
         cost_model=ZeroCost(),
         sizer=GrossNotionalSizer(),
     )
-    result = run_backtest(strategy, panel, config)
+    result = run_backtest(strategy, panel, config, contract=minimal_contract())
 
     trade = _trade_at_fill_row(result, panel, fill_row, "AAA")
     assert trade["decision_price"] == pytest.approx(100.0)

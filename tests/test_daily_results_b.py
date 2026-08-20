@@ -58,6 +58,7 @@ from nifty_quant.strategy.base import (
     Strategy,
     TargetPortfolio,
 )
+from tests.contract_fixtures import minimal_contract
 
 # ---------------------------------------------------------------------------
 # Date/time helpers. Rule 4: ts is int64 epoch-seconds, no timezone attached.
@@ -272,7 +273,7 @@ def _run_bt(strategy, panel):
         cost_model=ZeroCost(),
         fill_model=FillModel(slippage=ZeroSlippage()),
     )
-    return run_backtest(strategy, panel, config)
+    return run_backtest(strategy, panel, config, contract=minimal_contract())
 
 
 # ---------------------------------------------------------------------------

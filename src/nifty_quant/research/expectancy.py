@@ -291,72 +291,131 @@ def causal_buckets(
 # ---------------------------------------------------------------------------
 
 
+# ---------------------------------------------------------------------------
+# Block-length derivation (CLAUDE.md rule 8): measured, not chosen by convention.
+#
+# `L = horizon` is a defensible FLOOR -- overlapping h-bar forward returns induce
+# dependence spanning at least h bars by construction, a standard MA(h-1)-type overlap
+# effect that exists even under iid 1-minute returns. But the underlying 1-minute return
+# series carries its own serial correlation ON TOP of that overlap, which `L = horizon`
+# alone ignores (specs/overlap_se.md section 2). This must be measured, not assumed.
+#
+# MEASURED 2026-08-20: lag-1..30 autocorrelation of 1-minute LOG returns (LEFT-LABELLED
+# bars; only same-session consecutive pairs used -- a pair spanning a session gap, where
+# the row-to-row ts delta != 60s, is excluded so no measured correlation crosses a
+# session boundary) for ten liquid names -- RELIANCE, TCS, HDFCBANK, INFY, ICICIBANK,
+# SBIN, ITC, LT, AXISBANK, KOTAKBANK -- over 2024-01-01..2024-03-31 (n=~22,900
+# same-session consecutive pairs per symbol, computed directly from `data/bars/1/<SYM>/
+# 2024.parquet`). All ten symbols show the classic 1-minute bid-ask-bounce signature: a
+# significant NEGATIVE lag-1 ACF, decaying to inside +/-0.02 (an order of magnitude below
+# the lag-1 magnitude, used here as "practically zero") and staying there for >= 3
+# consecutive lags:
+#
+#     symbol      lag-1 ACF   decay lag (first lag where |ACF| < 0.02 for 3 consec. lags)
+#     RELIANCE      -0.0575    2
+#     TCS           -0.0488    2
+#     HDFCBANK      -0.0460    2
+#     INFY          -0.0501    2
+#     ICICIBANK     -0.0596    5
+#     SBIN          -0.0410    3
+#     ITC           -0.0631    4
+#     LT            -0.0401    2
+#     AXISBANK      -0.0617    4
+#     KOTAKBANK     -0.0658    5
+#
+#     decay lag across symbols:  p50=2.5   p90=5.0   p95=5.0   max=5
+#
+# The p95 decay lag (5 bars) is used as the extra padding added on top of the
+# horizon floor -- a conservative choice that over-covers 9 of the 10 measured symbols'
+# decay rather than the median symbol's.
+BLOCK_LENGTH_EXTRA_BARS: int = 5
+
+
+def _derive_block_length(horizon: int) -> int:
+    """Moving-block-bootstrap block length: DERIVED, never `L = horizon` by convention.
+
+    See `BLOCK_LENGTH_EXTRA_BARS` above for the measured autocorrelation this is derived
+    from. The floor is `horizon` (overlapping h-bar forward returns induce dependence
+    spanning at least h bars by construction); `BLOCK_LENGTH_EXTRA_BARS` covers the
+    additional measured autocorrelation in the underlying 1-minute return series.
+    """
+    return max(int(horizon), 1) + BLOCK_LENGTH_EXTRA_BARS
+
+
 def _block_bootstrap_resampling_2d(
     values_2d: np.ndarray,
     day_offsets: np.ndarray,
     horizon: int,
     n_boot: int,
     seed: int,
-) -> tuple[np.ndarray, tuple[tuple[int, int], ...]]:
-    """Block bootstrap on 2-D array (n_rows, n_symbols) respecting session boundaries.
+) -> tuple[np.ndarray, tuple[tuple[int, int], ...], int]:
+    """Moving-block bootstrap on 2-D array (n_rows, n_symbols), session-bounded.
+
+    Standard moving-block bootstrap (specs/overlap_se.md section 1): each replicate draws
+    blocks of `_derive_block_length(horizon)` rows WITH REPLACEMENT and concatenates them
+    until the resampled series reaches `n_rows`, truncating the final block -- it resamples
+    a SERIES, not a single block. No block straddles a session boundary: valid start
+    positions are drawn only from within a single session via `day_offsets` (never assumes
+    a fixed 375-bar stride, per CLAUDE.md rule 5). A session shorter than the block length
+    contributes no start positions and is SKIPPED; the skip count is returned, not silently
+    dropped.
 
     Returns:
-      - resampled: (n_boot, n_rows_sample, n_symbols) array of resampled values
-      - block_indices: tuple of (start, length) pairs, one per bootstrap sample
+      - resampled: (n_boot, n_rows, n_symbols) float64 array, one full-length series per
+        replicate.
+      - block_indices: FLAT tuple of (start, length) pairs, one entry per block actually
+        drawn across ALL replicates (not grouped per replicate) -- every block has the
+        same `length` (the derived block length), except none are ever truncated
+        individually; only the concatenated series is truncated to `n_rows`.
+      - n_sessions_skipped: count of sessions shorter than the block length in use.
     """
     n_rows, n_symbols = values_2d.shape
     offsets = np.asarray(day_offsets, dtype=int)
     n_sessions = len(offsets) - 1
 
-    # Compute session boundaries
     session_starts = offsets[:-1]
     session_ends = offsets[1:]
 
-    # Block length >= horizon
-    block_length = max(horizon, 1)
+    block_length = _derive_block_length(horizon)
 
-    # For each session, find all valid block starts
-    valid_starts = []
+    # For each session, find all valid block starts (block must fit entirely inside it).
+    valid_starts: list[int] = []
+    n_sessions_skipped = 0
     for sess_idx in range(n_sessions):
-        sess_start = session_starts[sess_idx]
-        sess_end = session_ends[sess_idx]
-        for start in range(sess_start, max(sess_start, sess_end - block_length + 1)):
-            valid_starts.append((start, sess_start, sess_end))
+        sess_start = int(session_starts[sess_idx])
+        sess_end = int(session_ends[sess_idx])
+        if sess_end - sess_start < block_length:
+            n_sessions_skipped += 1
+            continue
+        valid_starts.extend(range(sess_start, sess_end - block_length + 1))
+
+    rng = np.random.default_rng(seed)
+    resampled = np.full((n_boot, n_rows, n_symbols), np.nan, dtype=np.float64)
+    block_indices: list[tuple[int, int]] = []
 
     if not valid_starts:
-        # Fall back: resample all rows with replacement
-        rng = np.random.default_rng(seed)
-        resampled_rows = []
-        block_info = []
-        for _ in range(n_boot):
-            row_indices = rng.choice(n_rows, size=n_rows)
-            resampled_rows.append(values_2d[row_indices])
-            block_info.append((0, n_rows))  # Record fallback block range
-        return np.array(resampled_rows), tuple(block_info)
+        # No session is long enough to hold even one block at this block length. Fall
+        # back to whole-row iid resampling so callers still get a usable (degenerate) SE
+        # rather than an empty result; every session was already counted skipped above.
+        for b in range(n_boot):
+            row_idx = rng.choice(n_rows, size=n_rows, replace=True)
+            resampled[b] = values_2d[row_idx]
+        return resampled, tuple(block_indices), n_sessions_skipped
 
-    # Resample blocks
-    rng = np.random.default_rng(seed)
-    resampled_list = []
-    block_indices = []
+    starts_arr = np.array(valid_starts, dtype=int)
+    n_blocks_per_replicate = -(-n_rows // block_length)  # ceil(n_rows / block_length)
 
-    for _ in range(n_boot):
-        # Resample block starts
-        block_choice = rng.choice(len(valid_starts))
-        block_start_idx, sess_start, sess_end = valid_starts[block_choice]
-        block_end_idx = min(block_start_idx + block_length, sess_end)
+    for b in range(n_boot):
+        chosen_starts = rng.choice(starts_arr, size=n_blocks_per_replicate, replace=True)
+        pieces = []
+        for s in chosen_starts:
+            s_int = int(s)
+            pieces.append(values_2d[s_int : s_int + block_length])
+            block_indices.append((s_int, block_length))
+        series = np.concatenate(pieces, axis=0)[:n_rows]
+        resampled[b] = series
 
-        # Extract rows in the block
-        block_rows = values_2d[block_start_idx:block_end_idx]
-        resampled_list.append(block_rows)
-        block_indices.append((block_start_idx, block_end_idx - block_start_idx))
-
-    # Pad to same length
-    max_rows = max(r.shape[0] for r in resampled_list)
-    resampled = np.full((n_boot, max_rows, n_symbols), np.nan, dtype=np.float64)
-    for i, r in enumerate(resampled_list):
-        resampled[i, : r.shape[0], :] = r
-
-    return resampled, tuple(block_indices)
+    return resampled, tuple(block_indices), n_sessions_skipped
 
 
 def _non_overlapping_subsample(values: np.ndarray, horizon: int) -> tuple[np.ndarray, int]:
@@ -387,10 +446,14 @@ class BucketStat:
 
     bucket: int
     n_obs: int
-    n_effective: float  # after the overlap correction; << n_obs when horizon > 1
+    # n_effective is REPORTING ONLY (specs/overlap_se.md section 3, AMENDMENT 1
+    # obligation 8): n_effective = (std_bps / se_bps) ** 2. It never feeds back into
+    # se_bps, t_stat or spread_t -- mutating it changes nothing downstream.
+    n_effective: float
     mean_bps: float
     median_bps: float
     std_bps: float
+    se_bps: float  # the bootstrap/analytic standard error IS the standard error (rule 8)
     t_stat: float
     se_method: Literal["block_bootstrap", "non_overlapping", "naive"]
     ci_low_bps: float
@@ -425,11 +488,13 @@ def _compute_bucket_stats(
     median_bps = float(np.median(values_bps))
     std_bps = float(np.std(values_bps, ddof=1)) if n_obs > 1 else 0.0
 
-    # Overlap correction
+    # Overlap correction: this block computes se_bps ONLY. n_effective is derived from
+    # se_bps afterwards, as a REPORTING quantity -- it never feeds back into se_bps
+    # (specs/overlap_se.md section 3; the old n_effective = n_obs / (std/se)**2 transform
+    # here was the L8 defect and has been deleted).
     block_indices: tuple[tuple[int, int], ...] = ()
     if horizon == 1:
         # For horizon=1, no overlap correction is needed
-        n_effective = float(n_obs)
         if std_bps > 0 and n_obs > 0:
             se_bps = std_bps / np.sqrt(n_obs)
         else:
@@ -444,10 +509,11 @@ def _compute_bucket_stats(
 
         if n_symbols_in_data > 0:
             bucket_returns_2d = bucket_returns.reshape((n_rows, n_symbols_in_data))
-            resampled, block_indices = _block_bootstrap_resampling_2d(
+            resampled, block_indices, _n_sessions_skipped = _block_bootstrap_resampling_2d(
                 bucket_returns_2d, day_offsets, horizon, n_boot, seed
             )
-            # Resampled is (n_boot, n_rows_sample, n_symbols), flatten each bootstrap sample
+            # Resampled is (n_boot, n_rows, n_symbols): each replicate is now a FULL
+            # tiled-and-truncated series (L7 fix), not a single <= horizon block.
             resampled_flat = resampled.reshape((n_boot, -1))
             # Compute mean of each bootstrap sample
             # Detect which rows have at least one finite value to avoid RuntimeWarning
@@ -467,29 +533,29 @@ def _compute_bucket_stats(
             se_bps = 0.0
             block_indices = ()
 
-        if std_bps > 0 and se_bps > 0:
-            n_effective = float(n_obs / max(1.0, (std_bps / se_bps) ** 2))
-        else:
-            n_effective = n_obs
-
     elif se_method == "non_overlapping":
-        _, n_effective = _non_overlapping_subsample(valid_values, horizon)
+        _, n_eff_subsample = _non_overlapping_subsample(valid_values, horizon)
         se_bps = (
-            std_bps / np.sqrt(max(1.0, n_effective)) if std_bps > 0 and n_effective > 0 else 0.0
+            std_bps / np.sqrt(max(1.0, n_eff_subsample))
+            if std_bps > 0 and n_eff_subsample > 0
+            else 0.0
         )
 
     elif se_method == "naive":
-        n_effective = float(n_obs)
         se_bps = std_bps / np.sqrt(max(1.0, n_obs)) if std_bps > 0 and n_obs > 0 else 0.0
 
     else:
         raise ValueError(f"unknown se_method: {se_method}")
 
-    # t-statistic and CI (95%)
+    # t-statistic and CI (95%) -- computed directly from se_bps, never through n_effective
+    # (obligation 7's invariant: t_stat == mean_bps / se_bps exactly).
     t_stat = mean_bps / se_bps if se_bps > 0 else 0.0
     ci_half_width = 1.96 * se_bps  # ~95% CI
     ci_low_bps = mean_bps - ci_half_width
     ci_high_bps = mean_bps + ci_half_width
+
+    # n_effective: REPORTING ONLY, derived from se_bps after the fact (obligation 8).
+    n_effective = (std_bps / se_bps) ** 2 if se_bps > 0 else float(n_obs)
 
     return BucketStat(
         bucket=-1,  # Placeholder; set by caller
@@ -498,6 +564,7 @@ def _compute_bucket_stats(
         mean_bps=mean_bps,
         median_bps=median_bps,
         std_bps=std_bps,
+        se_bps=se_bps,
         t_stat=t_stat,
         se_method=se_method,
         ci_low_bps=ci_low_bps,
@@ -572,6 +639,7 @@ class ExpectancyTable:
             "mean_bps": [b.mean_bps for b in self.buckets],
             "median_bps": [b.median_bps for b in self.buckets],
             "std_bps": [b.std_bps for b in self.buckets],
+            "se_bps": [b.se_bps for b in self.buckets],
             "t_stat": [b.t_stat for b in self.buckets],
             "se_method": [b.se_method for b in self.buckets],
             "ci_low_bps": [b.ci_low_bps for b in self.buckets],
@@ -632,6 +700,7 @@ def conditional_expectancy(
                 mean_bps=stat.mean_bps,
                 median_bps=stat.median_bps,
                 std_bps=stat.std_bps,
+                se_bps=stat.se_bps,
                 t_stat=stat.t_stat,
                 se_method=stat.se_method,
                 ci_low_bps=stat.ci_low_bps,
@@ -650,14 +719,14 @@ def conditional_expectancy(
         bottom_mean = bucket_stats[0].mean_bps
         spread_bps = top_mean - bottom_mean
 
-        # Compute t-stat for spread
-        top_se = bucket_stats[-1].std_bps / np.sqrt(
-            max(1.0, bucket_stats[-1].n_effective)
-        )
-        bottom_se = bucket_stats[0].std_bps / np.sqrt(
-            max(1.0, bucket_stats[0].n_effective)
-        )
-        spread_se = np.sqrt(top_se**2 + bottom_se**2) if (top_se or bottom_se) else 0.0
+        # Spread SE from the bucket-level se_bps DIRECTLY (specs/overlap_se.md section 3):
+        # the bootstrap SE already reported on each bucket, combined in quadrature. This is
+        # the L8 fix at the table level -- the old code recomputed an SE via
+        # std_bps / sqrt(n_effective), which routed through the now-deleted n_effective
+        # over-correction and is exactly the defect AMENDMENT 2 traced spread_t through.
+        top_se = bucket_stats[-1].se_bps
+        bottom_se = bucket_stats[0].se_bps
+        spread_se = np.sqrt(top_se**2 + bottom_se**2) if (top_se > 0 or bottom_se > 0) else 0.0
         spread_t = spread_bps / spread_se if spread_se > 0 else 0.0
     else:
         spread_bps = 0.0

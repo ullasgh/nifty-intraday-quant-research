@@ -97,6 +97,7 @@ from nifty_quant.strategy.base import (
     Strategy,
     TargetPortfolio,
 )
+from tests.contract_fixtures import minimal_contract
 
 _IST = ZoneInfo("Asia/Kolkata")
 CAPITAL = 1_000_000.0
@@ -240,7 +241,10 @@ def test_ob1_four_timestamps_present_int64_and_ordered():
         open_=open_, high=high, low=low, close=close, volume=volume,
     )
     strategy = TsScriptStrategy(_EmptyParams(), script, decision_times=("09:20",))
-    result = run_backtest(strategy, panel, default_config(decision_latency_bars=1))
+    result = run_backtest(
+        strategy, panel, default_config(decision_latency_bars=1),
+        contract=minimal_contract(),
+    )
 
     trades = result.trades
     assert len(trades) > 0, "fixture produced no fills"
@@ -292,7 +296,7 @@ def test_order_id_monotonic_and_stable_across_distinct_orders():
     strategy = TsScriptStrategy(
         _EmptyParams(), script, decision_times=("09:20", "09:25")
     )
-    result = run_backtest(strategy, panel, default_config())
+    result = run_backtest(strategy, panel, default_config(), contract=minimal_contract())
 
     trades = result.trades
     aaa_trades = trades[trades["symbol"] == "AAA"].sort_values("fill_ts")
@@ -336,7 +340,10 @@ def test_ob2_zero_latency_signal_eq_decision_and_order_eq_fill_is_next_bar():
         open_=open_, high=high, low=low, close=close, volume=volume,
     )
     strategy = TsScriptStrategy(_EmptyParams(), script, decision_times=("09:20",))
-    result = run_backtest(strategy, panel, default_config(decision_latency_bars=0))
+    result = run_backtest(
+        strategy, panel, default_config(decision_latency_bars=0),
+        contract=minimal_contract(),
+    )
 
     trades = result.trades
     assert len(trades) > 0, "fixture produced no fills"
@@ -399,7 +406,10 @@ def test_ob3_order_ts_advances_along_short_session_not_fixed_stride():
         open_=open_, high=high, low=low, close=close, volume=volume,
     )
     strategy = TsScriptStrategy(_EmptyParams(), script, decision_times=("09:20",))
-    result = run_backtest(strategy, panel, default_config(decision_latency_bars=k))
+    result = run_backtest(
+        strategy, panel, default_config(decision_latency_bars=k),
+        contract=minimal_contract(),
+    )
 
     trades = result.trades
     assert len(trades) > 0, "fixture produced no fills"
@@ -487,7 +497,7 @@ def test_ob4b_slippage_bps_identity_holds_in_blotter():
     strategy = TsScriptStrategy(
         _EmptyParams(), script, decision_times=("09:20", "09:25")
     )
-    result = run_backtest(strategy, panel, default_config())
+    result = run_backtest(strategy, panel, default_config(), contract=minimal_contract())
 
     trades = result.trades
     assert len(trades) > 0, "fixture produced no fills"
@@ -534,7 +544,7 @@ def test_ob5_fees_bps_equals_charges_over_notional_via_as_bps_of():
     strategy = TsScriptStrategy(
         _EmptyParams(), script, decision_times=("09:20", "09:25")
     )
-    result = run_backtest(strategy, panel, default_config())
+    result = run_backtest(strategy, panel, default_config(), contract=minimal_contract())
 
     trades = result.trades
     assert len(trades) > 0, "fixture produced no fills"
@@ -608,7 +618,8 @@ def test_ob6_partial_fill_records_desired_filled_and_recoverable_remainder():
     result = run_backtest(
         strategy, panel, default_config(fill_model=FillModel(
             slippage=SqrtImpactSlippage(), max_participation=0.02
-        ))
+        )),
+        contract=minimal_contract(),
     )
 
     trades = result.trades
@@ -618,13 +629,24 @@ def test_ob6_partial_fill_records_desired_filled_and_recoverable_remainder():
     for col in ("desired_qty", "filled_qty", "filled_frac"):
         assert col in trades.columns, f"missing {col!r}"
 
+    # AMENDMENT 3 item 3: a 20-bar session never reaches square_off_time="15:20"
+    # from a 09:20 decision, so `square_off_row_for_day` clamps to the session's
+    # last row (engine.py:329-338) and the engine's mandatory session-end
+    # flattening emits a SECOND, structurally-required row (qty=-1.0,
+    # intent="eod_exit" -- measured directly; not the terminal FORCED_EOD
+    # safety-net path, which only fires if EOD_EXIT itself fails to reach flat)
+    # in addition to the partial-fill entry row. Select the entry order by
+    # intent, not by symbol, so "exactly one row" is asserted for THAT order
+    # rather than assumed for the whole symbol.
+    #
     # AMENDMENT 1 item 3, second half: multi-bar splitting is out of scope, so a
     # partially-filled order today must produce EXACTLY ONE row.
-    assert len(aaa_trades) == 1, (
+    entry_trades = aaa_trades[aaa_trades["intent"] == "entry"]
+    assert len(entry_trades) == 1, (
         f"a partially-filled order must produce exactly one row today (multi-bar "
-        f"splitting is deferred, AMENDMENT 1 item 3); got {len(aaa_trades)} rows"
+        f"splitting is deferred, AMENDMENT 1 item 3); got {len(entry_trades)} rows"
     )
-    row = aaa_trades.iloc[0]
+    row = entry_trades.iloc[0]
 
     desired_qty = float(row["desired_qty"])
     filled_qty = float(row["filled_qty"])
@@ -645,6 +667,13 @@ def test_ob6_partial_fill_records_desired_filled_and_recoverable_remainder():
 
     remainder = desired_qty - filled_qty
     assert remainder > 0.0, "unfilled remainder must be recoverable and positive"
+
+    # A partially-filled position must still end the session flat: the
+    # session-end flattening row must exist, making this assertion STRONGER
+    # than the count it replaces rather than simply dropping it.
+    eod_trades = aaa_trades[aaa_trades["intent"] == "eod_exit"]
+    assert len(eod_trades) == 1
+    assert eod_trades.iloc[0]["qty"] == pytest.approx(-1.0)
 
 
 def test_filled_frac_ratio_contract_is_nan_at_desired_qty_zero():
@@ -719,7 +748,7 @@ def test_ob7_record_shape_supports_multiple_fill_rows_per_order_id_hand_construc
         open_=open_, high=high, low=low, close=close, volume=volume,
     )
     strategy = TsScriptStrategy(_EmptyParams(), script, decision_times=("09:20",))
-    result = run_backtest(strategy, panel, default_config())
+    result = run_backtest(strategy, panel, default_config(), contract=minimal_contract())
 
     trades = result.trades
     aaa_trades = trades[trades["symbol"] == "AAA"]
@@ -797,7 +826,7 @@ def test_ob8_mid_is_nan_and_never_equals_close():
         open_=open_, high=high, low=low, close=close, volume=volume,
     )
     strategy = TsScriptStrategy(_EmptyParams(), script, decision_times=("09:20",))
-    result = run_backtest(strategy, panel, default_config())
+    result = run_backtest(strategy, panel, default_config(), contract=minimal_contract())
 
     trades = result.trades
     assert len(trades) > 0, "fixture produced no fills"
@@ -866,7 +895,8 @@ def test_ob9b_zero_slippage_blotter_has_zero_spread_impact_slippage_nonzero_fees
         _EmptyParams(), script, decision_times=("09:20", "09:25")
     )
     result = run_backtest(
-        strategy, panel, default_config(fill_model=FillModel(slippage=ZeroSlippage()))
+        strategy, panel, default_config(fill_model=FillModel(slippage=ZeroSlippage())),
+        contract=minimal_contract(),
     )
 
     trades = result.trades
@@ -915,7 +945,7 @@ def test_ob10_parquet_round_trip_preserves_dtypes(tmp_path):
     strategy = TsScriptStrategy(
         _EmptyParams(), script, decision_times=("09:20", "09:25")
     )
-    result = run_backtest(strategy, panel, default_config())
+    result = run_backtest(strategy, panel, default_config(), contract=minimal_contract())
 
     trades = result.trades
     assert len(trades) > 0, "fixture produced no fills"
@@ -1000,7 +1030,10 @@ def test_ob_arrival_price_equals_open_at_order_ts_bar():
         open_=open_, high=high, low=low, close=close, volume=volume,
     )
     strategy = TsScriptStrategy(_EmptyParams(), script, decision_times=("09:20",))
-    result = run_backtest(strategy, panel, default_config(decision_latency_bars=3))
+    result = run_backtest(
+        strategy, panel, default_config(decision_latency_bars=3),
+        contract=minimal_contract(),
+    )
 
     trades = result.trades
     assert len(trades) > 0, "fixture produced no fills"

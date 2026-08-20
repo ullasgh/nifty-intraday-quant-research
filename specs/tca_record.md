@@ -265,3 +265,111 @@ cannot occur, which is a different kind of false confidence from a vacuous asser
 false confidence.
 
 Recorded as scoped-down rather than dropped.
+
+---
+
+# AMENDMENT 3 — 2026-08-20. My AMENDMENT 2 item 2 was factually WRONG.
+
+## 1. `desired_qty == 0` IS reachable. Correcting myself.
+
+AMENDMENT 2 stated that a row with `desired_qty == 0` "cannot arise through the engine" because a
+fully rejected order emits zero blotter rows, and scoped the NaN branch to a unit test on that
+basis. That is wrong.
+
+A pluggable fill model can report a PHANTOM fill for a symbol with no desired order, and the engine
+records it as a real trade — it goes through `apply_fills` like any other. Two pre-existing tests
+cover exactly this and have for some time:
+
+    test_engine_coverage.py::test_filled_frac_zero_when_denom_zero
+    test_engine_coverage3.py::test_filled_frac_forced_zero_for_phantom_fill_with_zero_desired_order
+
+Both require `filled_frac == 0.0` — finite, not NaN.
+
+## 2. The semantics are pinned to 0.0, and there must be exactly ONE implementation
+
+`filled_frac` for `desired_qty == 0` is **0.0**, not NaN. Reasons, in order of weight:
+
+1. It is the existing, deliberately-tested behaviour ("forced_zero" is in the test's own name), and
+   changing tested engine behaviour to suit a newly-written spec is backwards.
+2. The case is pathological — it requires a test-double fill model inventing a fill — so the
+   aggregation argument for NaN carries little weight against breaking a real covered path.
+
+**Critical: do not leave two implementations with different semantics.** The implementer added a
+standalone `compute_filled_frac` returning NaN while `_record_trade` kept returning 0.0, precisely
+to avoid breaking those tests. That is the near-duplicate-with-subtly-different-semantics hazard
+this spec's body warns about, one level down. `compute_filled_frac` must return **0.0** for a zero
+denominator and `_record_trade` must CALL it, so there is a single definition.
+
+Obligation 6's unit assertion changes accordingly: `desired_qty == 0` yields `0.0`, not NaN, and
+never raises.
+
+## 3. Obligation 6's `len(rows_for_symbol) == 1` is wrong in BOTH suites
+
+Both suites starve an entry to a 1-share partial fill in a 20-bar session, then assert the symbol
+has exactly one blotter row. It has two: `square_off_time="15:20"` is never reached inside 20
+one-minute bars from 09:15, so the engine's mandatory session-end flattening emits a second,
+structurally-required row (`qty=-1.0`, `intent="forced_eod"`).
+
+Every preceding assertion in both tests is correct — the partial-fill row does have
+`desired_qty > filled_qty`, `filled_frac < 1.0`, and `filled_frac == filled_qty / desired_qty`.
+Only the trailing count assertion is wrong.
+
+**Restated:** select the row by `order_id` (or by `intent`), not by symbol, and assert exactly one
+row for THAT order. Then additionally assert the forced-EOD row EXISTS — a partially-filled
+position must still end the session flat, and asserting that makes the test stronger than the
+count it replaces.
+
+## 4. Note for the record: dual suites do not protect against a SHARED misreading
+
+Both suites were written independently and both made the same wrong assumption — one blotter row
+per symbol. Independence protects against differing misreadings of a spec; it does not protect
+against a shared misunderstanding of the ENGINE, because both authors read the same engine.
+
+This is the first time in this program the dual-suite mechanism has failed to catch something, and
+it is worth knowing its shape: agreement between the suites is evidence, not proof.
+
+---
+
+# AMENDMENT 4 — 2026-08-20. Two corrections to AMENDMENT 3, both found by measurement.
+
+## 1. The intent is `eod_exit`, not `forced_eod`. I asserted this without checking.
+
+AMENDMENT 3 stated the session-end row carries `intent="forced_eod"`. It carries **`eod_exit`**.
+
+`square_off_row_for_day` clamps to the session's LAST row (`engine.py:329-338`) when the configured
+`square_off_time` is never reached inside the fixture's bars, so the flattening routes through the
+ordinary EOD_EXIT queue path. `FORCED_EOD` is a terminal safety net that only fires if EOD_EXIT
+itself fails to flatten — a strictly rarer event.
+
+The implementer printed `result.trades` and read the value rather than taking my word. That
+distinction matters beyond the label: a test asserting `forced_eod` would have been asserting that
+the ordinary square-off path had FAILED, which is a materially different claim about the engine
+than "the position was closed at session end".
+
+## 2. Only ONE pre-existing test actually covers `desired_qty == 0`, not two
+
+AMENDMENT 3 cited two tests as requiring a finite `0.0`. Verified by mutation:
+
+- `test_engine_coverage3.py::test_filled_frac_forced_zero_for_phantom_fill_with_zero_desired_order`
+  — REAL. Reverting the branch to NaN fails it (`nan == 0.0`).
+- `test_engine_coverage.py::test_filled_frac_zero_when_denom_zero` — **VACUOUS**. It only asserts
+  `result.trades.empty` and never reaches the `filled_frac` branch at all. It stayed GREEN under the
+  same mutation, and its name promises something it does not test.
+
+So my evidence for the pinned semantics was half as strong as I claimed. The conclusion does not
+change — one real covering test is still a real covering test, and 0.0 remains pinned — but the
+overstatement is recorded because "two tests cover this" was doing argumentative work it had not
+earned.
+
+**The vacuous test is a pre-existing gap and is adjudicated for repair:** it must be made to
+actually reach the `filled_frac` computation with a zero denominator, or renamed to say what it
+tests. A test whose name claims a branch it never executes is worse than no test — it is why the
+branch looked covered.
+
+## 3. One test still asserts the retracted NaN contract
+
+`tests/test_tca_record_a.py::test_filled_frac_ratio_is_nan_when_desired_qty_is_zero_unit` was
+written under AMENDMENT 2's premise and asserts NaN. AMENDMENT 3 retracted that premise and pinned
+0.0. **Adjudicated: update it to assert `0.0`**, and rename it so the name matches the contract.
+
+Running tally of tests found asserting a defect or a retracted contract in this program: **15**.

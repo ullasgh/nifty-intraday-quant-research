@@ -31,6 +31,7 @@ from nifty_quant.research.tilt import (
     TiltConfig,
     run_tilt,
 )
+from tests.contract_fixtures import minimal_contract
 
 # Panel builder helpers (adapted from test_lens_criteria_repair_b.py pattern)
 _N_SYMBOLS = 10
@@ -143,8 +144,8 @@ def test_capital_changes_cost_not_gross() -> None:
         seed=100,  # Same seed for same signal
     )
 
-    result_1l = run_tilt(panel, config_1l)
-    result_10l = run_tilt(panel, config_10l)
+    result_1l = run_tilt(panel, config_1l, contract=minimal_contract())
+    result_10l = run_tilt(panel, config_10l, contract=minimal_contract())
 
     # Gross should be identical (signal-independent)
     assert np.isclose(result_1l.total.gross_bps, result_10l.total.gross_bps, rtol=1e-10), \
@@ -181,7 +182,7 @@ def test_one_leg_not_two() -> None:
         seed=42,
     )
 
-    result = run_tilt(panel, config)
+    result = run_tilt(panel, config, contract=minimal_contract())
 
     # Assert: cost_bps = round_trip_bps * mean(turnover)
     expected_cost = result.round_trip_bps * result.total.turnover
@@ -210,7 +211,7 @@ def test_custom_times_honored() -> None:
         exit_hhmm="15:20",
         seed=42,
     )
-    result_default = run_tilt(panel, config_default)
+    result_default = run_tilt(panel, config_default, contract=minimal_contract())
 
     # Run with custom times (10:00/14:00) on the second day
     config_custom = TiltConfig(
@@ -220,7 +221,7 @@ def test_custom_times_honored() -> None:
         exit_hhmm="14:00",
         seed=42,
     )
-    result_custom = run_tilt(panel, config_custom)
+    result_custom = run_tilt(panel, config_custom, contract=minimal_contract())
 
     # The gross_bps should differ because the price window differs
     assert not np.isclose(
@@ -283,7 +284,7 @@ def test_missing_checkpoint_drops_session() -> None:
         exit_hhmm="15:20",
         seed=42,
     )
-    result = run_tilt(panel, config)
+    result = run_tilt(panel, config, contract=minimal_contract())
 
     # The Muhurat session (60 bars) should be skipped
     # Per-year sessions should not include it
@@ -313,7 +314,7 @@ def test_date_range_respected() -> None:
         end=dt.date(2024, 1, 31),
         seed=42,
     )
-    result = run_tilt(panel, config)
+    result = run_tilt(panel, config, contract=minimal_contract())
 
     # Sum per-year n_sessions should equal total n_sessions
     sum_per_year = sum(row.n_sessions for row in result.per_year)
@@ -346,8 +347,8 @@ def test_smoothing_reduces_turnover() -> None:
         seed=42,
     )
 
-    result_daily = run_tilt(panel, config_daily)
-    result_smooth = run_tilt(panel, config_smooth)
+    result_daily = run_tilt(panel, config_daily, contract=minimal_contract())
+    result_smooth = run_tilt(panel, config_smooth, contract=minimal_contract())
 
     # Smoothing should reduce turnover
     assert result_smooth.total.turnover < result_daily.total.turnover, (
@@ -371,7 +372,7 @@ def test_weights_long_only_normalized() -> None:
         tilt="mild",
         seed=42,
     )
-    result = run_tilt(panel, config)
+    result = run_tilt(panel, config, contract=minimal_contract())
 
     # Assert weight invariants via diagnostics
     assert result.min_weight_seen >= 0.0, \
@@ -403,7 +404,7 @@ def test_holdout_protection() -> None:
     )
 
     with pytest.raises(ValueError, match=r"holdout"):
-        run_tilt(panel, config_in_holdout)
+        run_tilt(panel, config_in_holdout, contract=minimal_contract())
 
 
 def test_degenerate_inputs_raise() -> None:
@@ -421,7 +422,7 @@ def test_degenerate_inputs_raise() -> None:
         seed=42,
     )
     with pytest.raises(ValueError, match=r"start|end"):
-        run_tilt(panel, config_backwards)
+        run_tilt(panel, config_backwards, contract=minimal_contract())
 
     # Case 2: No usable session (all NaN panel)
     nan_panel = Panel(
@@ -441,7 +442,7 @@ def test_degenerate_inputs_raise() -> None:
         seed=42,
     )
     with pytest.raises(ValueError, match=r"session|usable"):
-        run_tilt(nan_panel, config_valid)
+        run_tilt(nan_panel, config_valid, contract=minimal_contract())
 
 
 def test_determinism() -> None:
@@ -458,8 +459,8 @@ def test_determinism() -> None:
         seed=123,
     )
 
-    result1 = run_tilt(panel, config)
-    result2 = run_tilt(panel, config)
+    result1 = run_tilt(panel, config, contract=minimal_contract())
+    result2 = run_tilt(panel, config, contract=minimal_contract())
 
     table1 = result1.to_table()
     table2 = result2.to_table()
@@ -481,7 +482,7 @@ def test_table_format() -> None:
         end=dt.date(2025, 1, 10),
         seed=42,
     )
-    result = run_tilt(panel, config)
+    result = run_tilt(panel, config, contract=minimal_contract())
 
     # to_table() should be a non-empty string
     table = result.to_table()
@@ -507,7 +508,7 @@ def test_explain_format() -> None:
         capital=1_000_000.0,
         seed=42,
     )
-    result = run_tilt(panel, config)
+    result = run_tilt(panel, config, contract=minimal_contract())
 
     explain = result.explain()
     assert isinstance(explain, str), "explain() should return a string"

@@ -18,6 +18,7 @@ from nifty_quant.strategy.base import (
     Strategy,
     TargetPortfolio,
 )
+from tests.contract_fixtures import minimal_contract
 
 SYMBOLS = ("AAA", "BBB", "CCC")
 N_DAYS = 5
@@ -205,7 +206,7 @@ def test_accounting_invariant_holds_every_step():
         sizer=GrossNotionalSizer(),
     )
 
-    result = run_backtest(strategy, panel, config)
+    result = run_backtest(strategy, panel, config, contract=minimal_contract())
 
     assert np.all(np.isfinite(result.equity_curve))
     assert np.all(np.isfinite(result.gross_returns))
@@ -223,7 +224,7 @@ def test_zero_cost_identity_net_equals_gross_exactly():
         sizer=GrossNotionalSizer(),
     )
 
-    result = run_backtest(strategy, panel, config)
+    result = run_backtest(strategy, panel, config, contract=minimal_contract())
 
     assert result.total_costs == 0.0
     assert np.array_equal(result.returns, result.gross_returns)
@@ -240,7 +241,7 @@ def test_cost_subtraction_matches_modelled_costs_exactly():
         sizer=GrossNotionalSizer(),
     )
 
-    result = run_backtest(strategy, panel, config)
+    result = run_backtest(strategy, panel, config, contract=minimal_contract())
 
     net_drop = result.equity_curve[-1] - result.initial_capital
     assert result.total_costs > 0.0
@@ -270,7 +271,7 @@ def test_one_bar_lag_defeats_lookahead_cheat():
         sizer=GrossNotionalSizer(),
     )
 
-    result = run_backtest(strategy, panel, config)
+    result = run_backtest(strategy, panel, config, contract=minimal_contract())
 
     # Reference: what a same-bar ("naive"/lookahead-bugged) fill would have
     # captured on every decision, computed independently of the engine.
@@ -290,7 +291,7 @@ def test_square_off_flattens_with_no_forced_liquidation():
         ConstantWeightStrategy.Params(weights=(0.05, -0.05, 0.03))
     )
 
-    result = run_backtest(strategy, panel, BacktestConfig())
+    result = run_backtest(strategy, panel, BacktestConfig(), contract=minimal_contract())
 
     assert result.forced_eod_liquidation_days == 0
 
@@ -306,7 +307,9 @@ def test_square_off_rejection_forces_eod_liquidation():
         start = row_at(day, "15:20")
         tradable[start:(day + 1) * BARS_PER_DAY, :] = False
 
-    result = run_backtest(strategy, panel, BacktestConfig(), tradable=tradable)
+    result = run_backtest(
+        strategy, panel, BacktestConfig(), tradable=tradable, contract=minimal_contract()
+    )
 
     assert result.forced_eod_liquidation_days == N_DAYS
 
@@ -320,7 +323,9 @@ def test_rejection_when_symbol_not_tradable():
     tradable = np.ones((N_ROWS, N_SYM), dtype=bool)
     tradable[:, 0] = False
 
-    result = run_backtest(strategy, panel, BacktestConfig(), tradable=tradable)
+    result = run_backtest(
+        strategy, panel, BacktestConfig(), tradable=tradable, contract=minimal_contract()
+    )
 
     assert result.trades.empty or (result.trades["symbol"] != "AAA").all()
     assert 0.0 < result.rejected_order_rate < 1.0
@@ -343,7 +348,7 @@ def test_capacity_aware_sizing_leaves_no_unfilled_notional():
         sizer=GrossNotionalSizer(),
     )
 
-    result = run_backtest(strategy, panel, config)
+    result = run_backtest(strategy, panel, config, contract=minimal_contract())
 
     assert result.unfilled_notional_pct == 0.0
 
@@ -418,7 +423,7 @@ def test_conservative_stop_fills_at_open_not_stop_price():
         sizer=GrossNotionalSizer(),
     )
 
-    result = run_backtest(strategy, panel, config)
+    result = run_backtest(strategy, panel, config, contract=minimal_contract())
 
     aaa_trades = result.trades[result.trades["symbol"] == "AAA"].sort_values("ts")
     assert len(aaa_trades) == 2
@@ -441,7 +446,7 @@ def test_latency_sensitivity_degrades_mean_reversion():
         cost_model=ZeroCost(),
         sizer=GrossNotionalSizer(),
     )
-    result_lat0 = run_backtest(strategy0, panel, config0)
+    result_lat0 = run_backtest(strategy0, panel, config0, contract=minimal_contract())
 
     strategy1 = MeanRevertStrategy(MeanRevertStrategy.Params(weight_size=0.05))
     config1 = BacktestConfig(
@@ -450,7 +455,7 @@ def test_latency_sensitivity_degrades_mean_reversion():
         cost_model=ZeroCost(),
         sizer=GrossNotionalSizer(),
     )
-    result_lat1 = run_backtest(strategy1, panel, config1)
+    result_lat1 = run_backtest(strategy1, panel, config1, contract=minimal_contract())
 
     assert result_lat0.equity_curve[-1] != result_lat1.equity_curve[-1]
     assert result_lat0.equity_curve[-1] > result_lat1.equity_curve[-1]
@@ -467,7 +472,7 @@ def test_determinism_bit_identical_equity_curves():
         cost_model=NSEIntradayEquityCosts(),
         sizer=GrossNotionalSizer(),
     )
-    result1 = run_backtest(strategy1, panel, config1)
+    result1 = run_backtest(strategy1, panel, config1, contract=minimal_contract())
 
     strategy2 = ConstantWeightStrategy(
         ConstantWeightStrategy.Params(weights=(0.05, -0.03, 0.02))
@@ -477,7 +482,7 @@ def test_determinism_bit_identical_equity_curves():
         cost_model=NSEIntradayEquityCosts(),
         sizer=GrossNotionalSizer(),
     )
-    result2 = run_backtest(strategy2, panel, config2)
+    result2 = run_backtest(strategy2, panel, config2, contract=minimal_contract())
 
     assert np.array_equal(result1.equity_curve, result2.equity_curve)
     assert np.array_equal(result1.returns, result2.returns)

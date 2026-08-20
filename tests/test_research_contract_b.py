@@ -32,12 +32,20 @@ allow_holdout: bool) -> None` raises `ValueError` when `validation["holdout_inte
 with the passed flag (`"never"` + `allow_holdout=True`, or `"reading_now"` + `allow_holdout=False`).
 
 Obligation 10 goes through the real `nq walkforward` CLI path (per explicit direction: do not
-invent a `run_walkforward_to_registry(...)` seam that exists only to be tested). `load_panel`,
-`load_universe`, and `settings.RESULTS_ROOT` are monkeypatched so no real `data/` is touched, and
-`TrialRegistry.record` is wrapped to capture every record written, including the pooled one.
-Because the exact walkforward CLI flag names are not pinned by the spec, `_walkforward_cli_args`
-introspects the Click command's registered parameters (via `typer.main.get_command`) and supplies
-plausible values by name rather than guessing a single fixed flag list.
+invent a `run_walkforward_to_registry(...)` seam that exists only to be tested), using the SAME
+proven harness pattern as `tests/test_walkforward_pooling.py` (read, not modified, for the
+pattern): a synthetic multi-session `Panel`, a real registered strategy (`volume_breakout`) with
+its params written to a real config YAML in `tmp_path`, `load_panel`/`load_universe`/
+`TradingCalendar.from_index_bars`/`settings.RESULTS_ROOT` monkeypatched, and `engine.run_backtest`
+stubbed to a deterministic fake result (populated via the real `build_daily`, exactly as that
+harness does) so the test exercises the CLI's contract/provenance wiring rather than needing a
+real strategy signal on synthetic prices. After the CLI run, the resulting `TrialRegistry` is
+opened directly from `tmp_path` and every record it contains (`TrialRegistry.all()`) is checked,
+rather than guessing CLI flag names via parameter introspection -- that approach was tried and
+abandoned (see git history of this file): each guessed flag/value it got wrong only surfaced once
+the previous guess was fixed, because introspection cannot recover semantics (which strategy is
+actually registered, which option wants a file path vs. a literal) that only the CLI's own code
+knows.
 """
 
 from __future__ import annotations
@@ -55,10 +63,10 @@ from zoneinfo import ZoneInfo
 import numpy as np
 import pandas as pd
 import pytest
-from nifty_quant.research.contract import ResearchContract, contract_hash
 from pydantic import BaseModel
 
 from nifty_quant.data.panel import Panel
+from nifty_quant.research.contract import ResearchContract, contract_hash
 
 _DEFAULT_SEED = 137
 
@@ -614,83 +622,158 @@ def test_obligation9_matching_intent_and_flag_do_not_raise() -> None:
 # --------------------------------------------------------------------------------------
 # Obligation 10: regression test for P4 -- every TrialRecord written by walkforward,
 # INCLUDING the pooled record, has all 12 Amendment-1 provenance fields populated.
-# Goes through the real `nq walkforward` CLI path per explicit direction.
+# Goes through the real `nq walkforward` CLI path, using the SAME proven harness shape
+# as `tests/test_walkforward_pooling.py` (read for the pattern, not modified or imported
+# from): a synthetic multi-session Panel, a real registered strategy with its params
+# written to a real config YAML in `tmp_path`, `load_panel`/`load_universe`/
+# `TradingCalendar.from_index_bars`/`settings.RESULTS_ROOT` monkeypatched, and
+# `engine.run_backtest` stubbed to a deterministic fake result populated via the real
+# `build_daily` -- NOT introspected/guessed CLI arguments, which cannot recover semantics
+# (which strategy name is actually registered, which option wants a file path vs. a
+# literal) that only the CLI's own code knows.
 # --------------------------------------------------------------------------------------
 
+_WF_STRATEGY_YAML = """\
+strategy: volume_breakout
+params:
+  breakout_window: 30
+  volume_window: 30
+  volume_z_threshold: 2.0
+  hurst_window: 390
+  hurst_threshold: 0.55
+  use_hurst: false
+  vol_window: 30
+  deseasonalize: true
+  direction: continuation
+  exit_mode: time
+  hold_bars: 30
+  min_hold_bars: 5
+  cooldown_bars: 0
+  square_off_time: "15:20"
+  sigma_floor: 1.0e-5
+  max_weight: 0.10
+  gross: 1.0
+"""
 
-def _walkforward_cli_args(app, start: dt.date, end: dt.date, contract_path: Path) -> list[str]:
-    import click
-    from typer.main import get_command
 
-    root_command = get_command(app)
-    walkforward_command = root_command.commands["walkforward"]
-    unset = object()
-    args = ["walkforward"]
+def _wf_session_ts(
+    session_date: dt.date, n_bars: int, start_hhmm: tuple[int, int] = (9, 15)
+) -> np.ndarray:
+    from datetime import time, timedelta, timezone
 
-    for parameter in walkforward_command.params:
-        name = parameter.name.replace("-", "_")
-        value: object = unset
+    ist = timezone(timedelta(hours=5, minutes=30))
+    start = dt.datetime.combine(session_date, time(*start_hhmm), tzinfo=ist)
+    return np.asarray([int(start.timestamp()) + 60 * i for i in range(n_bars)], dtype=np.int64)
 
-        if name in {"start", "start_date", "from_date"}:
-            value = start.isoformat()
-        elif name in {"end", "end_date", "to_date"}:
-            value = end.isoformat()
-        elif name in {"contract", "contract_path", "contract_file"}:
-            value = str(contract_path)
-        elif name in {"universe", "universe_name"}:
-            value = "all_equity"
-        elif name in {"panel", "panel_id", "panel_spec", "data"}:
-            value = "synthetic"
-        elif name in {
-            "train_days", "training_days", "train_window", "train_window_days", "train_size",
-        }:
-            value = "10"
-        elif name in {"test_days", "testing_days", "test_window", "test_window_days", "test_size"}:
-            value = "5"
-        elif name in {"step_days", "step", "step_size", "rolling_step_days"}:
-            value = "5"
-        elif name in {"n_splits", "splits", "num_splits"}:
-            value = "2"
-        elif name in {"purge_days", "purge_width"}:
-            value = "1"
-        elif name in {"embargo_days", "embargo_width"}:
-            value = "3"
-        elif name in {"seed", "random_seed"}:
-            value = "137"
-        elif name in {"allow_holdout"}:
-            value = False
-        elif name in {"params", "params_json", "parameters"}:
-            value = "{}"
-        elif name in {"strategy", "strategy_name", "strategy_id"}:
-            if parameter.required or parameter.default is None:
-                choices = getattr(parameter.type, "choices", ())
-                value = next(iter(choices), "constant_weight")
-        elif parameter.required:
-            type_name = getattr(parameter.type, "name", "")
-            if type_name in {"integer", "int"}:
-                value = "1"
-            elif type_name in {"float"}:
-                value = "1.0"
-            elif type_name in {"boolean", "bool"}:
-                value = False
-            else:
-                value = "synthetic"
 
-        if value is unset:
-            continue
+def _wf_make_panel(
+    session_dates: list[dt.date],
+    bars_per_session: list[int],
+    symbols: tuple[str, ...] = ("A", "B"),
+    close_price: float = 100.5,
+    volume_value: float = 1000.0,
+) -> Panel:
+    """Mirrors `tests/test_walkforward_pooling.py::_make_panel` -- a plain, non-checkpoint,
+    N-bar-per-session panel with all five OHLCV fields present, suitable for the real
+    `nq walkforward` CLI path (universe hashing, panel hashing, tradable-mask computation)
+    when `run_backtest` itself is stubbed out."""
+    ts = np.concatenate(
+        [_wf_session_ts(d, n) for d, n in zip(session_dates, bars_per_session)]
+    ).astype(np.int64)
+    day_offsets = np.concatenate(
+        [np.asarray([0], dtype=np.int32), np.cumsum(bars_per_session).astype(np.int32)]
+    )
+    n_rows = int(ts.size)
+    n_symbols = len(symbols)
+    fields = {
+        "open": np.full((n_rows, n_symbols), close_price - 0.5, dtype=np.float64),
+        "high": np.full((n_rows, n_symbols), close_price + 0.5, dtype=np.float64),
+        "low": np.full((n_rows, n_symbols), close_price - 1.0, dtype=np.float64),
+        "close": np.full((n_rows, n_symbols), close_price, dtype=np.float64),
+        "volume": np.full((n_rows, n_symbols), volume_value, dtype=np.float64),
+    }
+    return Panel(fields, symbols, ts, day_offsets, np.asarray(session_dates, dtype=object))
 
-        if isinstance(parameter, click.Option):
-            option_names = [option for option in parameter.opts if option.startswith("--")]
-            option_name = option_names[0] if option_names else parameter.opts[0]
-            if parameter.is_flag:
-                if bool(value):
-                    args.append(option_name)
-            else:
-                args.extend([option_name, str(value)])
-        else:
-            args.append(str(value))
 
-    return args
+def _wf_row_day_index(panel: Panel) -> np.ndarray:
+    n_rows = panel.n_rows()
+    return (
+        np.searchsorted(panel.day_offsets, np.arange(n_rows, dtype=np.int64), side="right") - 1
+    )
+
+
+def _wf_session_dates_epoch(panel: Panel) -> np.ndarray:
+    return np.asarray(
+        [
+            int(
+                dt.datetime(
+                    session_date.year, session_date.month, session_date.day, tzinfo=dt.timezone.utc
+                ).timestamp()
+            )
+            for session_date in panel.dates
+        ],
+        dtype=np.int64,
+    )
+
+
+def _wf_fake_result(n_rows: int, panel: Panel, seed: int = 0):
+    """Mirrors `tests/test_walkforward_pooling.py::_fake_result`: a deterministic fake
+    `BacktestResult` sized to `panel.n_rows()`, with `.daily` populated by the REAL
+    `build_daily`, so the CLI's own day-aggregation and provenance wiring run unmodified --
+    only the (irrelevant to this obligation) strategy signal itself is stubbed out."""
+    from nifty_quant.backtest.daily import build_daily
+    from nifty_quant.backtest.engine import BacktestResult
+
+    rng = np.random.default_rng(seed)
+    gross = rng.normal(loc=0.0006, scale=0.004, size=n_rows).astype(np.float64)
+    turnover = np.full(n_rows, 1.0, dtype=np.float64)
+    returns = (gross - 0.0002 * turnover).astype(np.float64)
+    initial_capital = 1e7
+    equity_curve = np.cumprod(1.0 + returns) * initial_capital
+    daily = build_daily(
+        _wf_row_day_index(panel),
+        equity_curve,
+        returns,
+        gross,
+        turnover,
+        _wf_session_dates_epoch(panel),
+        initial_capital=initial_capital,
+    )
+    return BacktestResult(
+        equity_curve=equity_curve,
+        returns=returns,
+        positions=np.zeros((n_rows, 1)),
+        trades=pd.DataFrame({"symbol": [], "side": [], "qty": [], "price": []}),
+        gross_returns=gross,
+        total_costs=1.0,
+        n_trades=5,
+        turnover=turnover,
+        rejected_order_rate=0.0,
+        unfilled_notional_pct=0.0,
+        forced_eod_liquidation_days=0,
+        initial_capital=initial_capital,
+        ruined=False,
+        ruin_index=-1,
+        daily=daily,
+    )
+
+
+class _WFFakeCalendar:
+    """Mirrors `tests/test_walkforward_pooling.py::_FakeCalendar`."""
+
+    def __init__(self, dates: list[dt.date]) -> None:
+        self._dates = list(dates)
+
+    def session_dates(
+        self,
+        start: dt.date | None = None,
+        end: dt.date | None = None,
+        *,
+        usable_only: bool = True,
+    ) -> list[dt.date]:
+        return [
+            d for d in self._dates if (start is None or d >= start) and (end is None or d <= end)
+        ]
 
 
 def test_obligation10_walkforward_populates_provenance_on_split_and_pooled_records(
@@ -699,41 +782,62 @@ def test_obligation10_walkforward_populates_provenance_on_split_and_pooled_recor
 ) -> None:
     from typer.testing import CliRunner
 
+    import nifty_quant.backtest.engine as engine_mod
+    import nifty_quant.calendar as calendar_mod
     import nifty_quant.data.panel as panel_mod
     import nifty_quant.settings as settings_mod
     import nifty_quant.universe.static as universe_mod
     from nifty_quant.cli import app
-    from nifty_quant.research.registry import TrialRecord, TrialRegistry
+    from nifty_quant.research.registry import TrialRegistry
     from nifty_quant.universe.static import Universe
 
-    dates = [dt.date(2022, 1, 3) + dt.timedelta(days=index) for index in range(20)]
-    loser_of_day = [index % 2 for index in range(20)]
-    panel = _cycling_aggressive_panel(dates, loser_of_day)
+    all_dates = pd.bdate_range("2020-01-01", periods=280).date.tolist()
+    panel = _wf_make_panel(all_dates, [2] * len(all_dates))
 
     monkeypatch.setattr(panel_mod, "load_panel", lambda spec: panel)
     monkeypatch.setattr(
-        universe_mod, "load_universe", lambda name: Universe(name="all_equity", symbols=_SYMBOLS)
+        universe_mod, "load_universe", lambda name: Universe(name="ab", symbols=panel.symbols)
+    )
+    monkeypatch.setattr(
+        engine_mod,
+        "run_backtest",
+        lambda strat, pnl, config, **kwargs: _wf_fake_result(pnl.n_rows(), pnl),
     )
     monkeypatch.setattr(settings_mod, "RESULTS_ROOT", tmp_path)
-
-    contract_path = tmp_path / "contract.json"
-    contract_path.write_text(
-        json.dumps({**_full_sections(), "seed": _DEFAULT_SEED}), encoding="utf-8"
+    monkeypatch.setattr(
+        calendar_mod.TradingCalendar,
+        "from_index_bars",
+        classmethod(lambda cls, symbol="NIFTY50": _WFFakeCalendar(all_dates)),
     )
 
-    records: list[TrialRecord] = []
-    original_record = TrialRegistry.record
-
-    def capture(record_registry: TrialRegistry, record: TrialRecord) -> None:
-        records.append(record)
-        original_record(record_registry, record)
-
-    monkeypatch.setattr(TrialRegistry, "record", capture)
+    config_path = tmp_path / "volume_breakout.yaml"
+    config_path.write_text(_WF_STRATEGY_YAML, encoding="utf-8")
 
     runner = CliRunner()
-    result = runner.invoke(app, _walkforward_cli_args(app, dates[0], dates[-1], contract_path))
+    result = runner.invoke(
+        app,
+        [
+            "walkforward",
+            "--strategy",
+            "volume_breakout",
+            "--config",
+            str(config_path),
+            "--start",
+            all_dates[0].isoformat(),
+            "--end",
+            all_dates[-1].isoformat(),
+            "--train-years",
+            "0.012",
+            "--test-years",
+            "0.012",
+        ],
+    )
 
     assert result.exit_code == 0, result.output
+
+    registry = TrialRegistry(tmp_path / "trials.db")
+    records = registry.all()
+
     assert records
     assert any(record.split_id.casefold() == "pooled" for record in records)
     assert any(record.split_id.casefold() != "pooled" for record in records)

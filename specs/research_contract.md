@@ -193,3 +193,66 @@ The author included one deliberately GREEN test asserting the existing `TrialRec
 12 Amendment-1 fields, to distinguish a future field-list drift from a real P4 regression. That is
 good practice and it stays. It is the only test in the suite permitted to be green before
 implementation, and the reason is recorded here so a later reader does not "fix" it.
+
+---
+
+# AMENDMENT 2 — 2026-08-20. The blast radius, and how it is repaired.
+
+Making `contract` a required parameter of `run_backtest()` and `run_tilt()` broke roughly a hundred
+pre-existing tests across ten files. That is not a surprise and not a regression — it is the
+mechanical consequence of adding a mandatory gate to the two entry points everything goes through,
+and obligation 5 and 6 require exactly that. The implementer correctly refused to edit any test.
+
+## One helper, not ten
+
+**`tests/contract_fixtures.py::minimal_contract()`** is written and owned by the lead. Every
+repaired test imports it. None constructs its own.
+
+A contract built ten slightly different ways is the same interface-with-no-owner hazard this
+program has already paid for twice (`filled_frac` with two semantics, `config_hash` with three
+readings), just spread wider — a later change to the contract's shape would have ten places to miss.
+
+Its values are deliberately inert. **If any test's outcome changes when those values change, that
+test is accidentally depending on contract content and is mis-scoped** — report it rather than
+tuning the fixture.
+
+Tests that ARE about contracts (`test_research_contract_{a,b}.py`) build their own and must NOT
+import the helper; they are testing the construction rules themselves.
+
+## Adjudicated for repair (lead-authorised test edits)
+
+    test_engine.py  test_engine_returns.py  test_order_lifecycle_a.py  test_order_lifecycle_b.py
+    test_tilt_a.py  test_tilt_b.py  test_tilt_coverage.py
+    test_cli_coverage.py  test_research.py  test_sweep_coverage.py
+
+The repair is mechanical: pass `contract=minimal_contract()`, and where a test monkeypatches
+`run_backtest`/`run_tilt` with a stub, give the stub `**kwargs` so it tolerates the new parameter.
+The four suites that already used `**kwargs` stubs — `test_cli_tradable.py`,
+`test_walkforward_pooling.py`, `test_registry_returns.py`, `test_returns_persistence.py` — were
+unaffected, which is itself an argument for that stub style.
+
+`test_research.py` and `test_sweep_coverage.py` additionally import `research/sweep.py`'s
+`config_hash`/`canonical_json`, deleted under obligation 11. They repoint to
+`research/contract.py`'s `canonical_hash`/`canonical_json`.
+
+**No assertion may be weakened in this repair.** If a test fails for any reason OTHER than the
+missing parameter or the moved import, that is a real finding and must be reported, not absorbed.
+
+## `config_hash`'s partial delegation, accepted with its reason recorded
+
+`config.py:72` and `strategy/registry.py:62` now delegate to `contract.canonical_hash`, so the
+canonicalisation and hashing MECHANISM is unified — but they still accept arbitrary mappings rather
+than the six-section form, because `strategy_config_hash({"strategy": ..., "params": ...})` is
+called that way throughout `cli.py`.
+
+So P2 is partially, not fully, closed: three implementations became one mechanism with two input
+shapes. The collision risk P2 identified (runs over different universes or date ranges sharing a
+hash) is addressed for anything hashed as a contract, and remains for anything still hashed as a
+bare `{strategy, params}` mapping. Recorded rather than claimed as finished.
+
+## Suite B obligation 10 has an environment-dependent bug
+
+`test_obligation10_walkforward_...` does `import click` inside its helper. This venv's typer vendors
+click as `typer._click` with no standalone `click` package, so the import fails. Suite A's
+equivalent test, which does not import click, passes. That is a defect in the test, not the
+implementation — repaired by using `typer.main.get_command` without the bare import.

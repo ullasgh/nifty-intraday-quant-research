@@ -8,17 +8,38 @@ from typing import Protocol
 import numpy as np
 
 
+@dataclass(frozen=True)
+class SlippageComponents:
+    """The two components a blended slippage `bps()` number is built from -- kept
+    separate so a TCA record can recover spread vs. impact rather than only their
+    sum (spec `tca_record.md`, "Interface change in fills.py")."""
+
+    spread_bps: np.ndarray
+    impact_bps: np.ndarray
+
+
 class SlippageModel(Protocol):
     def bps(self, notional: np.ndarray, bar_traded_value: np.ndarray) -> np.ndarray: ...
+
+    def components(
+        self, notional: np.ndarray, bar_traded_value: np.ndarray
+    ) -> SlippageComponents: ...
 
 
 @dataclass(frozen=True)
 class SqrtImpactSlippage:
+    """`half_spread_bps=1.5` and `impact_coef=10.0` are an ASSUMED baseline, not a
+    measured one: a prior calibration attempt regressing this data returned the
+    assumed constants back (intercept 1.5044 vs 1.5, slope 9.9828 vs 10.0), so OHLCV
+    cannot recover them. Rule 8 is not satisfied here -- do not present these as
+    calibrated."""
+
     half_spread_bps: float = 1.5
     impact_coef: float = 10.0
 
-    def bps(self, notional: np.ndarray, bar_traded_value: np.ndarray) -> np.ndarray:
-        """Return bps; invalid entries get +inf so they can never fill."""
+    def components(
+        self, notional: np.ndarray, bar_traded_value: np.ndarray
+    ) -> SlippageComponents:
         notional = np.asarray(notional, dtype=np.float64)
         bar_traded_value = np.asarray(bar_traded_value, dtype=np.float64)
         notional, bar_traded_value = np.broadcast_arrays(notional, bar_traded_value)
@@ -36,18 +57,36 @@ class SqrtImpactSlippage:
         with np.errstate(divide="ignore", invalid="ignore", over="ignore"):
             np.divide(notional, safe_btv, out=ratio, where=valid)
             np.sqrt(np.maximum(ratio, 0.0), out=impact, where=valid)
-            finite_bps = self.half_spread_bps + self.impact_coef * impact
 
-        return np.where(valid, finite_bps, np.inf)
+        # Invalid entries get +inf so they can never fill -- put the entire penalty
+        # on spread_bps (impact_bps stays a finite 0.0 there) so
+        # spread_bps + impact_bps == bps() holds unconditionally, including on the
+        # invalid branch.
+        spread_bps = np.where(valid, self.half_spread_bps, np.inf)
+        impact_bps = np.where(valid, self.impact_coef * impact, 0.0)
+        return SlippageComponents(spread_bps=spread_bps, impact_bps=impact_bps)
+
+    def bps(self, notional: np.ndarray, bar_traded_value: np.ndarray) -> np.ndarray:
+        """Redefined in terms of `components()`, computed once, so the blended
+        number can never drift from its own parts."""
+        c = self.components(notional, bar_traded_value)
+        return np.asarray(c.spread_bps + c.impact_bps, dtype=np.float64)
 
 
 @dataclass(frozen=True)
 class ZeroSlippage:
-    def bps(self, notional: np.ndarray, bar_traded_value: np.ndarray) -> np.ndarray:
+    def components(
+        self, notional: np.ndarray, bar_traded_value: np.ndarray
+    ) -> SlippageComponents:
         shape = np.broadcast_shapes(
             np.asarray(notional).shape, np.asarray(bar_traded_value).shape
         )
-        return np.zeros(shape, dtype=np.float64)
+        zeros = np.zeros(shape, dtype=np.float64)
+        return SlippageComponents(spread_bps=zeros, impact_bps=zeros.copy())
+
+    def bps(self, notional: np.ndarray, bar_traded_value: np.ndarray) -> np.ndarray:
+        c = self.components(notional, bar_traded_value)
+        return np.asarray(c.spread_bps + c.impact_bps, dtype=np.float64)
 
 
 @dataclass(frozen=True)

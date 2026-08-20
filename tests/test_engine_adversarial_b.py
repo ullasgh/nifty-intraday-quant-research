@@ -43,7 +43,13 @@ in advance. Do not trust this summary over the individual test failures/docstrin
 ============================================================================
 PASS: items 1, 2, 3, 4, 5, 6, 7, 8, 9, 12, 13, 14, 17, 18, 19 (I1/I2 hold as tested).
 
-FAIL (genuine findings; see the named test's assert message for the exact numbers):
+STATUS UPDATE 2026-08-20: **all 20 now PASS.** The failures listed below were real when
+written and were subsequently FIXED in the engine (the F1-F13 series; see
+specs/engine_adversarial_invariants.md). This is the record of what was found, not the
+current state. The analysis stays because these tests are now the regression guards for
+exactly those defects.
+
+FAIL, as originally found (see the named test's assert message for the exact numbers):
   - Item 10: I2 (square-off/terminal liquidation) still reaches flat even though the
     symbol has been untradable since row 3 -- because the engine's forced square-off
     and EOD-liquidation paths call `_execute_direct_fill`, which does NOT consult the
@@ -95,6 +101,7 @@ from nifty_quant.strategy.base import (
     Strategy,
     TargetPortfolio,
 )
+from tests.contract_fixtures import minimal_contract
 
 _IST = ZoneInfo("Asia/Kolkata")
 
@@ -358,7 +365,7 @@ def test_01_long_to_short_crossing_zero():
         {0: (np.array([1.0]), {}), 1: (np.array([-1.0]), {})}, repeat_last=False
     )
     config = make_config()
-    result = run_backtest(strategy, panel, config)
+    result = run_backtest(strategy, panel, config, contract=minimal_contract())
 
     # Manual ledger: buy 10_000 @ 100 (cash 1_000_000 -> 0), sell 20_000 @ 110
     # (cash 0 -> +2_200_000), realising a 100_000 gain on the closing long leg and
@@ -403,7 +410,7 @@ def test_02_short_to_flat():
         {0: (np.array([-1.0]), {}), 1: (np.array([0.0]), {})}, repeat_last=False
     )
     config = make_config()
-    result = run_backtest(strategy, panel, config)
+    result = run_backtest(strategy, panel, config, contract=minimal_contract())
 
     positions = result.positions
     assert positions[1][0] == pytest.approx(-10_000.0)
@@ -434,7 +441,7 @@ def test_03_short_to_long_crossing_zero():
         {0: (np.array([-1.0]), {}), 1: (np.array([1.0]), {})}, repeat_last=False
     )
     config = make_config()
-    result = run_backtest(strategy, panel, config)
+    result = run_backtest(strategy, panel, config, contract=minimal_contract())
 
     positions = result.positions
     assert positions[1][0] == pytest.approx(-10_000.0)
@@ -473,7 +480,7 @@ def test_04_long_flat_long_within_session():
         repeat_last=False,
     )
     config = make_config()
-    result = run_backtest(strategy, panel, config)
+    result = run_backtest(strategy, panel, config, contract=minimal_contract())
 
     positions = result.positions
     assert positions[1][0] == pytest.approx(10_000.0)  # after row2
@@ -509,7 +516,7 @@ def test_05_identical_target_emits_no_order():
 
     strategy = persistent(np.array([0.5]))  # same weight every decision call
     config = make_config(cost_model=NSEIntradayEquityCosts())
-    result = run_backtest(strategy, panel, config)
+    result = run_backtest(strategy, panel, config, contract=minimal_contract())
 
     trades = result.trades
     aaa_trades = trades[trades["symbol"] == "AAA"]
@@ -539,7 +546,7 @@ def test_06_zero_bar_traded_value_rejects_fill():
 
     strategy = one_shot(np.array([1.0]))
     config = make_config(cost_model=NSEIntradayEquityCosts())
-    result = run_backtest(strategy, panel, config)
+    result = run_backtest(strategy, panel, config, contract=minimal_contract())
 
     assert result.n_trades == 0
     assert result.total_costs == pytest.approx(0.0)
@@ -571,7 +578,7 @@ def test_07_repeated_partial_fills_across_rows():
 
     strategy = persistent(np.array([1.0]))  # full-capital target, every decision row
     config = make_config(fill_model=FillModel(slippage=ZeroSlippage(), max_participation=0.02))
-    result = run_backtest(strategy, panel, config)
+    result = run_backtest(strategy, panel, config, contract=minimal_contract())
 
     positions = result.positions
     abs_shares = np.abs(positions[:, 0])
@@ -614,7 +621,7 @@ def test_08_rejected_order_does_not_corrupt_in_flight():
 
     strategy = persistent(np.array([1.0]))  # same full-capital target every call
     config = make_config()
-    result = run_backtest(strategy, panel, config)
+    result = run_backtest(strategy, panel, config, contract=minimal_contract())
 
     positions = result.positions
     assert positions[1][0] == pytest.approx(0.0)  # row2 fill rejected: still flat
@@ -649,7 +656,7 @@ def test_09_zero_and_nan_fill_prices_are_rejected_not_divided_by():
     strategy = one_shot(np.array([0.5, 0.5]))
     config = make_config()
     with np.errstate(all="raise"):
-        result = run_backtest(strategy, panel, config)
+        result = run_backtest(strategy, panel, config, contract=minimal_contract())
 
     assert np.all(result.positions == 0.0)
     assert result.n_trades == 0
@@ -677,7 +684,7 @@ def test_10_halt_after_entry_no_stale_mark_and_square_off_still_flat():
 
     strategy = one_shot(np.array([1.0]))
     config = make_config()
-    result = run_backtest(strategy, panel, config, tradable=tradable)
+    result = run_backtest(strategy, panel, config, tradable=tradable, contract=minimal_contract())
 
     positions = result.positions
     assert positions[1][0] == pytest.approx(10_000.0)  # entered before the halt
@@ -723,7 +730,7 @@ def test_11_nan_close_after_entry_must_not_produce_nonfinite_equity():
 
     strategy = persistent(np.array([1.0]))
     config = make_config()
-    result = run_backtest(strategy, panel, config)
+    result = run_backtest(strategy, panel, config, contract=minimal_contract())
 
     assert np.all(np.isfinite(result.equity_curve)), (
         "I4 violated: a NaN close on a held symbol produced a non-finite equity_curve "
@@ -754,7 +761,7 @@ def test_12_gap_through_stop_fills_at_conservative_price():
     stop_price = 90.0
     strategy = one_shot(np.array([1.0]), meta={"stop:AAA": stop_price}, needs_intrabar_risk=True)
     config = make_config()
-    result = run_backtest(strategy, panel, config)
+    result = run_backtest(strategy, panel, config, contract=minimal_contract())
 
     trades = result.trades
     sells = trades[~trades["is_buy"]]
@@ -791,7 +798,7 @@ def test_13_absent_symbol_never_ordered_and_is_reported_absent():
     # handling (engine.py ~550-556).
     strategy = persistent(np.array([0.5, 0.5]))
     config = make_config()
-    result = run_backtest(strategy, panel, config)
+    result = run_backtest(strategy, panel, config, contract=minimal_contract())
 
     assert result.n_symbols_absent == 1
     assert result.absent_symbols == ("BBB",)
@@ -824,7 +831,7 @@ def test_14_extreme_price_move_stays_finite():
 
     strategy = persistent(np.array([1.0]))
     config = make_config()
-    result = run_backtest(strategy, panel, config)
+    result = run_backtest(strategy, panel, config, contract=minimal_contract())
 
     assert np.all(np.isfinite(result.equity_curve))
     assert np.all(np.isfinite(result.returns))
@@ -852,7 +859,7 @@ def test_15_negative_cash_is_surfaced_not_prevented():
     # though the position's notional roughly matches capital.
     strategy = one_shot(np.array([1.0]))
     config = make_config(cost_model=NSEIntradayEquityCosts())
-    result = run_backtest(strategy, panel, config)
+    result = run_backtest(strategy, panel, config, contract=minimal_contract())
 
     positions = result.positions
     idx2 = 1  # t=2, right after the entry fill
@@ -893,7 +900,7 @@ def test_16_ruin_sets_ruined_and_ruin_index_at_the_crash_row():
 
     strategy = persistent(np.array([1.0]))
     config = make_config()  # ZeroCost: cash is exactly 0 after the full-capital buy
-    result = run_backtest(strategy, panel, config)
+    result = run_backtest(strategy, panel, config, contract=minimal_contract())
 
     equity = result.equity_curve
     # t=1 (idx0): pre-fill, equity == capital.
@@ -938,7 +945,7 @@ def test_17_variable_session_lengths_60_and_105_bars():
 
     strategy = persistent(np.array([0.5]))
     config = make_config()
-    result = run_backtest(strategy, panel, config)
+    result = run_backtest(strategy, panel, config, contract=minimal_contract())
 
     assert result.forced_eod_liquidation_days == 0
     assert_flat_at_session_end(panel, result.positions)
@@ -961,7 +968,7 @@ def test_18_single_row_session():
 
     strategy = persistent(np.array([1.0]))  # never actually gets a chance to decide
     config = make_config()
-    result = run_backtest(strategy, panel, config)
+    result = run_backtest(strategy, panel, config, contract=minimal_contract())
 
     assert result.n_trades == 0
     assert len(result.equity_curve) == 1
@@ -986,7 +993,7 @@ def test_19_square_off_time_absent_from_panel_still_flattens_gracefully():
 
     strategy = one_shot(np.array([1.0]))
     config = make_config(square_off_time="15:20", cost_model=NSEIntradayEquityCosts())
-    result = run_backtest(strategy, panel, config)
+    result = run_backtest(strategy, panel, config, contract=minimal_contract())
 
     assert_flat_at_session_end(panel, result.positions)
     # Must resolve via the adaptive last-row square-off path (normal intraday
@@ -1028,7 +1035,7 @@ def test_20_weekend_gap_no_order_carries_into_next_session():
     # Fire only on the 3rd decision call, i.e. t=3 -- Friday's own LAST row.
     strategy = ScriptedStrategy({2: (np.array([1.0]), {})}, repeat_last=False)
     config = make_config()
-    result = run_backtest(strategy, panel, config)
+    result = run_backtest(strategy, panel, config, contract=minimal_contract())
 
     monday_first_ts = int(panel.ts[4])
     trades = result.trades

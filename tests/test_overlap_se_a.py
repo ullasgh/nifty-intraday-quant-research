@@ -159,7 +159,7 @@ def test_obligation_1_replicate_length_equals_n_rows():
     day_offsets = _single_session_day_offsets(n_rows)
     values_2d = np.arange(n_rows * n_symbols, dtype=float).reshape(n_rows, n_symbols)
 
-    resampled, _ = _block_bootstrap_resampling_2d(
+    resampled, _block_indices, _n_sessions_skipped = _block_bootstrap_resampling_2d(
         values_2d,
         day_offsets,
         horizon,
@@ -168,6 +168,8 @@ def test_obligation_1_replicate_length_equals_n_rows():
     )
     # Current bug: resampled.shape[1] is max block length, <= horizon (often horizon).
     # Correct behaviour: every replicate must be padded/truncated to n_rows.
+    # AMENDMENT 2 pins the return arity at 3 -- (resampled, block_indices,
+    # n_sessions_skipped) -- so this unpacks 3, matching obligation 3's contract.
     assert resampled.shape[1] == n_rows
 
 
@@ -183,7 +185,7 @@ def test_obligation_2_no_block_straddles_session_boundary():
     n_symbols = 1
     values_2d = np.arange(n_rows * n_symbols, dtype=float).reshape(n_rows, n_symbols)
 
-    resampled, block_indices = _block_bootstrap_resampling_2d(
+    resampled, block_indices, _n_sessions_skipped = _block_bootstrap_resampling_2d(
         values_2d,
         day_offsets,
         horizon,
@@ -212,15 +214,23 @@ def test_obligation_2_no_block_straddles_session_boundary():
 def test_obligation_3_short_sessions_skipped_and_count_reported():
     """Obligation 3: Sessions shorter than block length are skipped, and the skip count is reported.
 
-    This suite interprets the amendment's "implementer's choice" as an extra return value:
-    `_block_bootstrap_resampling_2d` must return a 3-tuple
-    `(resampled, block_indices, n_sessions_skipped)`.
-    If the real implementation reports the skip count differently, the failure here is a
-    `ValueError` on unpack, which should be read as "interpretation mismatch", not "feature absent".
-    """
-    from nifty_quant.research.expectancy import _block_bootstrap_resampling_2d
+    AMENDMENT 2 pins the return arity at 3 -- `(resampled, block_indices,
+    n_sessions_skipped)` -- confirmed correct by AMENDMENT 7 (`n_sessions_skipped` now
+    exists). If a future implementation reports the skip count via a different mechanism,
+    the failure here is a `ValueError` on unpack, which should be read as "interpretation
+    mismatch", not "feature absent".
 
-    # One 60-bar session (must be skipped for horizon=70) and one 375-bar session.
+    The skip threshold is the DERIVED block length (`horizon + BLOCK_LENGTH_EXTRA_BARS`,
+    AMENDMENT 7), not the raw horizon -- imported directly from the module under test so
+    this assertion tracks the real threshold rather than a stale re-derivation.
+    """
+    from nifty_quant.research.expectancy import (
+        BLOCK_LENGTH_EXTRA_BARS,
+        _block_bootstrap_resampling_2d,
+    )
+
+    # One 60-bar session (must be skipped: 60 < horizon(70) + 5 = 75) and one 375-bar
+    # session (not skipped: 375 >= 75).
     session_lengths = [60, 375]
     day_offsets = _multi_session_day_offsets(session_lengths)
     n_rows = int(day_offsets[-1])
@@ -236,7 +246,6 @@ def test_obligation_3_short_sessions_skipped_and_count_reported():
         n_boot,
         seed=3,
     )
-    # Current implementation returns a 2-tuple; this length assertion fails (RED).
     assert len(result) == 3, (
         "Expected 3-tuple (resampled, block_indices, n_sessions_skipped), "
         f"got {len(result)}-tuple"
@@ -244,8 +253,9 @@ def test_obligation_3_short_sessions_skipped_and_count_reported():
     resampled, block_indices, n_sessions_skipped = result
     # Assert the resampled series is complete.
     assert resampled.shape[1] == n_rows
-    # Assert skip count matches number of sessions too short for horizon.
-    expected_skipped = sum(1 for length in session_lengths if length < horizon)
+    # Assert skip count matches number of sessions shorter than the DERIVED block length.
+    derived_block_length = horizon + BLOCK_LENGTH_EXTRA_BARS
+    expected_skipped = sum(1 for length in session_lengths if length < derived_block_length)
     assert n_sessions_skipped == expected_skipped
 
 
@@ -510,7 +520,7 @@ def test_obligation_10_block_length_derived_and_documented():
     day_offsets = _single_session_day_offsets(n_rows)
     values_2d = np.arange(n_rows, dtype=float).reshape(n_rows, 1)
 
-    _, block_indices = _block_bootstrap_resampling_2d(
+    _, block_indices, _n_sessions_skipped = _block_bootstrap_resampling_2d(
         values_2d,
         day_offsets,
         horizon,

@@ -2,8 +2,6 @@
 
 from __future__ import annotations
 
-import hashlib
-import json
 from collections.abc import Mapping
 from typing import Any
 
@@ -60,8 +58,17 @@ def _to_serializable(obj: Any) -> Any:
 
 
 def config_hash(cfg: Mapping[str, Any]) -> str:
-    """Return a stable 16-hex-char hash of an order-independent canonical JSON form."""
+    """Return a stable 16-hex-char hash of an order-independent canonical JSON form.
+
+    Thin wrapper delegating to `nifty_quant.research.contract.canonical_hash`
+    (specs/research_contract.md: "REPLACES the three config_hash functions").
+    NOTE (spec P2): this function only ever sees whatever mapping the caller
+    passes it (typically `{"strategy": ..., "params": ...}`); it cannot see
+    universe/dates/costs/seed unless the caller includes them, so callers that
+    need a run's true identity (`walkforward`, `sweep`) must hash a
+    `ResearchContract`'s `contract_hash`, not this function's output.
+    """
     serializable = _to_serializable(dict(cfg))
-    canonical = json.dumps(serializable, sort_keys=True, separators=(",", ":"))
-    digest = hashlib.blake2s(canonical.encode("utf-8"), digest_size=8).hexdigest()
-    return digest
+    from nifty_quant.research.contract import canonical_hash
+
+    return canonical_hash(serializable)

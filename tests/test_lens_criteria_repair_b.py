@@ -254,13 +254,20 @@ def test_criterion6_none_strategy_returns_is_not_evaluated_and_names_the_input()
 
 
 def test_criterion6_not_evaluated_does_not_count_as_pass_in_overall_verdict() -> None:
-    """Spec item 2: NOT_EVALUATED must not silently count as PASS in the overall
-    verdict -- mirrors criterion 5's existing precedent (test_lens.py's
-    test_verdict_criterion5_not_evaluated_without_latency_profile: every other
-    criterion PASSes, the NOT_EVALUATED criterion is skipped, and the hypothesis
-    still survives). Requires a fixture where criteria 1-5 and 7 ALL genuinely
-    PASS, which needs real 12-month density for criterion 7 -- a sparse
-    January-only fixture would leave criterion 7 NOT_EVALUATED too and could not
+    """Spec item 2, CORRECTED: NOT_EVALUATED must not silently count as PASS in the
+    overall verdict -- but the corrected contract goes further than the original
+    docstring claimed. Previously this asserted `survived is True` on the theory that
+    "every other criterion PASSes, the NOT_EVALUATED criterion is skipped, and the
+    hypothesis still survives" -- that is the L1 defect (a criterion that was never run
+    silently vanishing from the conjunction instead of blocking SURVIVED). `Lens.verdict()`
+    was fixed so any NOT_EVALUATED criterion makes the outcome INCONCLUSIVE, never
+    SURVIVED (see lens.py: any FAIL -> KILLED, elif any_not_evaluated -> INCONCLUSIVE,
+    else -> SURVIVED). This test is genuinely about the SUBSET behaviour of a single
+    unevaluated criterion (isolating criterion 6 while all others PASS), not about the
+    hypothesis clearing the full screen, so the corrected assertion is INCONCLUSIVE /
+    survived=False, not a strengthened fixture. Still requires a fixture where criteria
+    1-5 and 7 ALL genuinely PASS, which needs real 12-month density for criterion 7 -- a
+    sparse January-only fixture would leave criterion 7 NOT_EVALUATED too and could not
     isolate criterion 6 as the sole unevaluated criterion this test requires."""
     verdict = _call_verdict(
         _dense_all_pass_panel(),
@@ -275,7 +282,9 @@ def test_criterion6_not_evaluated_does_not_count_as_pass_in_overall_verdict() ->
         else:
             assert "PASS" in verdict.reasons[i], verdict.reasons[i]
 
-    assert verdict.survived is True
+    # Corrected contract: NOT_EVALUATED makes the outcome INCONCLUSIVE, not SURVIVED.
+    assert verdict.outcome == "INCONCLUSIVE"
+    assert verdict.survived is False
 
 
 def test_criterion6_single_declared_trial_is_not_evaluated() -> None:
@@ -469,9 +478,16 @@ def test_any_not_evaluated_true_and_explain_states_incomplete_when_c6_unevaluate
     that is True when any criterion is NOT_EVALUATED, and explain() must state
     prominently that the verdict is INCOMPLETE -- not merely list NOT_EVALUATED
     among seven reason lines where a reader skims past it.' Reuses the same
-    every-other-criterion-passes fixture as the survived-is-True test above, so
-    this checks the flag on a verdict that is genuinely SURVIVED yet
-    incomplete -- the exact case the spec calls out as uncomfortable."""
+    every-other-criterion-passes fixture as the test above.
+
+    CORRECTED: the original docstring called this "a verdict that is genuinely
+    SURVIVED yet incomplete -- the exact case the spec calls out as uncomfortable".
+    That combination (survived=True AND any_not_evaluated=True) was the L1 defect
+    itself, now impossible by construction: `Lens.verdict()` maps any_not_evaluated
+    to outcome=INCONCLUSIVE, and `.survived` is exactly `outcome == "SURVIVED"`, so
+    survived is False here. What the spec actually requires -- the flag being set and
+    explain() surfacing INCOMPLETE prominently -- still holds and is asserted below.
+    """
     verdict = _call_verdict(
         _dense_all_pass_panel(),
         latency_profile=_PASS_LATENCY,
@@ -479,7 +495,8 @@ def test_any_not_evaluated_true_and_explain_states_incomplete_when_c6_unevaluate
         effective_n_trials=1,
     )
 
-    assert verdict.survived is True
+    assert verdict.outcome == "INCONCLUSIVE"
+    assert verdict.survived is False
     assert verdict.any_not_evaluated is True
     assert "INCOMPLETE" in verdict.explain()
 
