@@ -9,3 +9,4 @@ cache/
 results/
 *.egg-info/
 .coverage
+.coverage.json

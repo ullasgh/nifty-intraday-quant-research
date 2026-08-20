@@ -135,6 +135,7 @@ class BacktestResult:
         return {
             "total_costs": self.total_costs,
             "n_trades": self.n_trades,
+            "n_orders_dropped_at_session_end": self.n_orders_dropped_at_session_end,
             "rejected_order_rate": self.rejected_order_rate,
             "unfilled_notional_pct": self.unfilled_notional_pct,
             "forced_eod_liquidation_days": self.forced_eod_liquidation_days,
@@ -162,7 +163,7 @@ def _compute_returns(equity: np.ndarray, initial_capital: float) -> tuple[np.nda
 
     A step is "ruined" if its denominator (initial_capital for index 0, else the prior
     equity value) is <= 0 or non-finite, or if its numerator (the current equity value)
-    is non-finite. A ruined step's return is forced to 0.0 rather than letting a bad
+    is non-finite. Such a step's return is forced to 0.0 rather than letting a bad
     denominator sign-flip the ratio or a bad numerator propagate NaN. Once ruined, every
     subsequent index also emits 0.0 -- a ruined series never resumes normal division.
     first_ruin_index is -1 if the guard never trips.
@@ -174,23 +175,39 @@ def _compute_returns(equity: np.ndarray, initial_capital: float) -> tuple[np.nda
 
     initial_bad = not np.isfinite(initial_capital) or initial_capital <= 0.0
 
-    bad = np.empty(n, dtype=np.bool_)
-    bad[0] = initial_bad or not np.isfinite(equity[0])
+    # TWO DISTINCT PREDICATES -- F9. Conflating them was a real defect: the F3 fix
+    # added `cur <= 0.0` to a single mask used BOTH to locate ruin and to zero the
+    # return, which zeroed the return INTO ruin. That return is well defined (a good
+    # positive denominator, a finite numerator) and it is exactly the -100% that took
+    # the book to zero. Zeroing it broke reconciliation -- compounding the returns
+    # reconstructed 5,000,000 on an equity curve that reads 0.0.
+    #
+    #   detect   -- where ruin OCCURS, for first_ruin_index. Includes cur <= 0.0.
+    #   unusable -- where the return CANNOT be computed. Excludes cur <= 0.0, because
+    #               a finite cur over a good prev is a computable (catastrophic) return.
+    #
+    # Rows AFTER ruin are still zeroed without a special case: their own denominator is
+    # the ruined equity, so `prev <= 0.0` catches them.
+    detect = np.empty(n, dtype=np.bool_)
+    unusable = np.empty(n, dtype=np.bool_)
+    detect[0] = unusable[0] = initial_bad or not np.isfinite(equity[0])
     if n > 1:
         prev = equity[:-1]
         cur = equity[1:]
-        bad[1:] = (~np.isfinite(prev)) | (prev <= 0.0) | (~np.isfinite(cur)) | (cur <= 0.0)
+        denom_or_numer_bad = (~np.isfinite(prev)) | (prev <= 0.0) | (~np.isfinite(cur))
+        unusable[1:] = denom_or_numer_bad
+        detect[1:] = denom_or_numer_bad | (cur <= 0.0)
 
-    ruined_mask = np.logical_or.accumulate(bad)
+    ruined_mask = np.logical_or.accumulate(unusable)
 
-    if bad.any():
-        first_ruin_index = int(np.flatnonzero(bad)[0])
+    if detect.any():
+        first_ruin_index = int(np.flatnonzero(detect)[0])
     else:
         first_ruin_index = -1
 
     returns = np.empty(n, dtype=np.float64)
     with np.errstate(divide="ignore", invalid="ignore", over="ignore"):
-        if bad[0]:
+        if unusable[0]:
             returns[0] = 0.0
         else:
             returns[0] = equity[0] / initial_capital - 1.0

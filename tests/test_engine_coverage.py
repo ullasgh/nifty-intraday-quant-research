@@ -387,8 +387,8 @@ def test_compute_returns_bad_denominator_sticky() -> None:
     assert returns[0] == 0.0
     assert returns[1] == pytest.approx(-1.1)  # -1_000_000 / 10_000_000 - 1 = -1.1
     assert returns[2] == 0.0  # Sticky: step 2's denominator (equity[1]) is bad
-    # First bad index is 2, because equity[1] becomes the denominator at step 2
-    assert ruin_idx == 2
+    # F3: ruin is flagged AT the crash row. equity[1] is itself <= 0, so index 1.
+    assert ruin_idx == 1
 
 
 def test_compute_returns_bad_numerator() -> None:

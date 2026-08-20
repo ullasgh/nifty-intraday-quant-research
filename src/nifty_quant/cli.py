@@ -493,6 +493,8 @@ def backtest(
             metrics[f"gross_{key}"] = value
         for key, value in net.to_dict().items():
             metrics[f"net_{key}"] = value
+        # Add diagnostic counters (F1, F2, F4, F7).
+        n_forced_liq_nontradable = result.n_forced_liquidations_against_nontradable
         metrics.update(
             {
                 "breakeven_bps": float(breakeven),
@@ -501,6 +503,11 @@ def backtest(
                 "rejected_order_rate": float(result.rejected_order_rate),
                 "unfilled_notional_pct": float(result.unfilled_notional_pct),
                 "latency_sharpes": latency_sharpes,
+                "n_orders_dropped_at_session_end": result.n_orders_dropped_at_session_end,
+                "n_forced_liquidations_against_nontradable": n_forced_liq_nontradable,
+                "min_cash_seen": float(result.min_cash_seen),
+                "n_rows_negative_cash": result.n_rows_negative_cash,
+                "n_stale_marks": result.n_stale_marks,
             }
         )
         (trial_dir / "metrics.json").write_text(

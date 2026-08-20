@@ -677,28 +677,6 @@ def check_accounting(
         )
 
 
-def check_cash_floor(cash: float, *, floor: float = 0.0) -> None:
-    """F2: SURFACE negative cash at FULL strictness by raising, rather than
-    silently letting a backtest finance trades from an overdraft it never
-    declared. The default floor is 0.0 -- any negative cash raises. This is a
-    magnitude check on a scalar the engine guarantees is never NaN (cash is
-    accumulated only through finite fills and charges), so unlike
-    `check_accounting` (F6) it does not need a separate finiteness test; kept
-    explicit here anyway so a future caller cannot repeat F6's mistake by
-    routing a NaN `cash` through this same bare comparison.
-    """
-    _level = _strictness
-    if _level is None:
-        _level = get_strictness()
-    if _level < Strictness.FULL:
-        return
-
-    if not np.isfinite(cash) or cash < floor:
-        raise ContractViolation(
-            f"cash floor violated: cash={cash} is below floor={floor}"
-        )
-
-
 def check_aligned(*arrays: np.ndarray, names: Sequence[str] | None = None) -> None:
     """Check that all supplied arrays have the same leading length, always."""
     if len(arrays) < 2:

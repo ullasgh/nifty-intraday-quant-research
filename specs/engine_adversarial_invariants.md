@@ -347,3 +347,108 @@ Corollary worth stating: **the pooled/total turnover is correct; only its per-da
 wrong.** So aggregate cost estimates survive and per-day ones do not. Do not over-claim the
 damage, and do not under-claim it either — anything conditioning on daily turnover (regime splits,
 per-year tables, cost-per-day series) has been reading a shifted series.
+
+---
+
+# F9 — THE F3 FIX OVER-CORRECTED AND BROKE RETURNS/EQUITY RECONCILIATION
+
+Found by the lead while writing the contract-update briefs for F3, i.e. only because I stopped to
+compute the expected values instead of assuming them. **Caused by my own F3 brief**, which said
+"add `equity[1:] <= 0.0` to the disjunction" without noticing the disjunction is used for TWO
+different purposes.
+
+`_compute_returns` used ONE mask both to LOCATE ruin and to ZERO returns. Adding `cur <= 0.0`
+correctly moved `first_ruin_index` onto the crash row — and simultaneously zeroed the return INTO
+the crash, which is well defined and is exactly the -100% that wiped the book out.
+
+Measured, `equity = [1e7, 5e6, 0.0, 5e6]`:
+
+    returns AFTER the F3 fix   [0.0, -0.5,  0.0, 0.0]   -> compounds to 5,000,000
+    equity curve                [1e7,  5e6,  0.0, 5e6]   -> says 0
+                                                             ^ IRRECONCILABLE
+
+A returns series that cannot reproduce its own equity curve is worse than the off-by-one it
+replaced: total return computed from returns would have MISSED A TOTAL WIPEOUT.
+
+**Fix — separate the two predicates, because they answer different questions:**
+
+    detect   = bad_denominator | bad_numerator | (cur <= 0.0)   # WHERE ruin occurs -> ruin_index
+    unusable = bad_denominator | bad_numerator                  # where a return CANNOT be computed
+
+`cur <= 0.0` belongs only in `detect`. A finite `cur` over a good positive `prev` is a computable
+return, however catastrophic. Rows AFTER ruin need no special case: their own denominator is the
+ruined equity, so `prev <= 0.0` already catches them.
+
+Verified after the fix:
+
+    equity  [1e7, 5e6, 0.0, 5e6]  -> returns [0.0, -0.5, -1.0, 0.0]  ruin_index 2
+    compounding reproduces the wipeout exactly.
+    equity  [1e7, -1e6, 5e6]      -> returns [0.0, -1.1,  0.0]       ruin_index 1
+    healthy series unchanged.
+
+Guarded by a new regression test, `test_returns_reconcile_with_equity_through_ruin`.
+
+**The lesson, and it is the sharpest one of the program so far:** F3 was a one-line change to a
+boolean expression, described in a spec, implemented correctly as described, and it introduced a
+worse defect than it fixed. It was caught only because writing the test-update brief required
+computing the expected numbers, and the numbers did not reconcile. **A one-line fix to a predicate
+that serves two callers is a two-line fix.** Before changing any mask, enumerate every consumer of
+it.
+
+---
+
+# F2 MEASURED ON REAL DATA — the backtest runs on an UNDECLARED OVERDRAFT
+
+F2 added `min_cash_seen` and `n_rows_negative_cash`. Now that they reach `metrics.json`, they can
+be read on real data for the first time. Measured by the lead, `volume_breakout`, all_equity
+(149 names), January 2024, capital Rs 1,00,00,000:
+
+    min_cash_seen                Rs -64,43,280      peak overdraft = 0.64x capital
+    n_rows_negative_cash         568 rows
+    peak gross book financed     Rs 1,64,43,280     = 1.64x declared capital
+
+**Every published `volume_breakout` number describes a book running at up to ~1.64x, not 1.0x.**
+The config declares `gross: 1.0` and `capital: 1e7`; the engine has been financing the difference
+from a cash balance nobody constrained.
+
+## Why this matters more than the Sharpe
+
+`volume_breakout` is dead either way, so this does not resurrect or further kill it. What it
+changes is the READING of every cost and capacity conclusion drawn from the engine:
+
+- **Cost-per-rupee ratios are computed against a denominator that is too small.** Turnover as a
+  fraction of "capital" overstates churn relative to the capital actually at work.
+- **Any capacity statement is wrong by the leverage factor.** Phase H's ladder ("at what capital
+  does the edge die") would have inherited this silently.
+- **Risk numbers are understated.** A vol target computed on declared capital does not describe a
+  book holding 1.64x that notional -- which is exactly the defect `specs/portfolio_vol_target.md`
+  amendment 6 removed at the sizer level, reappearing here at the engine level.
+
+## Mechanism NOT yet established -- do not guess it
+
+The most likely candidate is fill sequencing: entries for a rotation filling at `open[t+1]` before
+the corresponding exits have settled, so gross exposure transiently exceeds the target. With
+`gross = 1.0` and `max_weight = 0.10` over 149 names, steady-state cash should sit near zero, not
+64% below it. Costs alone cannot explain a number this size.
+
+**This is stated as a hypothesis and must be measured, not assumed.** Required follow-up:
+1. Reconstruct cash row by row from the trade blotter and find the rows where it dives.
+2. Determine whether those rows coincide with rotations (simultaneous entry and exit).
+3. Decide the intended semantics DELIBERATELY: either the engine models a cash-settled book and
+   must reject orders it cannot fund, or it models a margin account and must DECLARE the facility
+   and charge for it. Right now it does neither and simply lets the balance go negative.
+
+Until that is settled, treat any engine-derived capacity or cost-per-capital figure as carrying an
+unquantified leverage factor.
+
+## Also measured, and quieter than expected
+
+    n_orders_dropped_at_session_end            = 0
+    n_forced_liquidations_against_nontradable  = 0
+    n_stale_marks                              = 0
+
+So on this configuration F1's session leak, F7's halted-symbol liquidation and F4's stale marks do
+NOT fire. They were real defects and the fixes are correct, but their frequency here is zero --
+worth knowing before attributing any number change to them. It also means the F1/F5/composed-cost
+mechanisms had nothing to act on in the 2024 baseline diff, which is why the cost figures did not
+move. That confirms the reading recorded in `results/baselines/PHASE_A_COST_DIFF.md`.

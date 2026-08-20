@@ -167,14 +167,16 @@ def test_compute_returns_flags_negative_denominator() -> None:
         np.array([100.0, 50.0, -10.0, -20.0]), 100.0
     )
     assert returns[3] == 0.0
-    assert first_ruin_index == 3
+    # F3: ruin is flagged AT the crash row, not one row late.
+    assert first_ruin_index == 2
     assert np.all(np.isfinite(returns))
 
 
 def test_compute_returns_flags_zero_equity() -> None:
     returns, first_ruin_index = _compute_returns(np.array([100.0, 0.0, 50.0]), 100.0)
     assert returns[2] == 0.0
-    assert first_ruin_index == 2
+    # F3: ruin is flagged AT the crash row, not one row late.
+    assert first_ruin_index == 1
     assert np.all(np.isfinite(returns))
 
 
@@ -182,9 +184,22 @@ def test_ruin_is_sticky() -> None:
     returns, first_ruin_index = _compute_returns(
         np.array([100.0, -5.0, 200.0, 300.0]), 100.0
     )
-    assert first_ruin_index == 2
+    # F3: ruin is flagged AT the crash row, not one row late.
+    assert first_ruin_index == 1
     assert returns[2] == 0.0
     assert returns[3] == 0.0
+
+
+def test_returns_reconcile_with_equity_through_ruin() -> None:
+    equity = np.array([1e7, 5e6, 0.0, 5e6])
+    returns, ruin_index = _compute_returns(equity, 1e7)
+    # the return INTO ruin is well defined: a good positive denominator (5e6) and a
+    # finite numerator (0.0). It is exactly -100% and must NOT be zeroed.
+    assert returns[2] == pytest.approx(-1.0)
+    assert ruin_index == 2
+    # compounding the returns must reproduce the equity curve down to the wipeout
+    reconstructed = 1e7 * np.cumprod(1.0 + returns)
+    assert reconstructed[2] == pytest.approx(0.0)
 
 
 def test_compute_returns_flags_nan_numerator() -> None:

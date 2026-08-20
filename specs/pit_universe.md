@@ -108,3 +108,80 @@ its provenance rather than only in a source comment.
 - `present` and `tradable` stay distinct (rule 7); eligibility is a THIRD concept and must not be
   merged into either. A name can be present, tradable, and still ineligible for research because
   it listed last week.
+
+---
+
+# AMENDMENT 1 — 2026-08-20. Eight defects from a test author; one of its claims is itself wrong.
+
+## 1. THE ADV REFERENCE WAS WRONG — but not in the way it was reported
+
+Section A said to reuse `data/validate.py:736-739` and called it "`compute_prior_adv`-style". The
+author reported that **no such function exists anywhere in the codebase**. That is incorrect:
+`compute_prior_adv` is a real callable at **`src/nifty_quant/research/lens.py:57`**. The author was
+right that `validate.py:736-739` is INLINED logic inside `tradable_mask`, not a callable — my spec
+pointed at inlined code while naming a function that lives in a different module. Half the report
+stands; the conclusion drawn from it does not.
+
+**There are TWO trailing-ADV implementations and their difference is DELIBERATE and documented** —
+this is not the duplication hazard it looks like:
+
+- `validate.py`'s `tradable_mask`: `np.nansum` over an entirely-absent session returns **0.0**,
+  which it correctly treats as "0 ADV -> not tradable" for ITS purpose.
+- `lens.py`'s `compute_prior_adv`: preserves **NaN** for an entirely-absent session, because for
+  liquidity-DECILE bucketing a 0.0 would misclassify a non-trading symbol as the most illiquid
+  name alive and drop it into decile 0 — a rule-6 violation (NaN means "no bar", never zero).
+
+**Eligibility needs the `lens.py` semantics**, for the same reason: a name that did not trade is
+"unknown", not "maximally illiquid".
+
+**Required change, and it is a real one:** `universe/` importing from `research/` is a layering
+inversion — `universe` is the lower layer. Move `compute_prior_adv` to a shared home
+(`data/liquidity.py` is the natural one), have BOTH `research/lens.py` and the new
+`universe/pit.py` import it, and add a test asserting the two ADV paths agree except at the
+documented all-NaN-session divergence. Do NOT let a third copy appear — the repo has already lost
+a day to two same-looking liquidity statistics that were not the same statistic.
+
+## 2. Entry point, named
+
+    src/nifty_quant/universe/pit.py
+        compute_eligibility(panel, *, min_history_sessions, min_adv_inr) -> PointInTimeEligibility
+
+matching what the author had to invent, so its suite needs no churn. The spec's failure to name an
+entry point is the same defect shape recorded in `specs/order_lifecycle.md` amendment 2 (unstated
+STRUCTURE) and it should have been caught before dispatch.
+
+## 3. Same-session presence is NOT required for eligibility — rule 7, extended
+
+The author correctly found this unstated and load-bearing. **Decision: eligibility does NOT require
+a bar on session `d`.** Eligibility answers "is this name part of the research universe on `d`",
+computed from strictly-prior data. Whether a bar actually exists that day is `present`; whether it
+is usable is `tradable`. Those are three distinct concepts and the spec already says so — this
+just makes the boundary explicit at the case that exposes it. A name can be eligible and absent;
+the `present` mask handles the absence.
+
+## 4. Remaining items, resolved
+
+- **ADV over gapped symbols:** trailing 20 **calendar** sessions, matching `compute_prior_adv`, not
+  20 sessions the symbol happened to be present for. A name that stopped trading should see its
+  ADV decay, not freeze.
+- **`symbols` on the result:** sorted, and the hash is computed over the sorted set. Sorting only
+  inside the hash would let two results compare unequal while hashing identically.
+- **Relationship to `Universe.as_of(d)`:** `compute_eligibility` SUPERSEDES it. `as_of` becomes a
+  thin wrapper delegating to it, keeping its `source="availability_proxy"` contract. Do not leave
+  two eligibility paths.
+- **The delisting-boundary wording:** the point is not that delistings exist and are handled — it
+  is that **this dataset contains ZERO of them**, so no eligibility result may ever be read as
+  survivorship-corrected. Say that at the API surface.
+- **`min_history_sessions` for required test 8:** `n_sessions - 1` is the right choice and the
+  author documented it. Accepted.
+
+## 5. FIFTH instance of the degenerate-fixture pattern
+
+The author found its own draft's item-3 ranking test "landing on a vacuous final assertion" and
+rewrote it into a provable form: with an ineligible name's true value sitting BETWEEN two eligible
+names', dropping it before ranking gives the survivors ranks `[1, 2]` while merely zero-weighting
+it gives `[1, 3]`. That is the actual, discriminating form of "excluded, not zero-weighted".
+
+Fifth occurrence in this program of a test that would have passed while asserting nothing. The
+standing rule, restated: **whenever a test asserts "X must differ from Y", construct the case
+where they provably differ and check the fixture does not sit on the coincidence.**

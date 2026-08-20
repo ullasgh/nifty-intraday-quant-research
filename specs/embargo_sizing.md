@@ -90,3 +90,61 @@ only forward), document the difference at each site rather than forcing a false 
 - No hand-chosen constants (rule 8). Every term is derived from a declared strategy or feature
   property. If a term cannot be derived for some strategy, `split()` must RAISE rather than
   default it to zero — a silently-zero embargo term is how this defect got here.
+
+---
+
+# AMENDMENT 1 — 2026-08-20. Defects found by a test author before implementation.
+
+## 1. MY STATED MECHANISM FOR `embargo_frac` WAS BACKWARDS
+
+Section C says `embargo_frac` "is not a property of the strategy and **shrinks as the sample
+grows** — precisely backwards." The second clause is itself backwards. Measured:
+
+    frac = 0.01,  embargo = ceil(frac * n_rows)
+    n_rows     1,000  ->     10 rows
+    n_rows    10,000  ->    100 rows
+    n_rows 1,000,000  -> 10,000 rows
+
+The ABSOLUTE embargo **GROWS** with the sample. It does not shrink.
+
+**The substantive objection survives intact, and it is the reason the change still stands:** a
+fraction of SAMPLE SIZE is not a property of the STRATEGY. The dependence horizon between train
+and test is set by the feature lookback, the label horizon, the holding period and the execution
+lag — none of which changes when you add three more years of data. Tying the embargo to `n_rows`
+leaves it untethered from the thing it exists to bound, **in either direction**: too small on a
+short sample, arbitrarily large on a long one. Growing without reason is no better than shrinking
+without reason.
+
+Required test 6 is UNCHANGED and was already correct: doubling the sample must leave the absolute
+embargo unchanged, because the embargo is a strategy property. Only my justification was wrong.
+
+## 2. Boundary, rounding and scope items — accepted, resolved here
+
+- **`>=` vs `<`.** `required_embargo` is a MINIMUM: the check fails when the configured embargo is
+  strictly LESS than the requirement. Equality passes.
+- **Rounding.** Components sum as floats and are converted to sessions with `math.ceil` at the
+  END, once — never per-component, which would over-count by up to one session per term.
+- **`holding_period` for non-EMA strategies.** The `1/a` effective-memory formula applies to
+  exponential smoothing only. For a fixed k-session hold it is `k`; for a strategy that cannot
+  declare one, `split()` RAISES rather than defaulting to zero. That was already the spec's rule
+  and it is restated because the author was right that the formula alone does not cover the space.
+- **`embargo_frac`'s fate.** DELETED, not silently ignored. A field that is read by nothing but
+  still accepted in a constructor is the same class of lie as the `target_vol_ann` this program
+  already removed from two plugins.
+- **`PurgedKFold`'s left purge.** It covers `label_horizon` only, NOT the full
+  `required_sessions()`. The purge and the embargo bound different dependencies — purging removes
+  label overlap on the left, the embargo removes serial dependence on the right. Do not unify them.
+- **Provenance recording** is Phase B3's job and is correctly untestable from this spec.
+
+## 3. A FOURTH INSTANCE OF THE DEGENERATE-FIXTURE PATTERN — caught by the author itself
+
+Author B found that its own regression guard used `holding_period=10`, which **coincidentally
+equalled the old fraction-based width at `n_rows=1000`** — so the assertion "must differ from the
+old behaviour" would have PASSED against unfixed code. It changed the constant to 7 and said so.
+
+That is the fourth time in this program that a fixture value collapsed onto the very thing it was
+meant to distinguish: flat prices making returns identically zero; an `annualization_factor` panel
+whose median landed on exactly 375; per-row turnover `[0.0, 0.6]` where sum equals compound; and
+now this. **Whenever a test asserts "X must differ from Y", compute Y and check the fixture does
+not sit on it.** The author catching this in its own draft, unprompted, is the behaviour to
+reinforce.

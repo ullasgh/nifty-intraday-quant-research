@@ -12,7 +12,8 @@ Defects / ambiguities / contradictions found in the spec:
   `cli.py` private helpers which this spec deletes. Reimplementing it in the test could diverge
   from the real old logic, especially around handling of the final row and duplicate rows.
 - The old reconstruction's final row mapping is ambiguous if the final row is also a decision row
-  (duplicate row index). This can cause length mismatch/shape issues in `aggregate_returns_by_group`.
+  (duplicate row index). This can cause length mismatch/shape issues in
+  `aggregate_returns_by_group`.
 - Rule 6 says no fixed 375-bar stride, but item 4 explicitly mentions "regular 375-bar sessions"
   mixed with shorter ones. This is not necessarily a contradiction, but it suggests the rule is
   about never assuming a constant length; tests must not rely on 375 anywhere.
@@ -38,7 +39,7 @@ from pydantic import BaseModel
 # `DailyResult` is unused today: importing it is the intentional TDD-red probe --
 # it must raise ImportError until `nifty_quant.backtest.daily` exists. Kept
 # deliberately (see the module-level defect note above), not a ruff F401 miss.
-from nifty_quant.backtest.daily import DailyResult  # noqa: F401
+from nifty_quant.backtest.daily import DailyResult, build_daily  # noqa: F401
 from nifty_quant.backtest.engine import BacktestConfig, run_backtest
 from nifty_quant.backtest.metrics import (
     PerformanceMetrics,
@@ -72,7 +73,12 @@ def _make_epoch(date_obj: date, hour: int, minute: int) -> int:
     return int(dt.timestamp())
 
 
-def _session_ts(date_obj: date, n_bars: int, start_hour: int = 9, start_min: int = 15) -> np.ndarray:
+def _session_ts(
+    date_obj: date,
+    n_bars: int,
+    start_hour: int = 9,
+    start_min: int = 15,
+) -> np.ndarray:
     """Generate `n_bars` 1-minute bars, left-labelled, starting at start_hour:start_min."""
     start = _make_epoch(date_obj, start_hour, start_min)
     return (start + np.arange(n_bars, dtype=np.int64) * 60).astype(np.int64)
@@ -246,7 +252,8 @@ def _old_daily_returns(strategy: Strategy, panel: Panel, result_returns: np.ndar
     row_indices = _old_row_indices(strategy, panel)
     if len(row_indices) != len(result_returns):
         raise ValueError(
-            f"old reconstruction length mismatch: rows={len(row_indices)} returns={len(result_returns)}"
+            f"old reconstruction length mismatch: "
+            f"rows={len(row_indices)} returns={len(result_returns)}"
         )
     group_ids = np.searchsorted(panel.day_offsets, row_indices, side="right") - 1
     return aggregate_returns_by_group(result_returns, group_ids)
@@ -317,7 +324,13 @@ def test_item_1_daily_returns_match_old_reconstruction():
 
 
 def test_item_2_turnover_sums_returns_compound():
-    # --- Turnover sums: two decision rows of turnover 0.1 and 0.2 => 0.3 ---
+    """This test verifies the per-day attribution of turnover (day 0's square-off).
+
+    The sums-vs-compounds contract is verified more directly by
+    test_item_2b_build_daily_turnover_sums_and_returns_compound, which does not
+    depend on engine attribution and cannot be vacuous.
+    """
+    # --- Turnover sums: two decision rows of turnover 0.1 and 0.2 => 0.6 total ---
     sessions = [(date(2022, 1, 3), 375), (date(2022, 1, 4), 375)]
     panel_const = _make_panel(sessions)
     strategy_turnover = _TimeWeightStrategy(
@@ -326,11 +339,14 @@ def test_item_2_turnover_sums_returns_compound():
     result_turnover = _run_bt(strategy_turnover, panel_const)
 
     # Day 0 has two decision rows; final row is on day 1.
-    # Daily turnover day 0 should be sum of the two decision-row turnovers.
-    assert result_turnover.daily.turnover[0] == 0.3
-    # Also assert the two decision rows have the expected per-row turnover.
-    assert result_turnover.turnover[0] == 0.1
-    assert result_turnover.turnover[1] == 0.2
+    # Daily turnover day 0 should be sum of the two decision-row turnovers plus
+    # the mandatory end-of-day square-off: 0.1 (10:00) + 0.2 (10:30) + 0.3 (square-off).
+    assert result_turnover.daily.turnover[0] == 0.6
+    # The per-row turnovers now reflect the F8 fix: the 10:00 decision (row 0)
+    # shows 0.0 (position change deferred), and the 10:30 decision (row 1)
+    # combines with the end-of-day square-off to show 0.6 total.
+    assert result_turnover.turnover[0] == 0.0
+    assert result_turnover.turnover[1] == 0.6
 
     # --- Returns compound: daily return = (1+r1)*(1+r2)-1 for day 0 ---
     # Build a panel with two sessions and rising prices so the first day has
@@ -371,6 +387,49 @@ def test_item_2_turnover_sums_returns_compound():
 
     expected_compound = (1.0 + r1) * (1.0 + r2) - 1.0
     assert np.isclose(result_returns.daily.returns[0], expected_compound, atol=1e-15)
+
+
+def test_item_2b_build_daily_turnover_sums_and_returns_compound():
+    """Direct unit test of the asymmetry: turnover SUMS, returns COMPOUND.
+
+    The per-row values [0.1, 0.2] are chosen so that sum (0.3) and compound
+    (0.32) are clearly distinguishable. This contract is verified here at the
+    aggregation level, independent of engine attribution.
+    """
+    row_day_index = np.array([0, 0], dtype=np.int64)
+    turnover = np.array([0.1, 0.2], dtype=np.float64)
+    returns = np.array([0.1, 0.2], dtype=np.float64)
+    gross_returns = np.array([0.1, 0.2], dtype=np.float64)
+    # Equity values after applying the returns: 1e7 * (1.1) * (1.2) = 1.32e7
+    equity = np.array([1.1e7, 1.32e7], dtype=np.float64)
+
+    # UTC-midnight epoch for 2022-01-03 (arbitrary choice; it's a single day)
+    date_2022_01_03 = int(
+        datetime(2022, 1, 3, tzinfo=timezone.utc).timestamp()
+    )
+    dates = np.array([date_2022_01_03], dtype=np.int64)
+
+    daily = build_daily(
+        row_day_index=row_day_index,
+        equity=equity,
+        returns=returns,
+        gross_returns=gross_returns,
+        turnover=turnover,
+        dates=dates,
+        initial_capital=1e7,
+    )
+
+    # Assert turnover SUMS, not compounds
+    expected_turnover_sum = 0.1 + 0.2  # 0.3
+    expected_turnover_compound = (1.0 + 0.1) * (1.0 + 0.2) - 1.0  # 0.32
+    assert np.isclose(daily.turnover[0], expected_turnover_sum, atol=1e-15)
+    assert not np.isclose(daily.turnover[0], expected_turnover_compound, atol=1e-15)
+
+    # Assert returns COMPOUND, not sum
+    expected_returns_compound = (1.0 + 0.1) * (1.0 + 0.2) - 1.0  # 0.32
+    expected_returns_sum = 0.1 + 0.2  # 0.3
+    assert np.isclose(daily.returns[0], expected_returns_compound, atol=1e-15)
+    assert not np.isclose(daily.returns[0], expected_returns_sum, atol=1e-15)
 
 
 def test_item_3_equity_is_end_of_day():

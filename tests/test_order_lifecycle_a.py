@@ -74,7 +74,6 @@ from nifty_quant.execution.costs import (
 from nifty_quant.execution.fills import FillModel, ZeroSlippage
 from nifty_quant.strategy.base import DataRequest, Strategy, TargetPortfolio
 
-
 BARS_PER_DAY = 375
 CAPITAL = 10_000_000.0
 PRICE = 100.0

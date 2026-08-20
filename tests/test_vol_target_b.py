@@ -150,7 +150,7 @@ from __future__ import annotations
 import numpy as np
 import pytest
 
-from nifty_quant.backtest.portfolio import GrossNotionalSizer, SizingResult, VolTargetSizer
+from nifty_quant.backtest.portfolio import GrossNotionalSizer, VolTargetSizer
 from nifty_quant.features.core import annualization_factor, ewma_volatility_ann
 
 
@@ -259,7 +259,11 @@ def test_vol_target_achieved_when_nothing_binds() -> None:
 
 def test_clip_binding_when_max_weight_binds() -> None:
     sizer = VolTargetSizer(
-        target_vol_ann=0.15, max_weight=0.001, gross=100.0, min_trade_notional=0.0, whole_shares=False
+        target_vol_ann=0.15,
+        max_weight=0.001,
+        gross=100.0,
+        min_trade_notional=0.0,
+        whole_shares=False,
     )
     weights = np.array([0.05, -0.03, 0.02, 0.04])
     sigma = np.array([0.2, 0.4, 0.1, 0.3])
@@ -446,7 +450,12 @@ def test_annualization_factor_uses_median_bars_per_session() -> None:
 
 
 def test_gross_notional_sizer_plain_path_is_bit_identical_to_golden_values() -> None:
-    sizer = GrossNotionalSizer(gross=1.0, max_weight=0.10, min_trade_notional=25_000.0, whole_shares=True)
+    sizer = GrossNotionalSizer(
+        gross=1.0,
+        max_weight=0.10,
+        min_trade_notional=25_000.0,
+        whole_shares=True,
+    )
     weights = np.array([0.05, -0.08, 0.15, np.nan, 0.03])
     prices = np.array([100.0, 250.0, 50.0, 300.0, np.nan])
     capital = 1_000_000.0
@@ -456,7 +465,12 @@ def test_gross_notional_sizer_plain_path_is_bit_identical_to_golden_values() -> 
 
 
 def test_gross_notional_sizer_capacity_path_is_bit_identical_to_golden_values() -> None:
-    sizer = GrossNotionalSizer(gross=1.0, max_weight=0.10, min_trade_notional=0.0, whole_shares=True)
+    sizer = GrossNotionalSizer(
+        gross=1.0,
+        max_weight=0.10,
+        min_trade_notional=0.0,
+        whole_shares=True,
+    )
     weights = np.array([0.10, -0.10, 0.08, 0.05])
     prices = np.array([100.0, 200.0, 50.0, 400.0])
     btv = np.array([10_000.0, 5_000.0, 1_000_000.0, 1_000_000.0])
