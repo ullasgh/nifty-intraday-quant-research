@@ -66,8 +66,16 @@ def test_forward_returns_dtype_conversion() -> None:
 
 
 def test_forward_returns_empty_panel() -> None:
-    """Skip test: day_offsets validation prevents empty panel."""
-    pass
+    """Empty panel (0 rows) produces empty forward returns array."""
+    close = np.empty((0, 2), dtype=np.float64)
+    day_offsets = np.array([0], dtype=int)
+    result = expectancy.forward_returns(close, day_offsets, horizon=1)
+
+    assert result.values.shape == (0, 2)
+    assert result.n_defined == 0
+    assert result.n_nan_tail == 0
+    assert result.horizon == 1
+    assert result.session_bounded is True
 
 
 # ---------------------------------------------------------------------------
@@ -124,8 +132,14 @@ def test_causal_buckets_all_nan_with_rolling_quantile() -> None:
 
 
 def test_causal_buckets_empty_panel() -> None:
-    """Skip empty panel test - day_offsets validation prevents it."""
-    pass
+    """Empty panel (0 rows) produces empty bucketing labels array."""
+    feature = np.empty((0, 2), dtype=np.float64)
+    day_offsets = np.array([0], dtype=int)
+    result = expectancy.causal_buckets(feature, day_offsets, n_buckets=5)
+
+    assert result.labels.shape == (0, 2)
+    assert result.n_buckets == 5
+    assert result.method == "expanding_quantile"
 
 
 # ---------------------------------------------------------------------------

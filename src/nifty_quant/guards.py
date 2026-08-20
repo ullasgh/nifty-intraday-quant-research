@@ -386,6 +386,420 @@ def causal(
     return decorator
 
 
+def _source_snippet(func: Callable[..., Any]) -> str:
+    """Best-effort short source snippet for violation messages.
+
+    `func.__name__` after `functools.wraps` is usually the thin wrapper's own name
+    (e.g. `"guarded"`), which tells a reader nothing about what leaked. Recovering
+    the wrapper's literal source (its `def` line plus body, and any decorator lines
+    above it) surfaces the actual call it made, at essentially no cost: this is
+    best-effort only, silently empty for functions with no retrievable source
+    (builtins, exec'd code, C extensions).
+    """
+    try:
+        src = inspect.getsource(func)
+    except (OSError, TypeError):
+        return ""
+    return "\nsource: " + src.strip()[:300]
+
+
+def universe_causal(
+    *,
+    panel_arg: str | int = 0,
+    row_arg: str | int | None = None,
+    n_probes: int = 4,
+    seed: int = 0,
+) -> Callable[[F], F]:
+    """Probe for universe-causality leaks by perturbing panel data after session `d`.
+
+    Wraps `f(panel) -> mask` where `panel` is 2-D `(n_sessions, n_symbols)`, either
+    bool (`True` = present) or float (`NaN` = absent, the repo-wide convention).
+    `row_arg` is an alias for `panel_arg` (kept for a second caller convention); if
+    given it wins.
+
+    At FULL strictness only: perturbs a SAMPLE of sessions (always the first, the
+    last, and one session adjacent to a symbol's first-present boundary if one
+    exists, topped up to `n_probes` distinct sessions via a seeded, pinnable draw --
+    not every session, so this stays usable on hundreds of sessions). For each
+    probed session `d`, BOTH directions are checked in separate calls: making
+    currently-absent future cells appear, and making currently-present future cells
+    disappear. A one-directional guard passes a mask built from
+    `np.any(present, axis=0)` -- see the module docstring / spec for why both
+    directions are mandatory.
+
+    Blind spot (documented per spec section D, style of
+    `research/expectancy.py:939`): this guard can only prove eligibility at session
+    `d` is unaffected by panel cells strictly AFTER `d`. It cannot prove eligibility
+    at `d` was honestly computed from cells <= `d` -- e.g. a caller who centred a
+    liquidity feature on a forward-looking window before ever passing it into the
+    eligibility function has already baked the leak into session `d`'s own input,
+    and this guard has nothing to say about it, exactly as `@causal` cannot see a
+    leak already baked into `prior_adv` before it reaches `expectancy_by_liquidity`.
+    """
+
+    def decorator(func: F) -> F:
+        key = row_arg if row_arg is not None else panel_arg
+        panel_arg_name = _static_arg_name(func, key)
+
+        @functools.wraps(func)
+        def wrapper(*args: Any, **kwargs: Any) -> Any:
+            _level = _strictness
+            if _level is None:
+                _level = get_strictness()
+            if _level < Strictness.FULL:
+                return func(*args, **kwargs)
+
+            name, panel = _resolve_arg(func, args, kwargs, panel_arg_name)
+            if not isinstance(panel, np.ndarray) or panel.ndim != 2:
+                raise ContractViolation(
+                    f"{func.__name__}: universe_causal argument {name!r} must be a "
+                    f"2-D ndarray, got {type(panel).__name__}"
+                )
+
+            y0 = func(*args, **kwargs)
+            if not isinstance(y0, np.ndarray) or y0.shape[0] != panel.shape[0]:
+                raise ContractViolation(
+                    f"{func.__name__}: universe_causal output must be an ndarray "
+                    f"with shape[0] == {panel.shape[0]}, got {type(y0).__name__}"
+                )
+
+            n_sessions = panel.shape[0]
+            if n_sessions < 2:
+                return y0
+
+            present = panel if panel.dtype == np.bool_ else np.isfinite(panel)
+
+            # Always probe the first and last session, plus one session adjacent to
+            # a symbol's first-present boundary if one exists.
+            probe_set: set[int] = {0, n_sessions - 1}
+            fp_candidates: list[int] = []
+            for col in range(present.shape[1]):
+                true_indices = np.nonzero(present[:, col])[0]
+                if true_indices.size > 0 and true_indices[0] > 0:
+                    fp_candidates.append(int(true_indices[0]))
+            if fp_candidates:
+                probe_set.add(min(fp_candidates) - 1)
+
+            # Top up to n_probes distinct sessions with a seeded, pinnable draw --
+            # this is a SAMPLE, not every session, so FULL strictness stays usable.
+            rng = np.random.default_rng(seed)
+            remaining = [i for i in range(0, n_sessions - 1) if i not in probe_set]
+            budget = max(n_probes - len(probe_set), 0)
+            if budget > 0 and remaining:
+                n_draw = min(budget, len(remaining))
+                drawn = rng.choice(remaining, size=n_draw, replace=False)
+                probe_set.update(int(d) for d in drawn)
+
+            for d in sorted(probe_set):
+                # Add direction: currently-absent future cells become present.
+                panel_add = panel.copy()
+                future_absent = ~present[d + 1 :]
+                if panel.dtype == np.bool_:
+                    panel_add[d + 1 :][future_absent] = True
+                else:
+                    draw = rng.standard_normal(size=int(future_absent.sum()))
+                    panel_add[d + 1 :][future_absent] = draw.astype(panel.dtype)
+
+                new_args, new_kwargs = _rebind_call(
+                    func, args, kwargs, key, panel_add, panel_arg_name
+                )
+                y1 = func(*new_args, **new_kwargs)
+                if not isinstance(y1, np.ndarray) or y1.shape[0] != y0.shape[0]:
+                    raise ContractViolation(
+                        f"{func.__name__}: universe_causal add-direction probe at "
+                        f"session {d} returned shape "
+                        f"{getattr(y1, 'shape', None)}, baseline was {y0.shape}"
+                    )
+                # array_equal(equal_nan=True) treats matching NaN patterns as equal
+                # and correctly flags a NaN-vs-finite mismatch, unlike a magnitude
+                # check `abs(x - y) > atol`, which is silently False (no violation)
+                # whenever either side is NaN.
+                if not np.array_equal(y1[d], y0[d], equal_nan=True):
+                    raise ContractViolation(
+                        f"{func.__name__}: universe_causal violation (add "
+                        f"direction): eligibility mask row/session {d} changed when "
+                        f"absent symbols were made to appear strictly after session "
+                        f"{d}{_source_snippet(func)}"
+                    )
+
+                # Remove direction: currently-present future cells become absent.
+                panel_remove = panel.copy()
+                future_present = present[d + 1 :]
+                if panel.dtype == np.bool_:
+                    panel_remove[d + 1 :][future_present] = False
+                else:
+                    panel_remove[d + 1 :][future_present] = np.nan
+
+                new_args, new_kwargs = _rebind_call(
+                    func, args, kwargs, key, panel_remove, panel_arg_name
+                )
+                y1 = func(*new_args, **new_kwargs)
+                if not isinstance(y1, np.ndarray) or y1.shape[0] != y0.shape[0]:
+                    raise ContractViolation(
+                        f"{func.__name__}: universe_causal remove-direction probe "
+                        f"at session {d} returned shape "
+                        f"{getattr(y1, 'shape', None)}, baseline was {y0.shape}"
+                    )
+                if not np.array_equal(y1[d], y0[d], equal_nan=True):
+                    raise ContractViolation(
+                        f"{func.__name__}: universe_causal violation (remove "
+                        f"direction): eligibility mask row/session {d} changed when "
+                        f"present symbols were made to disappear strictly after "
+                        f"session {d}{_source_snippet(func)}"
+                    )
+
+            return y0
+
+        return cast(F, wrapper)
+
+    return decorator
+
+
+def execution_causal(
+    *,
+    row_arg: str | int | None = None,
+    row_args: Sequence[str | int] | None = None,
+    n_probes: int = 3,
+    seed: int = 0,
+) -> Callable[[F], F]:
+    """Probe for execution-causality leaks by perturbing fill inputs after row `t`.
+
+    Two calling conventions, both real (two independent test suites used both, and
+    the signature below lets either pass -- see module-level rationale):
+
+    - `row_arg`: a single 2-D ndarray argument (e.g. packed columns
+      `[orders, price, bar_traded_value, tradable]`); the whole future block is
+      redrawn at once, exactly like `@causal(domain="real")`.
+    - `row_args`: a sequence of 1-D ndarray argument names/indices (e.g.
+      `("prices", "bar_traded_value")`) on a function taking several separate
+      arguments; only the named arguments are perturbed (with positive log-normal
+      noise, matching `@causal(domain="positive")`) -- other arguments such as
+      `orders`/`tradable` are decisions already known at `t`, not leakable market
+      data, and are passed through unchanged.
+
+    At FULL strictness only: perturbs a SAMPLE of rows (row 0 always, topped up to
+    `n_probes` distinct rows via a seeded, pinnable draw -- not every row, so FULL
+    strictness stays usable on large books). Specifically exercises the
+    participation cap (`fills.py:101`, `max_participation * bar_traded_value`)
+    because `bar_traded_value` is one of the perturbed inputs.
+
+    Blind spot (documented per spec section D, mirroring
+    `research/expectancy.py:939`): this guard can only prove row `t`'s fill output
+    is unaffected by rows strictly AFTER `t`. It cannot prove row `t`'s OWN
+    `bar_traded_value`/`prices` were honestly computed from data <= `t` before ever
+    reaching the wrapped fill function -- e.g. a caller who centred
+    `bar_traded_value` on a forward-looking window has already contaminated row
+    `t`'s own input, and this guard raises nothing, exactly as `@causal` cannot see
+    a leak already baked into `prior_adv` before it reaches
+    `expectancy_by_liquidity`.
+    """
+
+    def decorator(func: F) -> F:
+        if row_arg is not None and row_args is not None:
+            raise ValueError(
+                "execution_causal: specify exactly one of row_arg or row_args"
+            )
+        # F13: an EMPTY row_args silently disabled the guard entirely, at every
+        # strictness level including FULL. `static_names` came out empty, so the
+        # validation loop never ran, `n_rows` was never assigned, and the
+        # `n_rows is None` early return called straight through to the wrapped
+        # function with ZERO checking -- a deliberately leaky function passed.
+        # Fail at DECORATION time: an empty container is not "nothing to check",
+        # it is a caller error. Same family as F12's `if col_idx:`.
+        if row_args is not None and len(row_args) == 0:
+            raise ValueError(
+                "execution_causal: row_args is empty; that would silently disable "
+                "the guard. Pass the argument names to perturb, or omit row_args "
+                "to use the default single-array convention."
+            )
+        if row_arg is None and row_args is None:
+            effective_row_arg: str | int | None = 0
+            effective_row_args = None
+        else:
+            effective_row_arg = row_arg
+            effective_row_args = row_args
+
+        if effective_row_arg is not None:
+            row_arg_name = _static_arg_name(func, effective_row_arg)
+
+            @functools.wraps(func)
+            def _wrapper_row_arg(*args: Any, **kwargs: Any) -> Any:
+                _level = _strictness
+                if _level is None:
+                    _level = get_strictness()
+                if _level < Strictness.FULL:
+                    return func(*args, **kwargs)
+
+                name, x = _resolve_arg(func, args, kwargs, row_arg_name)
+                if not isinstance(x, np.ndarray) or x.ndim != 2:
+                    raise ContractViolation(
+                        f"{func.__name__}: execution_causal argument {name!r} must "
+                        f"be a 2-D ndarray, got {type(x).__name__}"
+                    )
+
+                y0 = func(*args, **kwargs)
+                if not isinstance(y0, np.ndarray) or y0.shape[0] != x.shape[0]:
+                    raise ContractViolation(
+                        f"{func.__name__}: execution_causal output must be an "
+                        f"ndarray with shape[0] == {x.shape[0]}, got "
+                        f"{type(y0).__name__}"
+                    )
+
+                n_rows = x.shape[0]
+                if n_rows < 2:
+                    return y0
+
+                rng = np.random.default_rng(seed)
+                probe_set: set[int] = {0}
+                remaining = list(range(1, n_rows - 1))
+                budget = min(n_probes, n_rows - 1) - 1
+                if budget > 0 and remaining:
+                    n_draw = min(budget, len(remaining))
+                    drawn = rng.choice(remaining, size=n_draw, replace=False)
+                    probe_set.update(int(d) for d in drawn)
+
+                for t in sorted(probe_set):
+                    x_perturbed = x.copy()
+                    draw = rng.standard_normal(size=x[t + 1 :].shape)
+                    x_perturbed[t + 1 :] = draw.astype(x.dtype)
+
+                    new_args, new_kwargs = _rebind_call(
+                        func, args, kwargs, effective_row_arg, x_perturbed,
+                        row_arg_name,
+                    )
+                    y1 = func(*new_args, **new_kwargs)
+                    if not isinstance(y1, np.ndarray) or y1.shape != y0.shape:
+                        raise ContractViolation(
+                            f"{func.__name__}: execution_causal probe at row {t} "
+                            f"returned shape {getattr(y1, 'shape', None)}, "
+                            f"baseline was {y0.shape}"
+                        )
+                    # See universe_causal for why equal_nan=True, not a magnitude
+                    # threshold, is used here.
+                    if not np.array_equal(y1[t], y0[t], equal_nan=True):
+                        raise ContractViolation(
+                            f"{func.__name__}: execution_causal violation: fill "
+                            f"quantity/price/charges at row {t} changed when data "
+                            f"strictly after row {t} was perturbed"
+                            f"{_source_snippet(func)}"
+                        )
+
+                return y0
+
+            return cast(F, _wrapper_row_arg)
+
+        static_names = [_static_arg_name(func, k) for k in effective_row_args]  # type: ignore[union-attr]
+
+        @functools.wraps(func)
+        def wrapper(*args: Any, **kwargs: Any) -> Any:
+            _level = _strictness
+            if _level is None:
+                _level = get_strictness()
+            if _level < Strictness.FULL:
+                return func(*args, **kwargs)
+
+            resolved: list[np.ndarray] = []
+            n_rows: int | None = None
+            for arg_name in static_names:
+                _, val = _resolve_arg(func, args, kwargs, arg_name)
+                if not isinstance(val, np.ndarray) or val.ndim != 1:
+                    raise ContractViolation(
+                        f"{func.__name__}: execution_causal row_args entry "
+                        f"{arg_name!r} must be a 1-D ndarray, got "
+                        f"{type(val).__name__}"
+                    )
+                if n_rows is None:
+                    n_rows = val.shape[0]
+                elif val.shape[0] != n_rows:
+                    raise ContractViolation(
+                        f"{func.__name__}: execution_causal row_args entries must "
+                        f"share one length, got {n_rows} and {val.shape[0]} for "
+                        f"{arg_name!r}"
+                    )
+                resolved.append(val)
+
+            if n_rows is None or n_rows < 2:
+                return func(*args, **kwargs)
+
+            y0 = func(*args, **kwargs)
+            if not isinstance(y0, np.ndarray) or y0.shape[0] != n_rows:
+                raise ContractViolation(
+                    f"{func.__name__}: execution_causal output must be an ndarray "
+                    f"with shape[0] == {n_rows}, got {type(y0).__name__}"
+                )
+
+            rng = np.random.default_rng(seed)
+            probe_set = {0}
+            remaining = list(range(1, n_rows - 1))
+            budget = min(n_probes, n_rows - 1) - 1
+            if budget > 0 and remaining:
+                n_draw = min(budget, len(remaining))
+                drawn = rng.choice(remaining, size=n_draw, replace=False)
+                probe_set.update(int(d) for d in drawn)
+
+            for t in sorted(probe_set):
+                perturbed: list[np.ndarray] = []
+                for arr in resolved:
+                    arr_copy = arr.copy()
+                    finite_positive = arr[np.isfinite(arr) & (arr > 0)]
+                    scale = (
+                        float(np.median(finite_positive))
+                        if finite_positive.size >= 1
+                        else 1.0
+                    )
+                    if finite_positive.size >= 2:
+                        sigma = float(np.std(np.log(finite_positive / scale)))
+                        if not np.isfinite(sigma) or sigma <= 0:
+                            sigma = 0.01
+                    else:
+                        sigma = 0.01
+                    draw = rng.standard_normal(size=arr[t + 1 :].shape)
+                    arr_copy[t + 1 :] = (scale * np.exp(draw * sigma)).astype(
+                        arr.dtype
+                    )
+                    # Row t+1 specifically gets a forced, deterministic, extreme
+                    # low value on top of the general jitter above: this is the
+                    # exact off-by-one leak the spec calls out (fills.py:101 --
+                    # "bar_traded_value is the one input where reading the wrong
+                    # row is both easy and invisible"). A participation cap only
+                    # binds, and so only becomes visible in the output, when the
+                    # future value is small enough relative to the order size; a
+                    # mild same-order-of-magnitude jitter of the whole future
+                    # block (as used for rows after t+1) can easily miss that
+                    # threshold by luck of the seed for realistic order sizes, so
+                    # row t+1 is forced deterministically rather than left to
+                    # probability.
+                    arr_copy[t + 1] = arr.dtype.type(scale * 1e-6)
+                    perturbed.append(arr_copy)
+
+                new_args, new_kwargs = args, kwargs
+                for arg_name, new_val in zip(static_names, perturbed):
+                    new_args, new_kwargs = _rebind_call(
+                        func, new_args, new_kwargs, arg_name, new_val, arg_name
+                    )
+
+                y1 = func(*new_args, **new_kwargs)
+                if not isinstance(y1, np.ndarray) or y1.shape != y0.shape:
+                    raise ContractViolation(
+                        f"{func.__name__}: execution_causal probe at row {t} "
+                        f"returned shape {getattr(y1, 'shape', None)}, baseline "
+                        f"was {y0.shape}"
+                    )
+                if not np.array_equal(y1[t], y0[t], equal_nan=True):
+                    raise ContractViolation(
+                        f"{func.__name__}: execution_causal violation: fill "
+                        f"quantity/price/charges at row {t} changed when "
+                        f"{', '.join(repr(n) for n in static_names)} strictly "
+                        f"after row {t} were perturbed{_source_snippet(func)}"
+                    )
+
+            return y0
+
+        return cast(F, wrapper)
+
+    return decorator
+
+
 def deterministic(*, n_repeats: int = 2) -> Callable[[F], F]:
     """Check that repeated FULL-strictness calls produce identical results."""
 

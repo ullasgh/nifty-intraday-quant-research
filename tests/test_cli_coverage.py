@@ -1194,10 +1194,22 @@ def test_walkforward_split_setup_failure(monkeypatch, tmp_path) -> None:
         "from_index_bars",
         classmethod(lambda cls, symbol="NIFTY50": _FakeCalendar(ALL_DATES)),
     )
+    # Signature must tolerate the real call: the CLI now passes the four embargo
+    # components (feature_lookback, label_horizon, holding_period,
+    # execution_horizon) as separate kwargs rather than a pre-summed
+    # max_lookback_days (specs/embargo_sizing.md AMENDMENT 2 item 4), so this spy
+    # must accept **kwargs. This test was earlier suspected of being
+    # order-dependent/flaky; it was never flaky, it was signature-fragile — it
+    # only appeared to flake because the CLI's call signature was changing
+    # underneath a flakiness measurement taken mid-refactor. Only the lambda's
+    # signature changes here; the assertion below (RuntimeError from split()
+    # propagates to a non-zero CLI exit code) is unchanged.
     monkeypatch.setattr(
         splits_mod.WalkForwardSplitter,
         "split",
-        lambda self, trading_dates: (_ for _ in ()).throw(RuntimeError("split boom")),
+        lambda self, trading_dates, **kwargs: (_ for _ in ()).throw(
+            RuntimeError("split boom")
+        ),
     )
     result = runner.invoke(
         app,
@@ -1219,6 +1231,40 @@ def test_walkforward_split_setup_failure(monkeypatch, tmp_path) -> None:
     )
     assert result.exit_code != 0
     assert "walkforward split setup failed: split boom" in result.output
+
+
+def test_walkforward_embargo_error_names_dominant_term(monkeypatch, tmp_path) -> None:
+    """The CLI passes the four embargo components to WalkForwardSplitter.split()
+    as separate kwargs (feature_lookback, label_horizon, holding_period,
+    execution_horizon) rather than pre-summing them through max_lookback_days
+    (specs/embargo_sizing.md AMENDMENT 2 item 4). This uses the REAL
+    WalkForwardSplitter (no monkeypatch of `split`) so EmbargoTooShortError's
+    dominant-term diagnostic -- which names which component forced the embargo --
+    is exercised end to end and must survive to the CLI's error output. Against
+    the pre-change CLI (which pre-summed into max_lookback_days), the raised
+    error names 'max_lookback_days' instead of the true dominant component and
+    this assertion fails.
+    """
+    import nifty_quant.calendar as calendar_mod
+
+    monkeypatch.setattr(
+        calendar_mod.TradingCalendar,
+        "from_index_bars",
+        classmethod(lambda cls, symbol="NIFTY50": _FakeCalendar(ALL_DATES)),
+    )
+    args = _walkforward_args() + [
+        "--feature-lookback",
+        "0",
+        "--label-horizon",
+        "100",
+        "--holding-period",
+        "0",
+        "--execution-horizon",
+        "0",
+    ]
+    result = runner.invoke(app, args)
+    assert result.exit_code != 0
+    assert "dominant term: label_horizon" in result.output
 
 
 def test_walkforward_no_splits_fit(monkeypatch, tmp_path) -> None:

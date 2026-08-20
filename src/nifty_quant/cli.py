@@ -1,12 +1,17 @@
 from __future__ import annotations
 
+import logging
 from datetime import date
 from pathlib import Path
-from typing import TYPE_CHECKING, NoReturn
+from typing import TYPE_CHECKING, Any, NoReturn
 
 import typer
 
 from nifty_quant import __version__
+
+# specs/run_provenance.md item 6 (amendment item 5): a registry write failure must be
+# logged at WARNING, never swallowed silently.
+_logger = logging.getLogger(__name__)
 
 if TYPE_CHECKING:  # pragma: no cover - False at runtime by language definition
     # `typing.TYPE_CHECKING` is a hard-coded `False` in every CPython execution; only static
@@ -16,6 +21,7 @@ if TYPE_CHECKING:  # pragma: no cover - False at runtime by language definition
     import numpy as np
 
     from nifty_quant.data.panel import Panel
+    from nifty_quant.universe.static import Universe
 
 app = typer.Typer()
 
@@ -116,6 +122,50 @@ def _tradable_mask_summary(panel: "Panel", mask: "np.ndarray") -> str:
         f"{100.0 * present_but_excluded / present_count if present_count else 0.0:.2f}% "
         f"excluded by liquidity/circuit-lock/staleness gating]"
     )
+
+
+def _apply_pit_eligibility(
+    panel: "Panel",
+    universe: "Universe",
+    tradable_full: "np.ndarray | None",
+    *,
+    min_history_sessions: int | None,
+    min_adv_inr: float,
+) -> "np.ndarray | None":
+    """Combine point-in-time eligibility into a bar-level tradable mask.
+
+    Returns `tradable_full` unchanged when `min_history_sessions is None`
+    (the gate is opt-in only: CLAUDE.md rule 8 forbids a hand-chosen default
+    for this threshold). Otherwise computes eligibility via
+    `nifty_quant.universe.pit.compute_eligibility`, broadcasts it to bar
+    level, and ANDs it into `tradable_full` -- EXCLUDING an ineligible name
+    from that session's cross-section entirely (via the same `tradable`
+    array strategies already use at decision time to build their
+    cross-section), never merely zero-weighting it after the fact. Shared by
+    `backtest` and `walkforward` so the two CLI paths cannot silently drift
+    into two different eligibility behaviours.
+    """
+    if min_history_sessions is None:
+        return tradable_full
+
+    from nifty_quant.universe.pit import compute_eligibility, eligibility_mask_to_bars
+
+    eligibility = compute_eligibility(
+        panel,
+        universe,
+        min_history_sessions=min_history_sessions,
+        min_adv_inr=min_adv_inr,
+    )
+    eligible_bars = eligibility_mask_to_bars(panel, eligibility)
+    typer.echo(
+        f"point-in-time eligibility: min_history_sessions={min_history_sessions}, "
+        f"min_adv_inr={min_adv_inr:.2e} -- "
+        f"{int(eligibility.mask[-1, :].sum())}/{eligibility.mask.shape[1]} names "
+        f"eligible on the final session."
+    )
+    if tradable_full is None:
+        return eligible_bars
+    return tradable_full & eligible_bars
 
 
 @app.command()
@@ -292,6 +342,17 @@ def backtest(
             "component of the tradable filter."
         ),
     ),
+    min_history_sessions: int | None = typer.Option(
+        None,
+        "--min-history-sessions",
+        help=(
+            "Point-in-time eligibility gate (nifty_quant.universe.pit.compute_eligibility): "
+            "a name must have this many PRIOR sessions with a present bar, plus clear "
+            "--min-adv-inr on trailing 20-session ADV, to enter this session's cross-section. "
+            "Disabled (no gate) unless explicitly set -- CLAUDE.md rule 8 forbids a "
+            "hand-chosen default for this threshold, so it must be a deliberate choice per run."
+        ),
+    ),
 ) -> None:
     """Run a single full-sample backtest."""
     start_d = _parse_date(start, "--start")
@@ -338,6 +399,15 @@ def backtest(
         from nifty_quant.data.panel import PanelSpec, load_panel
         from nifty_quant.data.validate import tradable_mask
         from nifty_quant.execution.costs import NSEIntradayEquityCosts, breakeven_cost_bps
+        from nifty_quant.execution.fills import FillModel, SqrtImpactSlippage
+        from nifty_quant.research.provenance import (
+            FEATURE_VERSION,
+            canonical_model_id,
+            compute_panel_hash,
+            compute_universe_hash,
+            embargo_components_json,
+            get_git_sha,
+        )
         from nifty_quant.research.registry import TrialRecord, TrialRegistry
         from nifty_quant.strategy.registry import config_hash as strategy_config_hash
         from nifty_quant.universe.static import load_universe, survivorship_report
@@ -362,7 +432,21 @@ def backtest(
         else:
             tradable_full = None
 
+        tradable_full = _apply_pit_eligibility(
+            panel,
+            universe,
+            tradable_full,
+            min_history_sessions=min_history_sessions,
+            min_adv_inr=min_adv_inr,
+        )
+
         cost_model = NSEIntradayEquityCosts()
+        # Explicit, not left to BacktestConfig's default_factory, so cost_model_id /
+        # slippage_model_id / fill_model_id (specs/run_provenance.md) can be derived
+        # from the actual objects used -- same values BacktestConfig would default to,
+        # so this changes no backtest numbers.
+        slippage_model = SqrtImpactSlippage()
+        fill_model = FillModel(slippage=slippage_model)
         t0 = time.monotonic()
 
         result = run_backtest(
@@ -373,6 +457,7 @@ def backtest(
                 square_off_time="15:20",
                 decision_latency_bars=0,
                 cost_model=cost_model,
+                fill_model=fill_model,
             ),
             tradable=tradable_full,
         )
@@ -441,6 +526,7 @@ def backtest(
                         square_off_time="15:20",
                         decision_latency_bars=latency_bars,
                         cost_model=cost_model,
+                        fill_model=fill_model,
                     ),
                     tradable=tradable_full,
                 )
@@ -488,7 +574,78 @@ def backtest(
             yaml.safe_dump(run_cfg.model_dump(mode="json")), encoding="utf-8"
         )
 
-        metrics: dict[str, float] = {}
+        # ---- specs/run_provenance.md: provenance fields, computed before metrics.json
+        # is written so registry_write_failed/provenance can be embedded in it. ----
+        manifest_fingerprint = None
+        manifest_adjustments = ""
+        try:
+            _manifest = Manifest.load()
+            manifest_fingerprint = _manifest.fingerprint
+            manifest_adjustments = _manifest.adjustments
+        except Exception:
+            manifest_fingerprint = None
+            manifest_adjustments = ""
+
+        git_sha = get_git_sha()
+        panel_hash = compute_panel_hash(panel, adjustments=manifest_adjustments)
+        universe_hash = compute_universe_hash(
+            name=universe_name, symbols=universe.symbols, n_sessions=panel.n_days()
+        )
+        cost_model_id = canonical_model_id(cost_model)
+        slippage_model_id = canonical_model_id(slippage_model)
+        fill_model_id = canonical_model_id(fill_model)
+        # `backtest` has no walk-forward split, so there is no embargo to size --
+        # all four terms are 0.0 (not a hand-chosen threshold: it is the only value
+        # describing "no embargo applies to a full-sample run").
+        embargo_components = embargo_components_json(
+            feature_lookback=0.0, label_horizon=0.0, holding_period=0.0, execution_horizon=0.0
+        )
+
+        record = TrialRecord(
+            config_hash=chash,
+            ts=datetime.now(timezone.utc).isoformat(timespec="seconds"),
+            strategy=strategy,
+            params_json=json.dumps(cfg.get("params", {})),
+            split_id="full",
+            purpose="exploration",
+            sharpe_gross=gross.sharpe,
+            sharpe_net=net.sharpe,
+            n_trades=result.n_trades,
+            turnover=mean_turnover,
+            breakeven_bps=breakeven,
+            git_sha=git_sha,
+            data_fingerprint=manifest_fingerprint,
+            code_version=__version__,
+            wall_s=time.monotonic() - t0,
+            result_path=str(trial_dir),
+            ruined=bool(result.ruined),
+            ruin_index=int(result.ruin_index),
+            error=None,
+            seed=None,
+            universe_name=universe_name,
+            universe_hash=universe_hash,
+            panel_hash=panel_hash,
+            start=start_d.isoformat(),
+            end=end_d.isoformat(),
+            cost_model_id=cost_model_id,
+            slippage_model_id=slippage_model_id,
+            fill_model_id=fill_model_id,
+            embargo_components=embargo_components,
+            parent_trial_id=None,
+            feature_version=FEATURE_VERSION,
+        )
+
+        trial_registry = TrialRegistry(settings.RESULTS_ROOT / "trials.db")
+        registry_write_failed = False
+        try:
+            trial_registry.record(record)
+        except Exception as registry_exc:
+            registry_write_failed = True
+            _logger.warning(
+                "registry write failed for trial %s: %s", chash, registry_exc
+            )
+
+        metrics: dict[str, Any] = {}
         for key, value in gross.to_dict().items():
             metrics[f"gross_{key}"] = value
         for key, value in net.to_dict().items():
@@ -508,6 +665,25 @@ def backtest(
                 "min_cash_seen": float(result.min_cash_seen),
                 "n_rows_negative_cash": result.n_rows_negative_cash,
                 "n_stale_marks": result.n_stale_marks,
+                "registry_write_failed": registry_write_failed,
+                "provenance": {
+                    "config_hash": chash,
+                    "git_sha": git_sha,
+                    "code_version": __version__,
+                    "data_fingerprint": manifest_fingerprint,
+                    "panel_hash": panel_hash,
+                    "universe_name": universe_name,
+                    "universe_hash": universe_hash,
+                    "seed": None,
+                    "start": start_d.isoformat(),
+                    "end": end_d.isoformat(),
+                    "cost_model_id": cost_model_id,
+                    "slippage_model_id": slippage_model_id,
+                    "fill_model_id": fill_model_id,
+                    "embargo_components": embargo_components,
+                    "parent_trial_id": None,
+                    "feature_version": FEATURE_VERSION,
+                },
             }
         )
         (trial_dir / "metrics.json").write_text(
@@ -516,43 +692,13 @@ def backtest(
 
         result.trades.to_parquet(trial_dir / "result.parquet")
         _write_returns_parquet(trial_dir / "returns.parquet", result.daily.dates, daily_net)
-
-        manifest_fingerprint = None
-        try:
-            manifest_fingerprint = Manifest.load().fingerprint
-        except Exception:
-            manifest_fingerprint = None
-
-        trial_registry = TrialRegistry(settings.RESULTS_ROOT / "trials.db")
-        trial_registry.record(
-            TrialRecord(
-                config_hash=chash,
-                ts=datetime.now(timezone.utc).isoformat(timespec="seconds"),
-                strategy=strategy,
-                params_json=json.dumps(cfg.get("params", {})),
-                split_id="full",
-                purpose="exploration",
-                sharpe_gross=gross.sharpe,
-                sharpe_net=net.sharpe,
-                n_trades=result.n_trades,
-                turnover=mean_turnover,
-                breakeven_bps=breakeven,
-                git_sha=None,
-                data_fingerprint=manifest_fingerprint,
-                code_version=__version__,
-                wall_s=time.monotonic() - t0,
-                result_path=str(trial_dir),
-                ruined=bool(result.ruined),
-                ruin_index=int(result.ruin_index),
-                error=None,
-            )
-        )
     except Exception as exc:
         try:
             import json
             from datetime import datetime, timezone
 
             from nifty_quant import settings
+            from nifty_quant.research.provenance import get_git_sha
             from nifty_quant.research.registry import TrialRecord, TrialRegistry
             from nifty_quant.strategy.registry import config_hash as strategy_config_hash
 
@@ -571,7 +717,7 @@ def backtest(
                     n_trades=None,
                     turnover=None,
                     breakeven_bps=None,
-                    git_sha=None,
+                    git_sha=get_git_sha(),
                     data_fingerprint=None,
                     code_version=__version__,
                     wall_s=None,
@@ -610,6 +756,46 @@ def walkforward(
             "Minimum 20-session average daily traded value (INR) for the liquidity "
             "component of the tradable filter."
         ),
+    ),
+    min_history_sessions: int | None = typer.Option(
+        None,
+        "--min-history-sessions",
+        help=(
+            "Point-in-time eligibility gate (nifty_quant.universe.pit.compute_eligibility): "
+            "a name must have this many PRIOR sessions with a present bar, plus clear "
+            "--min-adv-inr on trailing 20-session ADV, to enter this session's cross-section. "
+            "Disabled (no gate) unless explicitly set -- CLAUDE.md rule 8 forbids a "
+            "hand-chosen default for this threshold, so it must be a deliberate choice per run."
+        ),
+    ),
+    feature_lookback: float | None = typer.Option(
+        None,
+        "--feature-lookback",
+        help=(
+            "Longest feature window (in sessions) any signal in this run reads, used "
+            "to size the walk-forward embargo (research.embargo.EmbargoComponents). "
+            "Defaults to a conservative estimate derived from the strategy's own "
+            "declared DataRequest.warmup_bars() when not given explicitly."
+        ),
+    ),
+    label_horizon: float = typer.Option(
+        0.0,
+        "--label-horizon",
+        help="Forward-return label horizon (in sessions); one term of the embargo.",
+    ),
+    holding_period: float = typer.Option(
+        0.0,
+        "--holding-period",
+        help=(
+            "Expected position lifetime (in sessions); one term of the embargo. For "
+            "an EMA-smoothed book, pass "
+            "nifty_quant.research.embargo.effective_memory_sessions(a)."
+        ),
+    ),
+    execution_horizon: float = typer.Option(
+        0.0,
+        "--execution-horizon",
+        help="Decision-to-fill lag (in sessions); one term of the embargo.",
     ),
 ) -> None:
     """Run an out-of-sample walk-forward evaluation."""
@@ -654,10 +840,47 @@ def walkforward(
     if start_d > end_d:
         _fail(f"--start {start_d} is after --end {end_d}")
 
+    # Resolve feature_lookback so EmbargoTooShortError is reachable, rather than the
+    # unarmed default of 0.0. feature_lookback falls back to a conservative estimate
+    # derived from the strategy's own DataRequest.warmup_bars() when the caller does
+    # not pass --feature-lookback explicitly. The four components (feature_lookback,
+    # label_horizon, holding_period, execution_horizon) are passed to splitter.split()
+    # separately below rather than pre-summed here.
+    import math
+
+    from nifty_quant.settings import REGULAR_SESSION_BARS
+
+    resolved_feature_lookback: float
+    if feature_lookback is None:
+        try:
+            resolved_feature_lookback = float(
+                math.ceil(
+                    registry.build(cfg).data_request().warmup_bars()
+                    / REGULAR_SESSION_BARS
+                )
+            )
+        except Exception:
+            resolved_feature_lookback = 0.0
+    else:
+        resolved_feature_lookback = feature_lookback
+
+    # Pass the four embargo components separately rather than pre-summing them
+    # (see specs/embargo_sizing.md AMENDMENT 2 item 4): WalkForwardSplitter.split()
+    # takes four components rather than one total so EmbargoTooShortError can name
+    # WHICH term forced the embargo. Pre-summing through max_lookback_days destroys
+    # that diagnostic at exactly the boundary a user sees it. max_lookback_days
+    # remains supported on the splitter for backward compatibility but is no longer
+    # the path the CLI uses.
     try:
         trading_dates = calendar.session_dates(start_d, end_d)
         splitter = WalkForwardSplitter(train_years=train_years, test_years=test_years)
-        splits = splitter.split(trading_dates)
+        splits = splitter.split(
+            trading_dates,
+            feature_lookback=resolved_feature_lookback,
+            label_horizon=label_horizon,
+            holding_period=holding_period,
+            execution_horizon=execution_horizon,
+        )
     except Exception as exc:
         _fail(f"walkforward split setup failed: {exc}")
 
@@ -671,7 +894,7 @@ def walkforward(
         import numpy as np
 
         from nifty_quant import settings
-        from nifty_quant.backtest.engine import BacktestConfig, run_backtest
+        from nifty_quant.backtest.engine import BacktestConfig, BacktestResult, run_backtest
         from nifty_quant.backtest.metrics import (
             compute_metrics,
             deflated_sharpe,
@@ -683,6 +906,7 @@ def walkforward(
         from nifty_quant.data.panel import PanelSpec, load_panel
         from nifty_quant.data.validate import tradable_mask
         from nifty_quant.execution.costs import NSEIntradayEquityCosts, breakeven_cost_bps
+        from nifty_quant.research.provenance import get_git_sha
         from nifty_quant.research.registry import TrialRecord, TrialRegistry
         from nifty_quant.research.splits import HoldoutLock
         from nifty_quant.strategy.registry import config_hash as strategy_config_hash
@@ -690,6 +914,7 @@ def walkforward(
 
         strat = registry.build(cfg)
         wf_chash = strategy_config_hash(cfg)
+        _wf_git_sha = get_git_sha()
         universe = load_universe(universe_name)
         typer.echo(survivorship_report(universe, start_d, end_d).warning_line())
 
@@ -708,6 +933,14 @@ def walkforward(
             typer.echo(_tradable_mask_summary(panel, full_tradable_mask))
         else:
             full_tradable_mask = None
+
+        full_tradable_mask = _apply_pit_eligibility(
+            panel,
+            universe,
+            full_tradable_mask,
+            min_history_sessions=min_history_sessions,
+            min_adv_inr=min_adv_inr,
+        )
 
         cost_model = NSEIntradayEquityCosts()
 
@@ -778,7 +1011,7 @@ def walkforward(
                     n_trades=res.n_trades,
                     turnover=mean_turnover,
                     breakeven_bps=split_breakeven,
-                    git_sha=None,
+                    git_sha=_wf_git_sha,
                     data_fingerprint=manifest_fingerprint,
                     code_version=__version__,
                     wall_s=None,
@@ -837,7 +1070,7 @@ def walkforward(
 
         # Latency sensitivity is evaluated once over the whole evaluation window,
         # rather than re-sweeping every split, to bound runtime.
-        latency_results: dict[int, object] = {}
+        latency_results: dict[int, BacktestResult] = {}
         for latency_bars in (0, 1, 2):
             latency_results[latency_bars] = run_backtest(
                 strat,
@@ -940,7 +1173,7 @@ def walkforward(
                 n_trades=None,
                 turnover=pooled_mean_turnover if pooled_turnover.size else None,
                 breakeven_bps=pooled_final_breakeven,
-                git_sha=None,
+                git_sha=_wf_git_sha,
                 data_fingerprint=manifest_fingerprint,
                 code_version=__version__,
                 wall_s=None,
@@ -956,6 +1189,7 @@ def walkforward(
             from datetime import datetime, timezone
 
             from nifty_quant import settings
+            from nifty_quant.research.provenance import get_git_sha
             from nifty_quant.research.registry import TrialRecord, TrialRegistry
             from nifty_quant.strategy.registry import config_hash as strategy_config_hash
 
@@ -973,7 +1207,7 @@ def walkforward(
                     n_trades=None,
                     turnover=None,
                     breakeven_bps=None,
-                    git_sha=None,
+                    git_sha=get_git_sha(),
                     data_fingerprint=None,
                     code_version=__version__,
                     wall_s=None,
@@ -1038,6 +1272,7 @@ def sweep(
         from datetime import datetime, timezone
 
         import numpy as np
+        import yaml as yaml_mod
 
         from nifty_quant import settings
         from nifty_quant.backtest.engine import BacktestConfig, run_backtest
@@ -1048,6 +1283,15 @@ def sweep(
         from nifty_quant.data.manifest import Manifest
         from nifty_quant.data.panel import PanelSpec, load_panel
         from nifty_quant.execution.costs import NSEIntradayEquityCosts, breakeven_cost_bps
+        from nifty_quant.execution.fills import FillModel, SqrtImpactSlippage
+        from nifty_quant.research.provenance import (
+            FEATURE_VERSION,
+            canonical_model_id,
+            compute_panel_hash,
+            compute_universe_hash,
+            embargo_components_json,
+            get_git_sha,
+        )
         from nifty_quant.research.registry import TrialRecord, TrialRegistry
         from nifty_quant.strategy.registry import config_hash as strategy_config_hash
         from nifty_quant.universe.static import load_universe, survivorship_report
@@ -1064,12 +1308,51 @@ def sweep(
         )
         panel = load_panel(spec)
         cost_model = NSEIntradayEquityCosts()
+        slippage_model = SqrtImpactSlippage()
+        fill_model = FillModel(slippage=slippage_model)
 
         manifest_fingerprint = None
+        manifest_adjustments = ""
         try:
-            manifest_fingerprint = Manifest.load().fingerprint
+            _manifest = Manifest.load()
+            manifest_fingerprint = _manifest.fingerprint
+            manifest_adjustments = _manifest.adjustments
         except Exception:
             manifest_fingerprint = None
+            manifest_adjustments = ""
+
+        # specs/run_provenance.md AMENDMENT 1 item 8: a sweep-derived trial's
+        # parent_trial_id is the hash `base_params` alone would produce -- computed
+        # from the raw YAML rather than `load_sweep_yaml`'s return (which only hands
+        # back the already-EXPANDED param dicts, discarding `base_params` itself).
+        # KNOWN GAP, reported rather than silently fixed: no row for this hash is
+        # ever written to the registry (item9's own test pins `len(sweep_trials) == 2`
+        # for a 2-value sweep, i.e. no extra base row), so a sweep-derived trial's
+        # parent_trial_id can be a structurally dangling reference -- correct by value,
+        # unwalkable in practice. See the task's own note on this; fixing it would
+        # mean either writing an un-requested extra trial or changing what "sweep
+        # trial count" means, neither of which this subtask's contract permits.
+        _sweep_raw_cfg = yaml_mod.safe_load(config.read_text(encoding="utf-8"))
+        base_params = (
+            _sweep_raw_cfg.get("base_params", {}) if isinstance(_sweep_raw_cfg, dict) else {}
+        )
+        base_trial_id = strategy_config_hash(
+            {"strategy": strategy_name, "params": base_params}
+        )
+
+        sweep_git_sha = get_git_sha()
+        sweep_panel_hash = compute_panel_hash(panel, adjustments=manifest_adjustments)
+        sweep_universe_hash = compute_universe_hash(
+            name=universe_name, symbols=universe.symbols, n_sessions=panel.n_days()
+        )
+        sweep_cost_model_id = canonical_model_id(cost_model)
+        sweep_slippage_model_id = canonical_model_id(slippage_model)
+        sweep_fill_model_id = canonical_model_id(fill_model)
+        # No walk-forward split in a sweep either -- see the identical rationale on
+        # the `backtest` command above.
+        sweep_embargo_components = embargo_components_json(
+            feature_lookback=0.0, label_horizon=0.0, holding_period=0.0, execution_horizon=0.0
+        )
 
         registry_db = TrialRegistry(settings.RESULTS_ROOT / "trials.db")
         n_ok = 0
@@ -1083,7 +1366,7 @@ def sweep(
                 res = run_backtest(
                     strat,
                     panel,
-                    BacktestConfig(capital=1e7, cost_model=cost_model),
+                    BacktestConfig(capital=1e7, cost_model=cost_model, fill_model=fill_model),
                 )
                 sweep_daily_net = res.daily.returns
                 trial_dir = settings.RESULTS_ROOT / "trials" / chash
@@ -1124,7 +1407,7 @@ def sweep(
                         n_trades=res.n_trades,
                         turnover=mean_turnover,
                         breakeven_bps=breakeven,
-                        git_sha=None,
+                        git_sha=sweep_git_sha,
                         data_fingerprint=manifest_fingerprint,
                         code_version=__version__,
                         wall_s=None,
@@ -1132,6 +1415,18 @@ def sweep(
                         ruined=bool(res.ruined),
                         ruin_index=int(res.ruin_index),
                         error=None,
+                        seed=None,
+                        universe_name=universe_name,
+                        universe_hash=sweep_universe_hash,
+                        panel_hash=sweep_panel_hash,
+                        start=start_d.isoformat(),
+                        end=end_d.isoformat(),
+                        cost_model_id=sweep_cost_model_id,
+                        slippage_model_id=sweep_slippage_model_id,
+                        fill_model_id=sweep_fill_model_id,
+                        embargo_components=sweep_embargo_components,
+                        parent_trial_id=base_trial_id,
+                        feature_version=FEATURE_VERSION,
                     )
                 )
                 n_ok += 1
@@ -1150,7 +1445,7 @@ def sweep(
                             n_trades=None,
                             turnover=None,
                             breakeven_bps=None,
-                            git_sha=None,
+                            git_sha=sweep_git_sha,
                             data_fingerprint=None,
                             code_version=__version__,
                             wall_s=None,
@@ -1158,6 +1453,7 @@ def sweep(
                             ruined=None,
                             ruin_index=None,
                             error=str(exc),
+                            parent_trial_id=base_trial_id,
                         )
                     )
                 except Exception:

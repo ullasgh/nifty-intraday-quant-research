@@ -15,7 +15,9 @@ import datetime as dt
 import numpy as np
 import pandas as pd
 import pytest
+from typer.testing import CliRunner
 
+from nifty_quant.cli import app
 from nifty_quant.data.panel import Panel
 
 # NOTE (lead, at review): this file originally carried a fallback that loaded a
@@ -519,9 +521,19 @@ def test_explain_format() -> None:
 
 
 def test_cli_smoke() -> None:
-    """Test 12: nq tilt CLI with valid flags exits 0 and prints table.
-
-    This is a placeholder; the actual CLI test will run once the command exists.
-    """
-    # This test requires the CLI to be implemented; for now, skip or stub it
-    pytest.skip("CLI implementation pending")
+    """Test 12: nq tilt CLI with valid flags exits 0 and prints table."""
+    runner = CliRunner()
+    result = runner.invoke(
+        app,
+        [
+            "tilt",
+            "--start",
+            "2024-01-01",
+            "--end",
+            "2024-01-31",
+        ],
+    )
+    assert result.exit_code == 0
+    assert "Universe:" in result.output
+    # The output should contain the results table (as HTML or text)
+    assert len(result.output) > 0

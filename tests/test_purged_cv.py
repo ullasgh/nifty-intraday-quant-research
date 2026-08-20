@@ -41,7 +41,9 @@ def test_no_train_label_window_overlaps_test_block() -> None:
 
 def test_label_horizon_zero_reduces_to_contiguous_kfold() -> None:
     n_rows = 500
-    kf = PurgedKFold(n_splits=5, label_horizon=0, embargo_frac=0.0)
+    # embargo_frac=0.0 always produced width=0 regardless of n_rows; the absolute
+    # equivalent is simply embargo_sessions=0.
+    kf = PurgedKFold(n_splits=5, label_horizon=0, embargo_sessions=0)
     folds = kf.split(n_rows)
     for fold in folds:
         complement = np.setdiff1d(np.arange(n_rows), fold.test_idx, assume_unique=True)
@@ -51,8 +53,10 @@ def test_label_horizon_zero_reduces_to_contiguous_kfold() -> None:
 
 
 def test_larger_label_horizon_purges_strictly_more() -> None:
-    kf5 = PurgedKFold(n_splits=5, label_horizon=5, embargo_frac=0.0)
-    kf20 = PurgedKFold(n_splits=5, label_horizon=20, embargo_frac=0.0)
+    # embargo_frac=0.0 always produced width=0 regardless of n_rows; the absolute
+    # equivalent is simply embargo_sessions=0.
+    kf5 = PurgedKFold(n_splits=5, label_horizon=5, embargo_sessions=0)
+    kf20 = PurgedKFold(n_splits=5, label_horizon=20, embargo_sessions=0)
     total5 = sum(fold.n_purged for fold in kf5.split(500))
     total20 = sum(fold.n_purged for fold in kf20.split(500))
     assert total20 > total5
@@ -60,8 +64,14 @@ def test_larger_label_horizon_purges_strictly_more() -> None:
 
 def test_embargo_applies_after_test_block_not_before() -> None:
     n_rows = 500
-    width = math.ceil(0.02 * n_rows)
-    folds = PurgedKFold(n_splits=5, label_horizon=0, embargo_frac=0.02).split(n_rows)
+    # embargo_frac=0.02 on n_rows=500 produced width = ceil(0.02 * 500) = 10 rows.
+    # split() below is called without day_offsets, so embargo_sessions maps 1:1
+    # onto rows (per cv._embargo_width_rows).
+    embargo_sessions = 10
+    width = embargo_sessions
+    folds = PurgedKFold(
+        n_splits=5, label_horizon=0, embargo_sessions=embargo_sessions
+    ).split(n_rows)
     fold = next(
         f for f in folds if f.test_idx[0] > 0 and f.test_idx[-1] + 1 + width <= n_rows
     )
@@ -73,8 +83,10 @@ def test_embargo_applies_after_test_block_not_before() -> None:
         assert i not in fold.train_idx
 
 
-def test_embargo_frac_zero_purges_nothing_extra() -> None:
-    folds = PurgedKFold(n_splits=5, label_horizon=0, embargo_frac=0.0).split(500)
+def test_embargo_sessions_zero_purges_nothing_extra() -> None:
+    # embargo_frac=0.0 always produced width=0 regardless of n_rows; the absolute
+    # equivalent is simply embargo_sessions=0.
+    folds = PurgedKFold(n_splits=5, label_horizon=0, embargo_sessions=0).split(500)
     for fold in folds:
         assert fold.n_embargoed == 0
         assert fold.n_purged == 0
@@ -84,13 +96,16 @@ def test_n_purged_and_n_embargoed_are_reported_accurately() -> None:
     n_rows = 500
     n_splits = 5
     label_horizon = 5
-    embargo_frac = 0.02
-    width = math.ceil(embargo_frac * n_rows)
+    # embargo_frac=0.02 on n_rows=500 produced width = ceil(0.02 * 500) = 10 rows.
+    # split() below is called without day_offsets, so embargo_sessions maps 1:1
+    # onto rows (per cv._embargo_width_rows).
+    embargo_sessions = 10
+    width = embargo_sessions
 
     folds = PurgedKFold(
         n_splits=n_splits,
         label_horizon=label_horizon,
-        embargo_frac=embargo_frac,
+        embargo_sessions=embargo_sessions,
     ).split(n_rows)
 
     fold = next(
@@ -151,7 +166,10 @@ def test_irregular_sessions_do_not_break_snapping() -> None:
 
 
 def test_never_shuffles() -> None:
-    kf = PurgedKFold(n_splits=5, label_horizon=10, embargo_frac=0.02)
+    # embargo_frac=0.02 on n_rows=500 (the split() calls below) produced width =
+    # ceil(0.02 * 500) = 10 rows; split() is called without day_offsets, so
+    # embargo_sessions maps 1:1 onto rows (per cv._embargo_width_rows).
+    kf = PurgedKFold(n_splits=5, label_horizon=10, embargo_sessions=10)
     folds1 = kf.split(500)
     folds2 = kf.split(500)
 
@@ -177,11 +195,14 @@ def test_rejects_negative_label_horizon() -> None:
         PurgedKFold(label_horizon=-1)
 
 
-def test_rejects_embargo_frac_out_of_range() -> None:
+def test_rejects_negative_embargo_sessions() -> None:
+    # embargo_frac validated both bounds (0 <= frac < 1). embargo_sessions is an
+    # absolute session count with no natural upper bound (unlike a row fraction,
+    # nothing caps how many sessions may be embargoed), so __post_init__
+    # (src/nifty_quant/research/cv.py:79-80) validates only the lower bound.
+    # No equivalent upper-bound check exists to migrate; reported, not invented.
     with pytest.raises(ValueError):
-        PurgedKFold(embargo_frac=-0.1)
-    with pytest.raises(ValueError):
-        PurgedKFold(embargo_frac=1.0)
+        PurgedKFold(embargo_sessions=-1)
 
 
 def test_rejects_n_rows_too_small_for_n_splits() -> None:
@@ -234,11 +255,14 @@ def test_combinations_are_lexicographic_and_deterministic() -> None:
 
 
 def test_cpcv_folds_also_purged_and_embargoed() -> None:
+    # embargo_frac=0.01 on n_rows=600 (the split() call below) produced width =
+    # ceil(0.01 * 600) = 6 rows; split() is called without day_offsets, so
+    # embargo_sessions maps 1:1 onto rows (per cv._embargo_width_rows).
     cv = CombinatorialPurgedCV(
         n_groups=6,
         n_test_groups=2,
         label_horizon=10,
-        embargo_frac=0.01,
+        embargo_sessions=6,
     )
     folds = cv.split(600)
 
@@ -329,7 +353,10 @@ def test_pbo_is_high_for_overfit_trials_and_low_for_genuine() -> None:
 
 
 def test_explain_reports_purge_and_embargo_counts() -> None:
-    folds = PurgedKFold(n_splits=5, label_horizon=5, embargo_frac=0.02).split(500)
+    # embargo_frac=0.02 on n_rows=500 produced width = ceil(0.02 * 500) = 10 rows;
+    # split() is called without day_offsets, so embargo_sessions maps 1:1 onto
+    # rows (per cv._embargo_width_rows).
+    folds = PurgedKFold(n_splits=5, label_horizon=5, embargo_sessions=10).split(500)
     fold = next(f for f in folds if f.n_purged > 0 and f.n_embargoed > 0)
 
     explanation = fold.explain()
@@ -339,7 +366,10 @@ def test_explain_reports_purge_and_embargo_counts() -> None:
 
 
 def test_identical_inputs_give_identical_folds() -> None:
-    kf = PurgedKFold(n_splits=5, label_horizon=10, embargo_frac=0.02)
+    # embargo_frac=0.02 on n_rows=500 (the split() calls below) produced width =
+    # ceil(0.02 * 500) = 10 rows; split() is called without day_offsets, so
+    # embargo_sessions maps 1:1 onto rows (per cv._embargo_width_rows).
+    kf = PurgedKFold(n_splits=5, label_horizon=10, embargo_sessions=10)
     folds1 = kf.split(500)
     folds2 = kf.split(500)
 

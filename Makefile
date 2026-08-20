@@ -41,7 +41,13 @@ lint:
 # coverage_floor.json `_baseline_correction`: a floor transcribed rather than measured.
 #
 # Raising this number for any other reason is the same failure as lowering a coverage floor.
-MYPY_MAX := 172
+#
+# RATCHETED DOWN 172 -> 161 on 2026-08-20. Phase B pushed the count to 179; rather than raise the
+# ceiling, the seven new errors were FIXED (a duplicate `wrapper` closure name in guards.py, a
+# module-typed variable assigned None in splits.py, two stale `type: ignore` comments, a
+# BacktestResult that lost its type into a dict[int, object] in cli.py, and two int/float
+# mismatches). That work also cleared 11 pre-existing errors, hence 161 rather than 172.
+MYPY_MAX := 161
 
 types:
 	@n=$$($(PY) -m mypy src 2>&1 | grep -cE '^src/.*: error:' || true); \

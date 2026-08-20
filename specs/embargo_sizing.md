@@ -148,3 +148,98 @@ whose median landed on exactly 375; per-row turnover `[0.0, 0.6]` where sum equa
 now this. **Whenever a test asserts "X must differ from Y", compute Y and check the fixture does
 not sit on it.** The author catching this in its own draft, unprompted, is the behaviour to
 reinforce.
+
+---
+
+# AMENDMENT 2 — 2026-08-20. Adjudicating THREE direct contradictions between the two suites.
+
+The implementer found genuine, mutually-exclusive contradictions and correctly refused to resolve
+them by editing tests. **This is the dual-suite rule producing exactly what it exists to produce:
+disagreements a single author would have resolved silently and wrongly.** Each is decided here.
+
+## 1. `embargo_frac` — DELETED. Amendment 1 stands; suite B is wrong.
+
+Suite A requires `PurgedKFold(embargo_frac=0.01)` to raise `TypeError`. Suite B keeps the kwarg
+"for signature compatibility" and expects no error. Both cannot hold for the same call.
+
+**Amendment 1 item 2 already decided this: DELETED, not silently ignored.** A field accepted by a
+constructor and read by nothing is the same lie this program removed from `volume_breakout` and
+`vwap_reversion`. Suite B's tests 5, 6 and 7 are updated to the deletion contract.
+
+Consequence, foreseeable and accepted: **`tests/test_purged_cv.py` loses 10 tests to
+`TypeError: unexpected keyword argument 'embargo_frac'`.** That is a spec-mandated contract change,
+not an accident, and those tests get the same lead-authored adjudication treatment as Phase A's.
+
+## 2. Suite A contradicts ITSELF, and the older test loses
+
+`test_item6_documents_current_embargo_frac_scaling` was written to be GREEN at HEAD, documenting
+the fraction-based width — and it passes `embargo_frac=`, which
+`test_item6_embargo_frac_is_rejected_as_deleted_api` in the SAME FILE requires to raise. One must
+fail under any implementation.
+
+**RETIRE the documentation test.** It documented behaviour that this spec deletes; a test whose
+purpose is to pin the old contract has no role once the contract changes. The deletion test is the
+one that was RED at HEAD and is meant to go green — keep it.
+
+## 3. `bars_to_sessions` walks BACKWARD from the end. Suite A is right.
+
+Suite A's assertions (90 bars -> 1 session, 120 -> 2) are only consistent with walking backward
+from the end of `day_offsets`. Suite B's (60 -> 1, 61 -> 2) only with walking forward from the
+start. No implementation satisfies both.
+
+**Decided on semantics, not on which suite is louder:** the function converts a LOOKBACK window
+into sessions, and a lookback looks BACKWARD from now. Forward-from-start answers a question no
+caller asks ("how many sessions do the FIRST n bars occupy"). Suite B's `test_4` is updated.
+
+## 4. The CLI must pass the FOUR COMPONENTS, not a pre-summed number
+
+The implementer passed a pre-summed value through the legacy `max_lookback_days` keyword, because
+suite A's spy monkeypatches `split` with exactly that signature and the four-kwarg call would
+`TypeError` inside the spy.
+
+That is a reasonable local decision and it is the wrong global one: **pre-summing at the CLI
+destroys the dominant-term diagnostic at exactly the boundary a user sees.** The entire reason
+section B takes four components rather than one number is so the error can say WHICH term forced
+the embargo. A user who hits `EmbargoTooShortError` from `nq walkforward` and is told only a total
+learns nothing actionable.
+
+**Suite A's spy is over-constraining and must be updated** to accept the four keyword arguments.
+The CLI passes them separately. `max_lookback_days` remains supported for backward compatibility
+but is not the path the CLI uses.
+
+## 5. Two genuine test bugs, fixed not worked around
+
+- Suite B `test_7`: `rng.integers(10, min(50, remaining + 1))` can produce `low >= high` when
+  `remaining < 9`, which raises regardless of implementation. A real defect in the draft.
+- `tests/test_cli_coverage.py::test_walkforward_split_setup_failure` monkeypatches `split` with
+  `lambda self, trading_dates: ...` — no `max_lookback_days` at all. Any correct wiring breaks it.
+  **This also explains the earlier "order-dependent test" mystery: it is not order-dependent, it is
+  SIGNATURE-FRAGILE**, and it appeared to flake because the tree was changing under the
+  measurement. One less phantom to chase.
+
+## Amendment 2, clause 6 — BOTH splitters take the four components
+
+Implemented asymmetrically: `WalkForwardSplitter.split()` takes the four components, while
+`PurgedKFold.split()` takes only `n_rows`/`day_offsets` with a pre-summed `embargo_sessions` on the
+constructor. Suite B's tests 5, 6 and 7 fail on
+`TypeError: PurgedKFold.split() got an unexpected keyword argument 'feature_lookback'`.
+
+**Suite B is right and this is an implementation gap, not a test bug.** Required test 5 — present
+in BOTH suites — says the two mechanisms, *given identical components*, must produce embargo
+regions consistent in size. That sentence is only expressible if both mechanisms ACCEPT the
+components. Passing a pre-summed integer to one and four floats to the other makes "identical
+components" untestable by construction.
+
+It is also the same defect as amendment 2 item 4, one layer down: **pre-summing anywhere destroys
+the dominant-term diagnostic.** A `PurgedKFold` that raises `EmbargoTooShortError` should be able to
+say which term forced it, exactly as the walk-forward splitter can.
+
+Required: `PurgedKFold.split()` and `CombinatorialPurgedCV.split()` accept
+`feature_lookback`, `label_horizon`, `holding_period`, `execution_horizon` as keyword-only floats,
+defaulting to 0.0, and derive the embargo width from them via the same
+`required_embargo_sessions(...)` the walk-forward path uses. `embargo_sessions` remains as an
+explicit override for a caller that genuinely wants to set the width directly.
+
+Unchanged, and worth restating so it is not "helpfully" unified: the LEFT purge stays
+`label_horizon`-only. Purging removes label overlap on the left; the embargo removes serial
+dependence on the right. They bound different dependencies and must not be merged.

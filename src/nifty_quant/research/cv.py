@@ -14,6 +14,73 @@ from typing import Sequence
 
 import numpy as np
 
+from nifty_quant.research.embargo import required_embargo_sessions
+
+
+def _embargo_width_rows(
+    start_row: int,
+    n_rows: int,
+    embargo_sessions: int,
+    day_offsets: np.ndarray | None,
+) -> int:
+    """Convert an absolute session count into a row-width, starting at `start_row`
+    (which must itself be a session boundary when `day_offsets` is given) and
+    walking FORWARD through the next `embargo_sessions` sessions. Without
+    `day_offsets`, sessions and rows are treated 1:1. This is an ABSOLUTE size --
+    it must never scale with `n_rows`."""
+    if embargo_sessions <= 0:
+        return 0
+    if day_offsets is None:
+        return embargo_sessions
+    day_offsets = np.asarray(day_offsets, dtype=np.int64)
+    if day_offsets[-1] != n_rows:
+        day_offsets = np.append(day_offsets, n_rows)
+    idx = int(np.searchsorted(day_offsets, start_row))
+    end_idx = min(idx + embargo_sessions, len(day_offsets) - 1)
+    return int(day_offsets[end_idx] - start_row)
+
+
+def _resolve_embargo_sessions(
+    *,
+    configured_label_horizon: int,
+    configured_embargo_sessions: int,
+    feature_lookback: float,
+    label_horizon: float,
+    holding_period: float,
+    execution_horizon: float,
+) -> int:
+    """Resolve the RIGHT-side embargo width, in sessions, shared by `PurgedKFold`
+    and `CombinatorialPurgedCV`.
+
+    Two decisions, both from `specs/embargo_sizing.md` Amendment 2 clause 6, made
+    explicit here so neither is left ambiguous:
+
+    1. `configured_embargo_sessions` (the constructor's `embargo_sessions` field)
+       is an explicit override. When > 0 it wins outright over the derived value
+       -- a caller who names a number means it. When 0 (the default), the width
+       is derived from the four dependence-horizon components via
+       `required_embargo_sessions`, the SAME helper `WalkForwardSplitter.split`
+       uses, so the two mechanisms size the embargo identically for identical
+       components.
+    2. `label_horizon` here (a `split()`-time float, in sessions) is a second
+       source for the same concept `configured_label_horizon` (the constructor's
+       `label_horizon`, in bars) already holds, and is used ONLY for the LEFT
+       purge -- never for this embargo-sum. To avoid two live sources for one
+       value: if the `split()`-time float is left at its default (0.0), the
+       constructor's value is reused (cast to float) as the embargo-sum's
+       label_horizon term. If the `split()`-time float is passed non-zero, it
+       overrides the constructor's value for the embargo-sum ONLY; the
+       constructor field alone still, and always, drives the left purge.
+    """
+    if configured_embargo_sessions > 0:
+        return configured_embargo_sessions
+    effective_label_horizon = (
+        label_horizon if label_horizon != 0.0 else float(configured_label_horizon)
+    )
+    return required_embargo_sessions(
+        feature_lookback, effective_label_horizon, holding_period, execution_horizon
+    )
+
 
 @dataclass(frozen=True)
 class Fold:
@@ -44,8 +111,11 @@ class PurgedKFold:
     """
 
     n_splits: int = 5
-    label_horizon: int = 0  # bars a label looks forward; drives purging
-    embargo_frac: float = 0.01  # fraction of total rows embargoed AFTER each test block
+    label_horizon: int = 0  # bars a label looks forward; drives purging (LEFT side only)
+    embargo_sessions: int = 0  # explicit override for the RIGHT-side embargo width, in
+    # sessions. When > 0 it wins over the width derived from split()'s four
+    # dependence-horizon components (a caller who names a number means it). When left
+    # at the default 0, the width is derived -- see split().
 
     def __post_init__(self) -> None:
         """Validate parameters."""
@@ -53,11 +123,18 @@ class PurgedKFold:
             raise ValueError("n_splits must be at least 2")
         if self.label_horizon < 0:
             raise ValueError("label_horizon must be >= 0")
-        if self.embargo_frac < 0 or self.embargo_frac >= 1:
-            raise ValueError("embargo_frac must be in [0, 1)")
+        if self.embargo_sessions < 0:
+            raise ValueError("embargo_sessions must be >= 0")
 
     def split(
-        self, n_rows: int, *, day_offsets: np.ndarray | None = None
+        self,
+        n_rows: int,
+        *,
+        day_offsets: np.ndarray | None = None,
+        feature_lookback: float = 0.0,
+        label_horizon: float = 0.0,
+        holding_period: float = 0.0,
+        execution_horizon: float = 0.0,
     ) -> list[Fold]:
         """Contiguous test blocks in time order, with purging and embargo.
 
@@ -69,6 +146,27 @@ class PurgedKFold:
             If provided, test-block boundaries snap to session boundaries (rows
             that start a new day/session). This ensures a fold never splits a
             trading day.
+        feature_lookback, label_horizon, holding_period, execution_horizon : float
+            The four dependence-horizon components, in SESSIONS, used to derive
+            the RIGHT-side embargo width via the same
+            `nifty_quant.research.embargo.required_embargo_sessions` helper the
+            walk-forward splitter uses (spec `embargo_sizing.md` section A,
+            Amendment 2 clause 6). They do NOT affect the LEFT purge -- that
+            stays governed solely by the constructor's `label_horizon` (in bars),
+            unchanged. Purging removes label overlap on the left; the embargo
+            removes serial dependence on the right; the spec explicitly forbids
+            unifying the two, so a fold's left and right widths may legitimately
+            differ.
+
+            `label_horizon` here is a SECOND source, in sessions, for the same
+            concept the constructor's `label_horizon` field holds in bars.
+            Resolution (documented so two sources for one value is never
+            ambiguous): if this keyword is left at its default (0.0), the
+            constructor's `label_horizon` is reused (cast to float) as the
+            embargo-sum's label_horizon term, so a caller states the number only
+            once. If this keyword is passed non-zero, it OVERRIDES the
+            constructor's value for the embargo-sum contribution ONLY -- the
+            constructor field alone still drives the left purge, always.
 
         Returns
         -------
@@ -85,10 +183,16 @@ class PurgedKFold:
                 f"n_rows ({n_rows}) must be at least n_splits ({self.n_splits})"
             )
 
-        folds: list[Fold] = []
+        embargo_sessions = _resolve_embargo_sessions(
+            configured_label_horizon=self.label_horizon,
+            configured_embargo_sessions=self.embargo_sessions,
+            feature_lookback=feature_lookback,
+            label_horizon=label_horizon,
+            holding_period=holding_period,
+            execution_horizon=execution_horizon,
+        )
 
-        # Compute embargo width as a fraction of total rows.
-        embargo_width = math.ceil(self.embargo_frac * n_rows)
+        folds: list[Fold] = []
 
         # If day_offsets provided, snap test blocks to session boundaries.
         if day_offsets is not None:
@@ -118,8 +222,13 @@ class PurgedKFold:
             train_after_purge = candidate_train[purge_mask]
             n_purged = len(candidate_train) - len(train_after_purge)
 
-            # Embargo: drop embargo_width rows immediately AFTER test block.
+            # Embargo: drop embargo_width rows immediately AFTER test block. Width is
+            # an absolute session count converted to rows via day_offsets -- it must
+            # never scale with n_rows.
             embargo_start = test_end
+            embargo_width = _embargo_width_rows(
+                embargo_start, n_rows, embargo_sessions, day_offsets
+            )
             embargo_end = min(embargo_start + embargo_width, n_rows)
             embargo_mask = (train_after_purge < embargo_start) | (
                 train_after_purge >= embargo_end
@@ -235,8 +344,10 @@ class CombinatorialPurgedCV:
 
     n_groups: int = 6
     n_test_groups: int = 2
-    label_horizon: int = 0
-    embargo_frac: float = 0.01
+    label_horizon: int = 0  # bars a label looks forward; drives purging (LEFT side only)
+    embargo_sessions: int = 0  # explicit override for the RIGHT-side embargo width, in
+    # sessions -- same override semantics as `PurgedKFold.embargo_sessions`; see
+    # `_resolve_embargo_sessions`.
 
     def n_paths(self) -> int:
         """Number of distinct backtest paths.
@@ -266,7 +377,16 @@ class CombinatorialPurgedCV:
         n_combos = math.comb(self.n_groups, self.n_test_groups)
         return n_combos * self.n_test_groups // self.n_groups
 
-    def split(self, n_rows: int, *, day_offsets: np.ndarray | None = None) -> list[Fold]:
+    def split(
+        self,
+        n_rows: int,
+        *,
+        day_offsets: np.ndarray | None = None,
+        feature_lookback: float = 0.0,
+        label_horizon: float = 0.0,
+        holding_period: float = 0.0,
+        execution_horizon: float = 0.0,
+    ) -> list[Fold]:
         """Combinatorial test-group selection with purge and embargo.
 
         Each fold tests one contiguous group (or group combination) and trains on the rest.
@@ -278,6 +398,12 @@ class CombinatorialPurgedCV:
             Total number of rows.
         day_offsets : np.ndarray | None
             If provided, group boundaries snap to session boundaries.
+        feature_lookback, label_horizon, holding_period, execution_horizon : float
+            Same meaning, units and constructor-vs-split-time `label_horizon`
+            resolution as `PurgedKFold.split` (see its docstring and
+            `_resolve_embargo_sessions`): these size the RIGHT-side embargo only,
+            never the LEFT purge, which stays governed by the constructor's
+            `label_horizon` (bars).
 
         Returns
         -------
@@ -287,11 +413,20 @@ class CombinatorialPurgedCV:
         if self.n_test_groups >= self.n_groups:
             raise ValueError("n_test_groups must be < n_groups")
 
+        embargo_sessions = _resolve_embargo_sessions(
+            configured_label_horizon=self.label_horizon,
+            configured_embargo_sessions=self.embargo_sessions,
+            feature_lookback=feature_lookback,
+            label_horizon=label_horizon,
+            holding_period=holding_period,
+            execution_horizon=execution_horizon,
+        )
+
         # Use PurgedKFold to partition into n_groups groups.
         kf = PurgedKFold(
             n_splits=self.n_groups,
             label_horizon=self.label_horizon,
-            embargo_frac=self.embargo_frac,
+            embargo_sessions=self.embargo_sessions,
         )
         base_folds = kf.split(n_rows, day_offsets=day_offsets)
 
@@ -329,9 +464,13 @@ class CombinatorialPurgedCV:
             train_after_purge = candidate_train[purge_mask]
             n_purged = len(candidate_train) - len(train_after_purge)
 
-            # Embargo: drop ceil(embargo_frac * n_rows) rows immediately AFTER test block.
-            embargo_width = math.ceil(self.embargo_frac * n_rows)
+            # Embargo: drop embargo_sessions worth of rows immediately AFTER test
+            # block. Width is an absolute session count converted to rows via
+            # day_offsets -- it must never scale with n_rows.
             embargo_start = int(test_idx[-1]) + 1
+            embargo_width = _embargo_width_rows(
+                embargo_start, n_rows, embargo_sessions, day_offsets
+            )
             embargo_end = min(embargo_start + embargo_width, n_rows)
             embargo_mask = (train_after_purge < embargo_start) | (
                 train_after_purge >= embargo_end

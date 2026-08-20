@@ -2,14 +2,17 @@
 
 import calendar
 import json
+import math
 import os
 import tempfile
 from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import date, datetime, timezone
 from pathlib import Path
+from types import ModuleType
 from typing import Any, Iterator, Literal
 
+fcntl: ModuleType | None
 try:
     import fcntl
 except ImportError:  # pragma: no cover - non-POSIX fallback
@@ -67,7 +70,14 @@ class WalkForwardSplitter:
     embargo_days: int = 5  # in TRADING days
 
     def split(
-        self, trading_dates: list[date], *, max_lookback_days: int = 0
+        self,
+        trading_dates: list[date],
+        *,
+        max_lookback_days: int = 0,
+        feature_lookback: float = 0.0,
+        label_horizon: float = 0.0,
+        holding_period: float = 0.0,
+        execution_horizon: float = 0.0,
     ) -> list[Split]:
         if max_lookback_days > 0 and self.embargo_days < max_lookback_days:
             raise EmbargoTooShortError(
@@ -80,6 +90,24 @@ class WalkForwardSplitter:
             raise ValueError("train_years, test_years, and step_years must be > 0")
         if self.embargo_days < 0:
             raise ValueError("embargo_days must be >= 0")
+
+        from nifty_quant.research.embargo import EmbargoComponents
+
+        components = EmbargoComponents(
+            feature_lookback=feature_lookback,
+            label_horizon=label_horizon,
+            holding_period=holding_period,
+            execution_horizon=execution_horizon,
+        )
+        required = math.ceil(components.required_sessions())
+        if self.embargo_days < required:
+            dominant = components.dominant_term()
+            raise EmbargoTooShortError(
+                f"embargo_days={self.embargo_days} is shorter than the required "
+                f"embargo of {required} sessions (dominant term: "
+                f"{dominant}={getattr(components, dominant)}); increase embargo to "
+                "avoid train/test data leakage"
+            )
 
         n = len(trading_dates)
         if n == 0:

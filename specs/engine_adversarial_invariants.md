@@ -452,3 +452,250 @@ NOT fire. They were real defects and the fixes are correct, but their frequency 
 worth knowing before attributing any number change to them. It also means the F1/F5/composed-cost
 mechanisms had nothing to act on in the 2024 baseline diff, which is why the cost figures did not
 move. That confirms the reading recorded in `results/baselines/PHASE_A_COST_DIFF.md`.
+
+---
+
+# F10 — THE HOLDOUT LOCK GUARDS A MOVING TARGET
+
+Found while investigating why `results/holdout_lock.json` showed **6 reads** on 2026-08-20 against
+a program record that says "Holdout still LOCKED and unread."
+
+`HoldoutLock.holdout_range(trading_dates)` computes `holdout_end = trading_dates[-1]` and
+`holdout_start = holdout_end - holdout_months`. **The boundary is derived from whatever dates the
+caller passes**, and `cli.walkforward` passes the dates of the CURRENT RUN:
+
+    full calendar (the TRUE holdout)   -> 2025-08-14 .. 2026-08-14
+    a Jan-2024-only run                -> 2024-01-01 .. 2024-01-31
+    a 2024-only run                    -> 2024-01-01 .. 2024-12-31
+
+So a short run **manufactures a fake holdout inside its own window** and records a read against it.
+
+## What actually happened, and what did not
+
+All six entries are `walkforward split rolling_000` — the FIRST rolling split, whose test window is
+the EARLIEST test period. Under full-calendar defaults `rolling_000` tests around 2021 and could
+never trip a 2025-08-14 boundary. It recorded only because those runs were short (agents using
+Jan-2024 windows for speed while testing the embargo guard and PBO plumbing).
+
+**The true holdout window 2025-08-14..2026-08-14 has NOT been read. The counter says 6; the true
+count is 0.**
+
+## Why this is still serious
+
+The counter is the ONLY mechanism protecting the program's single unbiased read. It is:
+- **unreliable upward** — records reads that never touched the real window (demonstrated), so a
+  future reader cannot distinguish "spent" from "noise" and may wrongly believe it is burned;
+- **unreliable as a gate** — `cli.walkforward` does not refuse, it merely counts, so nothing stops
+  a genuine read;
+- **inconsistent across callers** — `research/tilt.py` builds its calendar from GLOBAL index bars
+  (`TradingCalendar.from_index_bars("NIFTY50")`) and therefore gets the TRUE boundary, and it DOES
+  refuse. `cli.walkforward` uses the run's own dates and only counts. Two callers, two different
+  boundaries, two different behaviours. `tilt` additionally writes to a hardcoded
+  `/tmp/nifty_quant_holdout_lock.json`, a DIFFERENT FILE from walkforward's
+  `results/holdout_lock.json`.
+
+## Required
+
+1. **The boundary is a FIXED, RECORDED constant**, derived once from the full calendar and stored
+   in the lock file itself — never recomputed from a caller-supplied window. A holdout whose
+   definition depends on what you happen to be running is not a holdout.
+2. **One lock file**, one path, shared by every caller. The `/tmp` path is deleted.
+3. `cli.walkforward` REFUSES by default when a split's test window intersects the holdout, with an
+   explicit `--allow-holdout` override that is what actually increments the counter. Counting
+   without refusing is what let this go unnoticed.
+4. **Reconcile the existing count**: the six recorded entries are false positives and must be
+   annotated as such in the log rather than deleted — the audit trail records that they happened
+   and why they did not count, which is more honest than a reset.
+
+## The lesson, and it generalises past this repo
+
+**A guard whose threshold is computed from the same input it is guarding cannot guard anything.**
+This is structurally the same error as F9 (one predicate serving two callers) and as the
+`embargo_frac` defect (a bound defined as a fraction of the sample it bounds). Three instances now.
+When a limit is derived from the data it constrains, it moves with the data.
+
+---
+
+# CORRECTION TO THE F2 MEASUREMENT — I WAS WRONG ABOUT LEVERAGE
+
+I recorded above that the engine "runs on an undeclared overdraft" at "1.64x declared capital",
+computing the book as `capital - min_cash`. **That is arithmetically invalid and the conclusion
+was wrong.** A controlled investigation settled it; I verified the correction independently.
+
+`capital - min_cash` equals the gross book ONLY if equity is still at capital. It was not. At the
+worst-cash row the account was **past zero**:
+
+    cash             -1,25,66,075
+    equity              -25,52,677     <- INSOLVENT
+    positions_value   1,00,13,398      <- the actual book: 1.001x capital
+
+    identity  cash = equity - positions_value   holds to the rupee
+
+Peak realised gross over the whole run is **1.261x**, p99 **1.052x**, mean **0.633x**. Instrumented
+directly at `GrossNotionalSizer.to_shares`, the sizer NEVER requested more than the declared
+multiple: max target notional is exactly `gross x capital` at gross = 0.5, 1.0 and 2.0. **There are
+ZERO rows where cash < 0 while equity >= capital.** Genuine leverage of a solvent book never occurs.
+
+## The actual mechanism
+
+`engine.py`:
+
+    capital_now = portfolio.equity(mark_prices) if config.compound else config.capital
+
+`BacktestConfig.compound` defaults to **False** and the CLI never sets it. So the sizer targets
+`gross x INITIAL capital` on every decision row **regardless of what the account is now worth**.
+`gross: 1.0` means "1.0x day-one capital", not "1.0x equity". Once equity falls,
+`cash = equity - exposure` goes negative by exactly the drawdown.
+
+Attribution at the worst row — the overdraft is a SOLVENCY artifact, not an exposure artifact:
+
+    net exposure above declared capital       0.1%
+    cumulative charges                       59.0%
+    cumulative gross trading losses          40.9%
+
+Controlled: `compound=True` removes **98.5%** of the overdraft. Cost dose-response is exactly
+linear at `d(overdraft)/d(charges) = 0.970` with turnover held bit-identical.
+
+Rotation overlap IS real but small and separately identified: under `compound=True` only 8 bars go
+negative, worst -1,89,728 (1.9% of capital), each a one-bar transient caused by
+`max_participation=0.02` capping entry and exit legs asymmetrically. Raising it to 0.20 gives
+`min_cash = +2,148`, zero negative rows.
+
+## What this means for the cost and capacity numbers — restated correctly
+
+Engine-derived numbers do **NOT** carry a hidden leverage factor. Phase H's capacity ladder does
+not inherit one. My earlier warning to that effect was wrong and is withdrawn.
+
+What they DO carry is different and arguably worse: past roughly 2024-01-24 the book is sized off a
+capital number the account no longer has, so the equity curve, turnover ratios and every
+per-rupee-of-capital metric after that point describe **a portfolio that could not be funded**. The
+fix is one line (`compound=True`, or size off `min(equity, capital)`) but it changes every number
+in the program — a research decision, not a bug fix.
+
+# F11 — `check_cash_non_negative` IS DOCUMENTED BUT DOES NOT EXIST
+
+`engine.py:95` states that FULL strictness "raises on any negative cash via
+`check_cash_non_negative`", and `run_backtest` does run under FULL. Grep across `src/` and `tests/`
+finds that name **only in that comment**. The function was never written.
+
+That is why a book could run Rs 1.26 crore into overdraft for a month without tripping anything.
+**A comment describing a guard that does not exist is worse than no comment** — it tells the next
+reader the case is covered. Same family as F6 (a guard that existed but could not see NaN).
+
+# UNEXPLAINED, FLAGGED FOR INVESTIGATION
+
+Running with `tradable=None` (all-True) produced results **bit-identical** to running with the real
+mask, which is only 92.8% True — same `min_cash` to the decimal, same 2,35,985 fills, same 0.310
+unfilled. **That should not be identical.** Not chased and not asserted as a bug, but it means
+either the mask is not reaching the fill path or the excluded cells never had orders. Rule 7 makes
+`present` vs `tradable` a load-bearing distinction, so this needs settling.
+
+---
+
+# THE `tradable=None` ANOMALY — RESOLVED. Benign for one strategy, not in general.
+
+Investigated by controlled measurement. The bit-identity reproduces, but ONLY for
+`volume_breakout`, and the mask is demonstrably load-bearing everywhere else:
+
+    xsec_zscore      DIFFERS   646 vs 617 trades          12 wanted-but-excluded cells
+    carver_trend     DIFFERS   807,402 vs 793,077 trades  19,362 wanted-but-excluded
+    vwap_reversion   DIFFERS   13,623 vs 13,542 trades    81 wanted-but-excluded
+    volume_breakout  IDENTICAL                            **0 wanted-but-excluded**
+
+Enforcement proven two ways: `min_adv_inr=5e10` (mask 0% True) takes `volume_breakout` from
+235,985 trades to **0**; a synthetic mod-4 mask refuses **38,261** order cells on bars with
+positive volume and a valid price. Rule 7 is honoured at both documented consumption points — the
+fill model (`fills.py`, `eligible = has_order & tradable & ...`) and `ArrayMarketView.tradable`.
+
+Why it is a no-op for `volume_breakout` specifically: of 55,193 cells where the two runs' masks
+differ, **98.5% are session 0** (see below) and the rest are zero-volume stale bars — which a
+volume-SPIKE signal can never select, and which `valid_btv` rejects anyway. The 7 order cells that
+did reach an excluded fill row had `bar_traded_value == 0` and were rejected identically in both
+runs. Across 8,029 decision rows the target weights are **bit-identical**.
+
+**So: not a bug. It would bind for a strategy trading the panel's first session, stale or
+circuit-locked bars, or any universe containing names under the ADV floor — this one has none.**
+
+## SESSION 0 IS ENTIRELY NON-TRADABLE IN EVERY MASKED RUN
+
+`data/validate.py`:
+
+    adv = np.full((n_sessions, n_symbols), np.nan)
+    for session_idx in range(1, n_sessions):        # <- starts at 1
+        adv[session_idx, :] = np.nanmean(day_value[lookback_start:session_idx, :], axis=0)
+
+Session 0 keeps its NaN, and `NaN >= min_adv_inr` is `False`. **Every symbol is non-tradable for
+the whole first session of any panel.**
+
+This is CORRECT — with a strictly-prior ADV you genuinely do not know whether a name was liquid on
+day one, and rule 6 forbids inventing a value. The problem is that it is **SILENT**: the loss is
+reported only inside an aggregate percentage in `_tradable_mask_summary`.
+
+    a   22-session backtest forfeits  4.55% of its sample to session 0
+    a   60-session backtest forfeits  1.67%
+    a  249-session backtest forfeits  0.40%
+    a 1867-session backtest forfeits  0.05%
+
+**Required: surface it explicitly**, not as a share of an aggregate. Short research windows are
+exactly where this bites hardest and exactly where agents have been running (Jan 2024 = 22
+sessions). Every measurement taken on a short masked window in this program has silently excluded
+its first session.
+
+## Two further observations, recorded not yet acted on
+
+1. **Cursor/fill skew.** The strategy is shown `tradable_exec[t-1]` while the fill is checked
+   against `tradable_exec[t+1]` — a two-bar staleness. Invisible while the mask is per-session
+   constant (its ADV component is), but real for the per-bar stale and circuit-locked components.
+2. **Exit asymmetry.** `volume_breakout` gates ENTRIES on `tradable` but not holds or exits, and a
+   queued `EOD_EXIT` goes through the masked model fill — so a mask exclusion can TRAP a position
+   until the `FORCED_EOD` bypass frees it. Did not trigger here (0 forced days) but it is the path
+   by which a masked exit becomes a mask-bypassing one.
+
+---
+
+# F12 and F13 — THE EMPTY-CONTAINER FAMILY. Two in one phase.
+
+Both found by coverage work on Phase B code, both the same root cause: **Python truthiness makes
+an EMPTY container indistinguishable from NOT PROVIDED**, so the "nothing to do" path swallows a
+caller error.
+
+## F12 — `universe/pit.py`, `if col_idx:`
+
+`col_idx` is NEVER `None` — it defaults to `list(range(len(panel.symbols)))`. So the truthiness
+guard's ONLY effect was to skip column filtering when `col_idx` is EMPTY: a universe with zero
+symbols in common with the panel. A full-width slice was then assigned into a zero-width
+`session_present`, raising a shape mismatch from inside a loop.
+
+Reachable in practice: `universe/static.py::load_universe` SILENTLY falls back to the full
+149-name universe on any failure, so odd universes are more likely, not less. An explicit universe
+whose symbols are absent from the loaded panel should return a well-formed EMPTY result, not crash.
+
+**Fixed:** index unconditionally at both sites.
+
+## F13 — `guards.py`, `execution_causal(row_args=())` SILENTLY DISABLES THE GUARD
+
+Strictly worse, because a crash is loud and this is not. With an empty `row_args`:
+`static_names = []` -> the validation loop never runs -> `n_rows` is never assigned, stays `None`
+-> the `n_rows is None or n_rows < 2` early return fires unconditionally -> the wrapped function is
+called with **ZERO validation**, at every strictness level including FULL.
+
+Reproduced with a blatantly leaky function (`out[:-1] = prices[1:]`, row t reading row t+1): it
+passed untouched, call count 1, no baseline ever computed.
+
+**Fixed at DECORATION time** — a caller error should fail when the decorator is applied, not
+silently at call time:
+
+    if row_args is not None and len(row_args) == 0:
+        raise ValueError("execution_causal: row_args is empty; that would silently
+                          disable the guard. ...")
+
+## The generalisable rule
+
+**An empty container is not "nothing to do" — it is usually a caller error.** Prefer
+`if x is not None:` over `if x:` for any optional collection, and RAISE on empty where empty cannot
+be meaningful. Audit every `if <collection>:` in this codebase against that test.
+
+This joins the running list of shapes that keep recurring here: a number that had to come from
+somewhere with the spec silent about where (5 instances); a fixture value that collapses onto the
+thing it is meant to distinguish (7); a guard whose threshold is derived from the input it guards
+(3); and now an empty container taking the no-op path (2).

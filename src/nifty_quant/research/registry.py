@@ -33,6 +33,19 @@ class TrialRecord:
     error: str | None
     ruined: bool | None = None
     ruin_index: int | None = None
+    # ---- specs/run_provenance.md: fields added, never renaming/removing the above ----
+    seed: int | None = None
+    universe_name: str = ""
+    universe_hash: str = ""
+    panel_hash: str = ""
+    start: str = ""
+    end: str = ""
+    cost_model_id: str = ""
+    slippage_model_id: str = ""
+    fill_model_id: str = ""
+    embargo_components: str = "{}"
+    parent_trial_id: str | None = None
+    feature_version: str = ""
 
 
 @dataclass(frozen=True)
@@ -123,6 +136,18 @@ class TrialRegistry:
                 error TEXT,
                 ruined INTEGER,
                 ruin_index INTEGER,
+                seed INTEGER,
+                universe_name TEXT,
+                universe_hash TEXT,
+                panel_hash TEXT,
+                "start" TEXT,
+                "end" TEXT,
+                cost_model_id TEXT,
+                slippage_model_id TEXT,
+                fill_model_id TEXT,
+                embargo_components TEXT,
+                parent_trial_id TEXT,
+                feature_version TEXT,
                 UNIQUE(config_hash, split_id)
             )
             """
@@ -149,19 +174,37 @@ class TrialRegistry:
                     f"ALTER TABLE trials ADD COLUMN {column_name} INTEGER"
                 )
 
+        # specs/run_provenance.md section A: add any of the twelve new columns
+        # missing from a pre-existing trials.db, same idempotent pattern as above.
+        _text_columns = (
+            "universe_name",
+            "universe_hash",
+            "panel_hash",
+            "start",
+            "end",
+            "cost_model_id",
+            "slippage_model_id",
+            "fill_model_id",
+            "embargo_components",
+            "parent_trial_id",
+            "feature_version",
+        )
+        for column_name in _text_columns:
+            if column_name not in existing_columns:
+                self._conn.execute(
+                    f'ALTER TABLE trials ADD COLUMN "{column_name}" TEXT'
+                )
+        if "seed" not in existing_columns:
+            self._conn.execute("ALTER TABLE trials ADD COLUMN seed INTEGER")
+
         self._conn.commit()
 
     def record(self, rec: TrialRecord) -> None:
         """Append-only insert; duplicate (config_hash, split_id) rows are ignored."""
+        columns = ", ".join(f'"{name}"' for name in _TRIAL_FIELDS)
+        placeholders = ", ".join("?" for _ in _TRIAL_FIELDS)
         self._conn.execute(
-            """
-            INSERT OR IGNORE INTO trials (
-                config_hash, ts, strategy, params_json, split_id, purpose,
-                sharpe_gross, sharpe_net, n_trades, turnover, breakeven_bps,
-                git_sha, data_fingerprint, code_version, wall_s, result_path, error,
-                ruined, ruin_index
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-            """,
+            f"INSERT OR IGNORE INTO trials ({columns}) VALUES ({placeholders})",
             tuple(getattr(rec, name) for name in _TRIAL_FIELDS),
         )
         self._conn.commit()
