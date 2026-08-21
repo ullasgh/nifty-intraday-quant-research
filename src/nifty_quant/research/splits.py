@@ -45,6 +45,10 @@ def _subtract_months(value: date, months: int) -> date:
 
 
 @contextmanager
+# NOTE: `nifty_quant/concurrency.py::locked_path` duplicates this fcntl.flock pattern ON
+# PURPOSE -- see the long comment there. `tests/test_splits_coverage.py` pins this module's
+# `fcntl` attribute and this function as live module attributes, so this copy cannot be
+# replaced by a re-export. Change one, change the other.
 def _locked_path(path: Path) -> Iterator[None]:
     """Best-effort advisory lock for atomic JSON read-modify-write cycles."""
     if fcntl is None:

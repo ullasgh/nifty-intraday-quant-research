@@ -184,3 +184,45 @@ defect lived:
 (`abs(spread_t) > 1.96`) was computed on the broken SE. Those verdicts are not automatically wrong,
 but they are unverified. Recomputing them is a separate deliberate step and has NOT been done — the
 implementation was explicitly instructed not to silently re-run and overwrite recorded numbers.
+
+---
+
+## CORRECTION 2026-08-21 — the L7/L8 recomputation scope was overstated
+
+I wrote that "every result previously gated on criterion 3 was computed on the broken SE." That is
+too broad, and the code says so plainly (`expectancy.py:496`):
+
+    if horizon == 1:
+        # For horizon=1, no overlap correction is needed
+        se_bps = std_bps / np.sqrt(n_obs)
+
+A `horizon == 1` verdict never reaches the block bootstrap at all. Its SE is `std/sqrt(n)`, and for
+genuinely NON-OVERLAPPING observations that is the correct estimator, not a defective one.
+
+**H2 runs at `horizon=1`** (`horizon_mode='session'`, one observation per symbol-day, explicitly
+non-overlapping — stated in its own verdict). So H2's criterion 3 is unaffected by L7/L8 and needs
+no recomputation. The same applies to any other `horizon=1` verdict.
+
+**Narrowed scope:** recomputation is required for verdicts with `horizon > 1` only. All five
+recorded hypotheses are KILLED regardless, and H3's criterion 3 already reads FAIL, so the
+retrospective reach of this fix is small.
+
+**Where it DOES matter is forward-looking, and that is the whole point:** Phase E sweeps horizons of
+5, 15, 30, 60 bars and EOD. Every one of those lands on the overlapping path, which is exactly the
+regime where the pre-fix false-positive rate was 34%.
+
+## CORRECTION 2026-08-21 — H2 is KILLED, and I described it loosely
+
+Finding L3 and its commit message called H2 "the only live signal family in this program". H2's
+verdict is **KILLED** — it fails criterion 7 (recent-years cost gate: 2023-24 mean -15.20 bps
+against a 2x hurdle of 16.53 bps), and its per-year spread decays from -39.18 bps in 2018 to
+-9.62 bps in 2025.
+
+The L3 fix is still correct and still necessary: criterion 5 branched on `if lag_0_edge > 0` and
+would hard-FAIL any negative-signed edge, and H2's edge is negative BY CONSTRUCTION because it is a
+reversal traded short-side. The reasoning holds. The characterisation of H2 as "live" does not.
+
+**Accurate statement:** what is live is the low-turnover index-relative TILT built on H2's signal,
+which survives by paying a one-leg hurdle (8.26 bps) and starting from the index return rather than
+from zero. The underlying effect is real and decaying; the tilt is the construction that can still
+use it.

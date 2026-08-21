@@ -22,7 +22,18 @@ from nifty_quant.research.contract import ResearchContract
 # changes when these change, that test is accidentally depending on contract content and is
 # mis-scoped.
 _MINIMAL_SECTIONS: dict[str, dict[str, object]] = {
-    "data": {"panel_id": "test-panel", "panel_hash": "test", "universe_name": "test"},
+    # `start`/`end` are populated deliberately. `feature_sweep.run_sweep` asserts its data
+    # window ends strictly before the stored holdout boundary, and reads `data["end"]` to do
+    # it. With no `end` present that assertion is a silent no-op -- a guard that never fires,
+    # which is worse than no guard because it reads as protection. These dates sit far before
+    # the real holdout (2025-08-14) so the check passes for tests that are not about it.
+    "data": {
+        "panel_id": "test-panel",
+        "panel_hash": "test",
+        "universe_name": "test",
+        "start": "2020-01-01",
+        "end": "2020-12-31",
+    },
     "features": {"ids": (), "feature_version": "test"},
     "label": {"horizon_bars": 1, "overlapping": False},
     "execution": {"cost_model_id": "test", "slippage_model_id": "test"},

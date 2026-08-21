@@ -331,6 +331,25 @@ def causal_buckets(
 BLOCK_LENGTH_EXTRA_BARS: int = 5
 
 
+# `block_indices` is a DIAGNOSTIC (which blocks were drawn), never part of the
+# statistic itself -- capping how many are RETAINED changes nothing about which
+# blocks are drawn, in what order, or how the resampled series/means are computed.
+# Uncapped, it accumulates one (start, length) tuple per block per replicate: on the
+# real panel (n_boot=1000, block lengths of ~6-25 rows over 701_863 rows) that is an
+# estimated 28M-117M tuples, ~10-15 GB. Budget: ~64 MiB of retained diagnostic
+# tuples, at a conservative ~100 bytes per (start, length) 2-tuple held inside a
+# python list (two boxed ints at ~28 bytes each plus tuple/list-slot overhead,
+# rounded up for margin) -- solving for count gives the cap below. Every test fixture
+# in this repo (n_boot <= 500, tens of sessions) draws far fewer blocks than this
+# cap, so the small-fixture contract (`block_indices` as an exhaustive, per-block
+# record) is unaffected; only production-sized runs are bounded.
+_BLOCK_INDICES_DIAGNOSTIC_BUDGET_BYTES: int = 64 * 1024 * 1024
+_BLOCK_INDICES_BYTES_PER_ENTRY: int = 100
+_BLOCK_INDICES_MAX_RETAINED: int = (
+    _BLOCK_INDICES_DIAGNOSTIC_BUDGET_BYTES // _BLOCK_INDICES_BYTES_PER_ENTRY
+)
+
+
 def _derive_block_length(horizon: int) -> int:
     """Moving-block-bootstrap block length: DERIVED, never `L = horizon` by convention.
 
@@ -340,6 +359,55 @@ def _derive_block_length(horizon: int) -> int:
     additional measured autocorrelation in the underlying 1-minute return series.
     """
     return max(int(horizon), 1) + BLOCK_LENGTH_EXTRA_BARS
+
+
+def _draw_block_start_positions(
+    rng: np.random.Generator,
+    starts_arr: np.ndarray,
+    n_blocks_per_replicate: int,
+    n_replicates: int,
+) -> np.ndarray:
+    """Draw block start positions for `n_replicates` replicates in ONE vectorized
+    call, bit-identical to `n_replicates` sequential
+    `rng.choice(starts_arr, size=n_blocks_per_replicate, replace=True)` calls.
+
+    `Generator.choice` with `replace=True` and no `p` reduces internally to
+    `starts_arr[rng.integers(0, len(starts_arr), size=shape)]`, and `Generator.integers`
+    fills its output in the same flat, sequential draw order whether requested as one
+    `size=(n_replicates, n_blocks_per_replicate)` call or as `n_replicates` separate
+    `size=(n_blocks_per_replicate,)` calls made back-to-back on the same generator
+    (verified empirically against both a 2-call and a variable-chunk-size,
+    non-power-of-two-population case before relying on it here). Batching therefore
+    costs nothing in RNG-stream fidelity, which is what lets the chunked path
+    (`_block_bootstrap_means_chunked`) reproduce the full-array path
+    (`_block_bootstrap_resampling_2d`) bit-for-bit for the same seed regardless of
+    `chunk_size` -- a pre-existing contract this function must not break.
+
+    Returns shape (n_replicates, n_blocks_per_replicate) of actual row positions
+    (not indices into `starts_arr`).
+    """
+    idx = rng.integers(0, len(starts_arr), size=(n_replicates, n_blocks_per_replicate))
+    return starts_arr[idx]
+
+
+def _blocks_to_gather_indices(
+    chosen_starts: np.ndarray, block_length: int, n_rows: int
+) -> np.ndarray:
+    """Vectorized equivalent of concatenating `values_2d[s : s + block_length]` pieces
+    per replicate and truncating the concatenation to `n_rows`.
+
+    Broadcasts each drawn start into `block_length` consecutive row indices
+    (`starts[:, :, None] + arange(block_length)[None, None, :]`), flattens the
+    per-replicate block sequence into one row-index series per replicate, and
+    truncates each row to `n_rows` -- exactly what the per-block Python loop did,
+    just built with broadcasting and a single fancy-index gather instead of a
+    Python-level loop over blocks.
+
+    Returns shape (n_replicates, n_rows) of row indices into the original panel.
+    """
+    within_block = np.arange(block_length)
+    expanded = chosen_starts[:, :, None] + within_block[None, None, :]
+    return expanded.reshape(chosen_starts.shape[0], -1)[:, :n_rows]
 
 
 def _block_bootstrap_resampling_2d(
@@ -405,17 +473,164 @@ def _block_bootstrap_resampling_2d(
     starts_arr = np.array(valid_starts, dtype=int)
     n_blocks_per_replicate = -(-n_rows // block_length)  # ceil(n_rows / block_length)
 
-    for b in range(n_boot):
-        chosen_starts = rng.choice(starts_arr, size=n_blocks_per_replicate, replace=True)
-        pieces = []
-        for s in chosen_starts:
-            s_int = int(s)
-            pieces.append(values_2d[s_int : s_int + block_length])
-            block_indices.append((s_int, block_length))
-        series = np.concatenate(pieces, axis=0)[:n_rows]
-        resampled[b] = series
+    # Vectorized: draw every replicate's block starts in one call, expand each start
+    # into `block_length` consecutive row indices via broadcasting, then gather with a
+    # single fancy-index operation -- replaces what was previously a per-replicate,
+    # per-block Python loop (see `_draw_block_start_positions` /
+    # `_blocks_to_gather_indices` for the RNG-stream-fidelity argument).
+    chosen_starts_all = _draw_block_start_positions(rng, starts_arr, n_blocks_per_replicate, n_boot)
+    gather_idx = _blocks_to_gather_indices(chosen_starts_all, block_length, n_rows)
+    # `.astype(..., copy=False)`: match the documented float64 return contract (the old
+    # loop assigned into a pre-allocated float64 buffer, upcasting on assignment) without
+    # an extra copy when `values_2d` is already float64.
+    resampled = values_2d[gather_idx].astype(np.float64, copy=False)
+
+    # `block_indices` retention: still capped at `_BLOCK_INDICES_MAX_RETAINED`, still in
+    # the same flat per-replicate-then-per-block order the old loop produced (row-major
+    # over `chosen_starts_all`, which is exactly (replicate, block) order).
+    flat_starts = chosen_starts_all.ravel()
+    take = min(_BLOCK_INDICES_MAX_RETAINED, flat_starts.size)
+    block_indices = [(int(s), block_length) for s in flat_starts[:take]]
 
     return resampled, tuple(block_indices), n_sessions_skipped
+
+
+# Target peak memory for one chunk of the resampled bootstrap buffer. Chosen as a
+# round, conservative number well under typical per-process RAM headroom; see
+# `_default_bootstrap_chunk_size` for how it is turned into a replicate count.
+_BOOTSTRAP_CHUNK_TARGET_BYTES: int = 256 * 1024 * 1024
+
+
+def _default_bootstrap_chunk_size(n_rows: int, n_symbols: int) -> int:
+    """Derive a bootstrap chunk size bounding peak memory to ~256 MB (measured, not
+    guessed -- see `_BOOTSTRAP_CHUNK_TARGET_BYTES`).
+
+    One bootstrap replicate of the resampled series occupies
+    `n_rows * n_symbols * 8` bytes (float64). Materialising `chunk_size` replicates
+    at once therefore costs `chunk_size * n_rows * n_symbols * 8` bytes; solving for
+    `chunk_size` against the target gives the formula below. Clamped to >= 1: a
+    single replicate cannot be subdivided further because the row-level
+    any-finite/nanmean reduction needs the full (n_rows, n_symbols) replicate
+    materialised at once. Called directly with n_symbols=149 (the real panel's raw
+    symbol count) this floor of 1 dominates -- one replicate alone is ~0.78 GB,
+    already over the 256 MB target -- so `chunk_size` resolves to 1. In practice
+    `_compute_bucket_stats`'s `block_bootstrap` branch no longer calls this against
+    that shape: it reduces to a length-n_rows per-row bucket-mean series first (see
+    `_bucket_row_means`) and passes THAT (n_rows, 1) shape here instead, so on the
+    real panel `chunk_size` resolves to roughly `256 MB / (701_863 * 1 * 8 bytes)` =
+    tens of replicates per chunk rather than flooring at 1. This function itself is
+    unchanged and still tested standalone at n_symbols=149 for the floor case.
+    """
+    bytes_per_replicate = max(1, n_rows) * max(1, n_symbols) * 8
+    return max(1, _BOOTSTRAP_CHUNK_TARGET_BYTES // bytes_per_replicate)
+
+
+def _block_bootstrap_means_chunked(
+    values_2d: np.ndarray,
+    day_offsets: np.ndarray,
+    horizon: int,
+    n_boot: int,
+    seed: int,
+    chunk_size: int | None = None,
+) -> tuple[np.ndarray, tuple[tuple[int, int], ...], int]:
+    """Memory-bounded equivalent of `_block_bootstrap_resampling_2d` followed by the
+    per-replicate any-finite/nanmean reduction that `_compute_bucket_stats` applies to
+    its output. Returns per-replicate bootstrap MEANS directly (`boot_means`, shape
+    `(n_boot,)`, NaN where a replicate had no finite values) instead of the full
+    `(n_boot, n_rows, n_symbols)` array, so peak memory is
+    `O(chunk_size * n_rows * n_symbols)` rather than `O(n_boot * n_rows * n_symbols)`
+    (the latter is 0.8 TB on the real panel at n_boot=1000 and SIGKILLs the process).
+
+    Bit-for-bit identical to the unchunked path for the same `seed`: exactly one
+    `np.random.default_rng(seed)` is created and every replicate b = 0, 1, ..., n_boot-1
+    draws its blocks from that SAME stream in that SAME order -- `chunk_size` only
+    changes how many already-decided replicates are held in memory simultaneously
+    before being reduced and discarded; it never changes what is drawn, in what
+    order, or how the reduction is computed. `_block_bootstrap_resampling_2d` shares
+    the same vectorized `_draw_block_start_positions` / `_blocks_to_gather_indices`
+    helpers (its own direct tests still exercise the full-array contract on small
+    fixtures); this function reimplements the chunked driving loop around those same
+    helpers because that function's API requires returning the full array, which is
+    exactly the allocation this function exists to avoid.
+    """
+    n_rows, n_symbols = values_2d.shape
+    offsets = np.asarray(day_offsets, dtype=int)
+    n_sessions = len(offsets) - 1
+    session_starts = offsets[:-1]
+    session_ends = offsets[1:]
+
+    block_length = _derive_block_length(horizon)
+
+    valid_starts: list[int] = []
+    n_sessions_skipped = 0
+    for sess_idx in range(n_sessions):
+        sess_start = int(session_starts[sess_idx])
+        sess_end = int(session_ends[sess_idx])
+        if sess_end - sess_start < block_length:
+            n_sessions_skipped += 1
+            continue
+        valid_starts.extend(range(sess_start, sess_end - block_length + 1))
+
+    rng = np.random.default_rng(seed)
+    boot_means = np.full(n_boot, np.nan, dtype=np.float64)
+    block_indices: list[tuple[int, int]] = []
+
+    if chunk_size is None:
+        chunk_size = _default_bootstrap_chunk_size(n_rows, n_symbols)
+    chunk_size = max(1, min(int(chunk_size), max(1, n_boot)))
+
+    if not valid_starts:
+        # Same iid-row fallback as `_block_bootstrap_resampling_2d`, chunked.
+        for chunk_start in range(0, n_boot, chunk_size):
+            chunk_end = min(chunk_start + chunk_size, n_boot)
+            this_chunk = chunk_end - chunk_start
+            resampled_chunk = np.full((this_chunk, n_rows, n_symbols), np.nan, dtype=np.float64)
+            for local_b, b in enumerate(range(chunk_start, chunk_end)):
+                row_idx = rng.choice(n_rows, size=n_rows, replace=True)
+                resampled_chunk[local_b] = values_2d[row_idx]
+            chunk_flat = resampled_chunk.reshape((this_chunk, -1))
+            valid_rows = np.isfinite(chunk_flat).any(axis=1)
+            if np.any(valid_rows):
+                boot_means[chunk_start:chunk_end][valid_rows] = np.nanmean(
+                    chunk_flat[valid_rows], axis=1
+                )
+        return boot_means, tuple(block_indices), n_sessions_skipped
+
+    starts_arr = np.array(valid_starts, dtype=int)
+    n_blocks_per_replicate = -(-n_rows // block_length)  # ceil(n_rows / block_length)
+
+    for chunk_start in range(0, n_boot, chunk_size):
+        chunk_end = min(chunk_start + chunk_size, n_boot)
+        this_chunk = chunk_end - chunk_start
+
+        # Vectorized per-chunk draw + gather (see `_draw_block_start_positions` /
+        # `_blocks_to_gather_indices`): one `rng.integers` call per chunk instead of
+        # `this_chunk * n_blocks_per_replicate` per-block Python-loop iterations.
+        # Sequential chunks each drawing from the SAME generator reproduce exactly the
+        # same flat draw order as one unchunked call over all `n_boot` replicates, so
+        # this remains bit-identical to `_block_bootstrap_resampling_2d` for the same
+        # seed regardless of `chunk_size` (see docstring above and the identity tests
+        # in tests/test_expectancy_bootstrap_chunking.py).
+        chosen_starts_chunk = _draw_block_start_positions(
+            rng, starts_arr, n_blocks_per_replicate, this_chunk
+        )
+        gather_idx = _blocks_to_gather_indices(chosen_starts_chunk, block_length, n_rows)
+        resampled_chunk = values_2d[gather_idx].astype(np.float64, copy=False)
+
+        remaining_capacity = _BLOCK_INDICES_MAX_RETAINED - len(block_indices)
+        if remaining_capacity > 0:
+            flat_starts = chosen_starts_chunk.ravel()
+            take = min(remaining_capacity, flat_starts.size)
+            block_indices.extend((int(s), block_length) for s in flat_starts[:take])
+
+        chunk_flat = resampled_chunk.reshape((this_chunk, -1))
+        valid_rows = np.isfinite(chunk_flat).any(axis=1)
+        if np.any(valid_rows):
+            boot_means[chunk_start:chunk_end][valid_rows] = np.nanmean(
+                chunk_flat[valid_rows], axis=1
+            )
+
+    return boot_means, tuple(block_indices), n_sessions_skipped
 
 
 def _non_overlapping_subsample(values: np.ndarray, horizon: int) -> tuple[np.ndarray, int]:
@@ -433,6 +648,27 @@ def _non_overlapping_subsample(values: np.ndarray, horizon: int) -> tuple[np.nda
     subsampled = values[subsampled_indices]
 
     return subsampled, len(subsampled)
+
+
+def _bucket_row_means(bucket_returns_2d: np.ndarray) -> np.ndarray:
+    """Reduce a masked (n_rows, n_symbols) bucket-returns panel to a length-`n_rows`
+    series of per-row bucket means.
+
+    Each entry is `nanmean` across symbols for that row; a row with no finite bucket
+    member (no symbol in the bucket on that row, or all-NaN data) is NaN. The block
+    bootstrap exists to respect dependence ALONG ROWS (sessions and bars), not across
+    symbols within a row -- so resampling this reduced series instead of the full 2-D
+    panel is statistically equivalent for the bucket MEAN (the only statistic the
+    caller bootstraps) while being `n_symbols` times cheaper, and it is strictly
+    better-behaved: resampling the 2-D array directly can tear a row's symbols apart
+    across different drawn blocks, whereas resampling this series never can.
+    """
+    n_rows = bucket_returns_2d.shape[0]
+    row_means = np.full(n_rows, np.nan, dtype=np.float64)
+    row_has_valid = np.isfinite(bucket_returns_2d).any(axis=1)
+    if np.any(row_has_valid):
+        row_means[row_has_valid] = np.nanmean(bucket_returns_2d[row_has_valid], axis=1)
+    return row_means
 
 
 # ---------------------------------------------------------------------------
@@ -468,11 +704,16 @@ def _compute_bucket_stats(
     se_method: str = "block_bootstrap",
     n_boot: int = 1000,
     seed: int = 0,
+    chunk_size: int | None = None,
 ) -> BucketStat | None:
     """Compute statistics for a single bucket.
 
     Returns None if the bucket has no observations.
     bucket_returns should be flattened (n_rows * n_symbols,).
+
+    `chunk_size` bounds peak memory in the `block_bootstrap` branch: see
+    `_default_bootstrap_chunk_size` for the derivation of its default (None ->
+    auto-computed from `n_rows * n_symbols` against a ~256 MB target).
     """
     valid_mask = np.isfinite(bucket_returns)
     valid_values = bucket_returns[valid_mask]
@@ -509,19 +750,22 @@ def _compute_bucket_stats(
 
         if n_symbols_in_data > 0:
             bucket_returns_2d = bucket_returns.reshape((n_rows, n_symbols_in_data))
-            resampled, block_indices, _n_sessions_skipped = _block_bootstrap_resampling_2d(
-                bucket_returns_2d, day_offsets, horizon, n_boot, seed
+            # Resample the length-n_rows per-row bucket-MEAN series, not the full
+            # (n_rows, n_symbols) panel: the bucket statistic is a mean over all
+            # (row, symbol) cells, and the block bootstrap exists to respect
+            # dependence ALONG ROWS, not across symbols within a row -- so reducing
+            # once via `_bucket_row_means` before resampling is `n_symbols_in_data`
+            # times cheaper (and statistically preferable: it can never tear a row's
+            # symbols apart across different blocks). This mirrors what
+            # `research/ic.py`'s `_overlap_aware_se` already does for the IC series.
+            # On the real panel this turns a 0.837 GB-per-replicate 2-D allocation
+            # into a ~5.6 MB-per-replicate 1-D one, so `_block_bootstrap_means_chunked`
+            # (still reused as-is below, just called on a 1-column array) auto-derives
+            # a chunk_size far above 1 instead of flooring at it.
+            row_means = _bucket_row_means(bucket_returns_2d).reshape((n_rows, 1))
+            boot_means, block_indices, _n_sessions_skipped = _block_bootstrap_means_chunked(
+                row_means, day_offsets, horizon, n_boot, seed, chunk_size
             )
-            # Resampled is (n_boot, n_rows, n_symbols): each replicate is now a FULL
-            # tiled-and-truncated series (L7 fix), not a single <= horizon block.
-            resampled_flat = resampled.reshape((n_boot, -1))
-            # Compute mean of each bootstrap sample
-            # Detect which rows have at least one finite value to avoid RuntimeWarning
-            # from np.nanmean on all-NaN rows
-            valid_rows = np.isfinite(resampled_flat).any(axis=1)
-            boot_means = np.full(n_boot, np.nan, dtype=np.float64)
-            if np.any(valid_rows):
-                boot_means[valid_rows] = np.nanmean(resampled_flat[valid_rows], axis=1)
             # Filter out NaN means (from empty or all-NaN samples)
             valid_boot_means = boot_means[np.isfinite(boot_means)]
             if len(valid_boot_means) > 1:
@@ -660,8 +904,14 @@ def conditional_expectancy(
     seed: int = 0,
     cost_hurdle_bps: float | None = None,
     feature_name: str = "feature",
+    chunk_size: int | None = None,
 ) -> ExpectancyTable:
-    """Compute conditional expectancy table."""
+    """Compute conditional expectancy table.
+
+    `chunk_size` bounds peak memory of the `block_bootstrap` `se_method` -- see
+    `_default_bootstrap_chunk_size`. Default `None` auto-derives it from the panel
+    shape against a ~256 MB target; pass an explicit value to override.
+    """
     feature64 = np.asarray(feature, dtype=np.float64)
     if feature64.ndim != 2:
         raise ValueError("feature must be 2-D")
@@ -690,6 +940,7 @@ def conditional_expectancy(
             se_method=se_method,
             n_boot=n_boot,
             seed=seed,
+            chunk_size=chunk_size,
         )
 
         if stat is not None:

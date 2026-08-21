@@ -15,6 +15,7 @@ import pandas as pd
 
 from nifty_quant import settings
 from nifty_quant.calendar import SessionGrid, to_ist
+from nifty_quant.concurrency import locked_path
 from nifty_quant.data.manifest import Manifest
 from nifty_quant.guards import check_day_offsets, check_sorted_unique
 
@@ -482,13 +483,25 @@ def load_panel(
     from nifty_quant.data import panel_builder
 
     years = sorted({year for year in range(spec.start.year, spec.end.year + 1)})
-    panel_builder.build_panel(
-        freq=spec.freq,
-        years=years,
-        symbols=spec.symbols,
-        force=False,
-        progress=False,
+
+    # `panel_builder.build_panel` writes the per-year raw cache in place (no tmp
+    # dir / atomic rename of its own), so two processes racing to build the same
+    # (cache_key, freq) year cache can observe a partially-written .npy or a
+    # meta.json mid-rewrite. Serialize the whole call per (cache_key, freq): once
+    # one process has built (or confirmed cached) the requested years, every
+    # other process's call becomes a cheap `is_cached` no-op under the same lock.
+    year_cache_root = (
+        settings.CACHE_ROOT / "panel" / f"v{settings.PANEL_VERSION}" / cache_key / spec.freq
     )
+    year_cache_root.mkdir(parents=True, exist_ok=True)
+    with locked_path(year_cache_root / "_build"):
+        panel_builder.build_panel(
+            freq=spec.freq,
+            years=years,
+            symbols=spec.symbols,
+            force=False,
+            progress=False,
+        )
 
     requested_symbols = tuple(sorted(spec.symbols))
     year_infos = []
@@ -523,6 +536,8 @@ def load_panel(
         materialized_dir.parent.mkdir(parents=True, exist_ok=True)
 
         if not force:
+            # Fast path: no lock needed to read an already-published (immutable,
+            # atomically-renamed) materialization.
             cached = _try_open_materialized(
                 materialized_dir,
                 cache_key,
@@ -533,6 +548,32 @@ def load_panel(
             if cached is not None:
                 ts_final, fields_final = cached
             else:
+                # Cold (or stale) cache: only one process may build a given spec at
+                # a time. A waiter blocks on the lock (no spin) and, once it wakes,
+                # re-checks for a materialization the lock-holder may have just
+                # published rather than rebuilding from scratch.
+                with locked_path(materialized_dir):
+                    cached = _try_open_materialized(
+                        materialized_dir,
+                        cache_key,
+                        spec,
+                        total_rows,
+                        len(requested_symbols),
+                    )
+                    if cached is not None:
+                        ts_final, fields_final = cached
+                    else:
+                        ts_final, fields_final = _build_materialized(
+                            materialized_dir,
+                            cache_key,
+                            spec,
+                            requested_symbols,
+                            year_infos,
+                            total_rows,
+                            force=False,
+                        )
+        else:
+            with locked_path(materialized_dir):
                 ts_final, fields_final = _build_materialized(
                     materialized_dir,
                     cache_key,
@@ -540,18 +581,8 @@ def load_panel(
                     requested_symbols,
                     year_infos,
                     total_rows,
-                    force=False,
+                    force=True,
                 )
-        else:
-            ts_final, fields_final = _build_materialized(
-                materialized_dir,
-                cache_key,
-                spec,
-                requested_symbols,
-                year_infos,
-                total_rows,
-                force=True,
-            )
     else:
         ts_final = np.empty(total_rows, dtype=np.int64)
 

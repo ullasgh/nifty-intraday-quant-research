@@ -615,3 +615,57 @@ The same author replaced that file's old "we can't check this directly" comment 
 per-block session-boundary check, now that `block_indices` exposes `(start, length)`. That is
 worth more than the arity fix it came in with: the test's name promised blocks never straddle a
 session, and until now the file could not actually verify it.
+
+---
+
+# AMENDMENT 9 — 2026-08-21. Row-weighted, not cell-weighted. Adjudicated.
+
+The bucket bootstrap now reduces the masked 2-D bucket panel to a length-`n_rows` series of per-row
+bucket MEANS before resampling, rather than resampling the 2-D panel. An implementer flagged that
+this moves `se_bps` and stopped rather than shipping, per the condition attached to the task. Correct
+call, and the change is adopted. Here is why, and what the numbers actually say.
+
+## The measured disagreement
+
+    adversarial fixture (6 symbols, 60% coverage, one all-NaN symbol):  7.3% - 14.7%
+    realistic geometry  (149 symbols, 95% coverage):                    0.06% - 0.25%
+
+The gap is **row-weighted vs cell-weighted averaging under heterogeneous per-row coverage**, and it
+only becomes large when coverage is patchy and the cross-section is small.
+
+## Why row-weighting is CORRECT, not merely cheaper
+
+This is the deciding argument, and it is about what the statistic is supposed to represent.
+
+Cell-weighting averages over stock-days. A bar with 30 names in the bucket gets ten times the
+influence of a bar with 3. That answers "what is the average return of a stock-day in this bucket".
+
+**Row-weighting averages over bars, which is what a strategy actually earns.** You trade each bar
+with whatever names are available that bar; the realised return for that bar is the equal-weighted
+mean of the bucket's members; the strategy's return is the average across bars. A bar is one
+decision and one P&L event regardless of how many names happened to be eligible.
+
+So the two estimators answer different questions and we want the tradable one. That the change is
+also ~149x cheaper is a happy accident, not the justification — and it was NOT adopted for that
+reason.
+
+Secondary benefit: `research/ic.py` already aggregates per-bar and then across bars. Two code paths
+that should agree now do.
+
+## Consequence: one pinned test is stale, not regressed
+
+`tests/test_expectancy_bootstrap_chunking.py::test_se_bps_matches_recorded_pre_fix_baseline` pins
+the pre-change `se_bps` to 1e-12. It was written to prove a MEMORY fix changed nothing, which was
+true and valuable at the time. This change deliberately alters the estimator's granularity, so that
+baseline no longer describes the intended behaviour.
+
+**Adjudicated: re-baseline it to the row-weighted values, and rename it** so it states which
+estimator it pins. Its purpose survives — catching an unintended drift in `se_bps` — but it must
+pin the estimator we chose, not the one we replaced. Do NOT delete it: an unpinned SE is how L7 and
+L8 went unnoticed for the life of the repo.
+
+## What must be re-verified after the change
+
+The false-positive rate must still sit near alpha, and the SE ratio against independently
+resimulated empirical SEs must still be near 1.0 (0.977 pre-change). Those two measurements, not
+the pinned baseline, are what establish the estimator is right.
