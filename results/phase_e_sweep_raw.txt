@@ -1,0 +1,211 @@
+========================================================================================
+TRIAL MATRIX SHAPE (T x n_trials) = 521107 x 60
+  rows: 701863 before the finite-row intersection -> 521107 after (180756 dropped, 25.75%)
+MEASURED effective_n_trials = 19.2969   (this run's PLANNED trial count = 132; full-registry production planned count = 132)
+PBO (CSCV)                  = 0.0267
+var_trial_sharpes (MEASURED)= 0.0310657   (expected_max_sharpe used as DSR sr0 = 0.332222)
+========================================================================================
+feature                         horizon     sharpe  deflated_sharpe
+amihud_illiquidity                    1    -0.0010           0.0000
+amihud_illiquidity                   15    -0.0207           0.0000
+amihud_illiquidity                   30    -0.0311           0.0000
+amihud_illiquidity                    5    -0.0096           0.0000
+amihud_illiquidity                   60    -0.0485           0.0000
+amihud_illiquidity                  EOD    -0.0549           0.0000
+beta_residual_return                  1    -0.8367           0.0000
+beta_residual_return                 15    -0.3355           0.0000
+beta_residual_return                 30    -0.2494           0.0000
+beta_residual_return                  5    -0.5266           0.0000
+beta_residual_return                 60    -0.1737           0.0000
+beta_residual_return                EOD    -0.1066           0.0000
+efficiency_ratio                      1     0.0716           0.0000
+efficiency_ratio                     15     0.0648           0.0000
+efficiency_ratio                     30     0.0522           0.0000
+efficiency_ratio                      5     0.0728           0.0000
+efficiency_ratio                     60     0.0371           0.0000
+efficiency_ratio                    EOD     0.0467           0.0000
+hurst_on_stitched                     1     0.0011           0.0000
+hurst_on_stitched                    15     0.0070           0.0000
+hurst_on_stitched                    30     0.0075           0.0000
+hurst_on_stitched                     5     0.0042           0.0000
+hurst_on_stitched                    60     0.0118           0.0000
+hurst_on_stitched                   EOD    -0.0010           0.0000
+opening_range                         1     0.0017           0.0000
+opening_range                        15     0.0134           0.0000
+opening_range                        30     0.0204           0.0000
+opening_range                         5     0.0077           0.0000
+opening_range                        60     0.0318           0.0000
+opening_range                       EOD     0.0185           0.0000
+overnight_return                      1    -0.0170           0.0000
+overnight_return                     15    -0.0461           0.0000
+overnight_return                     30    -0.0572           0.0000
+overnight_return                      5    -0.0310           0.0000
+overnight_return                     60    -0.0694           0.0000
+overnight_return                    EOD    -0.1194           0.0000
+rolling_beta                          1     0.0055           0.0000
+rolling_beta                         15    -0.0067           0.0000
+rolling_beta                         30    -0.0102           0.0000
+rolling_beta                          5     0.0003           0.0000
+rolling_beta                         60    -0.0176           0.0000
+rolling_beta                        EOD    -0.0542           0.0000
+sector_relative_return                1    -0.7107           0.0000
+sector_relative_return               15    -0.2971           0.0000
+sector_relative_return               30    -0.2242           0.0000
+sector_relative_return                5    -0.4572           0.0000
+sector_relative_return               60    -0.1589           0.0000
+sector_relative_return              EOD    -0.0953           0.0000
+tradable_overnight_return             1     0.0065           0.0000
+tradable_overnight_return            15    -0.0337           0.0000
+tradable_overnight_return            30    -0.0453           0.0000
+tradable_overnight_return             5    -0.0165           0.0000
+tradable_overnight_return            60    -0.0576           0.0000
+tradable_overnight_return           EOD    -0.0755           0.0000
+vol_ratio                             1     0.0349           0.0000
+vol_ratio                            15     0.0221           0.0000
+vol_ratio                            30     0.0145           0.0000
+vol_ratio                             5     0.0270           0.0000
+vol_ratio                            60     0.0100           0.0000
+vol_ratio                           EOD     0.0075           0.0000
+breadth                               1        nan              nan
+breadth                              15        nan              nan
+breadth                              30        nan              nan
+breadth                               5        nan              nan
+breadth                              60        nan              nan
+breadth                             EOD        nan              nan
+breakout_strength                     1        nan              nan
+breakout_strength                    15        nan              nan
+breakout_strength                    30        nan              nan
+breakout_strength                     5        nan              nan
+breakout_strength                    60        nan              nan
+breakout_strength                   EOD        nan              nan
+close_location_value                  1        nan              nan
+close_location_value                 15        nan              nan
+close_location_value                 30        nan              nan
+close_location_value                  5        nan              nan
+close_location_value                 60        nan              nan
+close_location_value                EOD        nan              nan
+cross_sectional_dispersion            1        nan              nan
+cross_sectional_dispersion           15        nan              nan
+cross_sectional_dispersion           30        nan              nan
+cross_sectional_dispersion            5        nan              nan
+cross_sectional_dispersion           60        nan              nan
+cross_sectional_dispersion          EOD        nan              nan
+garman_klass_volatility               1        nan              nan
+garman_klass_volatility              15        nan              nan
+garman_klass_volatility              30        nan              nan
+garman_klass_volatility               5        nan              nan
+garman_klass_volatility              60        nan              nan
+garman_klass_volatility             EOD        nan              nan
+median_pairwise_correlation           1        nan              nan
+median_pairwise_correlation          15        nan              nan
+median_pairwise_correlation          30        nan              nan
+median_pairwise_correlation           5        nan              nan
+median_pairwise_correlation          60        nan              nan
+median_pairwise_correlation         EOD        nan              nan
+parkinson_volatility                  1        nan              nan
+parkinson_volatility                 15        nan              nan
+parkinson_volatility                 30        nan              nan
+parkinson_volatility                  5        nan              nan
+parkinson_volatility                 60        nan              nan
+parkinson_volatility                EOD        nan              nan
+rogers_satchell_volatility            1        nan              nan
+rogers_satchell_volatility           15        nan              nan
+rogers_satchell_volatility           30        nan              nan
+rogers_satchell_volatility            5        nan              nan
+rogers_satchell_volatility           60        nan              nan
+rogers_satchell_volatility          EOD        nan              nan
+signed_volume_proxy                   1        nan              nan
+signed_volume_proxy                  15        nan              nan
+signed_volume_proxy                  30        nan              nan
+signed_volume_proxy                   5        nan              nan
+signed_volume_proxy                  60        nan              nan
+signed_volume_proxy                 EOD        nan              nan
+variance_ratio                        1        nan              nan
+variance_ratio                       15        nan              nan
+variance_ratio                       30        nan              nan
+variance_ratio                        5        nan              nan
+variance_ratio                       60        nan              nan
+variance_ratio                      EOD        nan              nan
+volume_zscore                         1        nan              nan
+volume_zscore                        15        nan              nan
+volume_zscore                        30        nan              nan
+volume_zscore                         5        nan              nan
+volume_zscore                        60        nan              nan
+volume_zscore                       EOD        nan              nan
+
+EXCLUDED FROM THE TRIAL MATRIX (all-NaN / zero-variance) -- a RESULT, not a bug:
+  breadth (horizon=1): all-NaN (0 finite observations)
+  breadth (horizon=15): all-NaN (0 finite observations)
+  breadth (horizon=30): all-NaN (0 finite observations)
+  breadth (horizon=5): all-NaN (0 finite observations)
+  breadth (horizon=60): all-NaN (0 finite observations)
+  breadth (horizon=EOD): all-NaN (0 finite observations)
+  breakout_strength (horizon=1): all-NaN (0 finite observations)
+  breakout_strength (horizon=15): all-NaN (0 finite observations)
+  breakout_strength (horizon=30): all-NaN (0 finite observations)
+  breakout_strength (horizon=5): all-NaN (0 finite observations)
+  breakout_strength (horizon=60): all-NaN (0 finite observations)
+  breakout_strength (horizon=EOD): all-NaN (0 finite observations)
+  close_location_value (horizon=1): all-NaN (0 finite observations)
+  close_location_value (horizon=15): all-NaN (0 finite observations)
+  close_location_value (horizon=30): all-NaN (0 finite observations)
+  close_location_value (horizon=5): all-NaN (0 finite observations)
+  close_location_value (horizon=60): all-NaN (0 finite observations)
+  close_location_value (horizon=EOD): all-NaN (0 finite observations)
+  cross_sectional_dispersion (horizon=1): all-NaN (0 finite observations)
+  cross_sectional_dispersion (horizon=15): all-NaN (0 finite observations)
+  cross_sectional_dispersion (horizon=30): all-NaN (0 finite observations)
+  cross_sectional_dispersion (horizon=5): all-NaN (0 finite observations)
+  cross_sectional_dispersion (horizon=60): all-NaN (0 finite observations)
+  cross_sectional_dispersion (horizon=EOD): all-NaN (0 finite observations)
+  garman_klass_volatility (horizon=1): all-NaN (0 finite observations)
+  garman_klass_volatility (horizon=15): all-NaN (0 finite observations)
+  garman_klass_volatility (horizon=30): all-NaN (0 finite observations)
+  garman_klass_volatility (horizon=5): all-NaN (0 finite observations)
+  garman_klass_volatility (horizon=60): all-NaN (0 finite observations)
+  garman_klass_volatility (horizon=EOD): all-NaN (0 finite observations)
+  median_pairwise_correlation (horizon=1): all-NaN (0 finite observations)
+  median_pairwise_correlation (horizon=15): all-NaN (0 finite observations)
+  median_pairwise_correlation (horizon=30): all-NaN (0 finite observations)
+  median_pairwise_correlation (horizon=5): all-NaN (0 finite observations)
+  median_pairwise_correlation (horizon=60): all-NaN (0 finite observations)
+  median_pairwise_correlation (horizon=EOD): all-NaN (0 finite observations)
+  parkinson_volatility (horizon=1): all-NaN (0 finite observations)
+  parkinson_volatility (horizon=15): all-NaN (0 finite observations)
+  parkinson_volatility (horizon=30): all-NaN (0 finite observations)
+  parkinson_volatility (horizon=5): all-NaN (0 finite observations)
+  parkinson_volatility (horizon=60): all-NaN (0 finite observations)
+  parkinson_volatility (horizon=EOD): all-NaN (0 finite observations)
+  rogers_satchell_volatility (horizon=1): all-NaN (0 finite observations)
+  rogers_satchell_volatility (horizon=15): all-NaN (0 finite observations)
+  rogers_satchell_volatility (horizon=30): all-NaN (0 finite observations)
+  rogers_satchell_volatility (horizon=5): all-NaN (0 finite observations)
+  rogers_satchell_volatility (horizon=60): all-NaN (0 finite observations)
+  rogers_satchell_volatility (horizon=EOD): all-NaN (0 finite observations)
+  signed_volume_proxy (horizon=1): all-NaN (0 finite observations)
+  signed_volume_proxy (horizon=15): all-NaN (0 finite observations)
+  signed_volume_proxy (horizon=30): all-NaN (0 finite observations)
+  signed_volume_proxy (horizon=5): all-NaN (0 finite observations)
+  signed_volume_proxy (horizon=60): all-NaN (0 finite observations)
+  signed_volume_proxy (horizon=EOD): all-NaN (0 finite observations)
+  variance_ratio (horizon=1): all-NaN (0 finite observations)
+  variance_ratio (horizon=15): all-NaN (0 finite observations)
+  variance_ratio (horizon=30): all-NaN (0 finite observations)
+  variance_ratio (horizon=5): all-NaN (0 finite observations)
+  variance_ratio (horizon=60): all-NaN (0 finite observations)
+  variance_ratio (horizon=EOD): all-NaN (0 finite observations)
+  volume_zscore (horizon=1): all-NaN (0 finite observations)
+  volume_zscore (horizon=15): all-NaN (0 finite observations)
+  volume_zscore (horizon=30): all-NaN (0 finite observations)
+  volume_zscore (horizon=5): all-NaN (0 finite observations)
+  volume_zscore (horizon=60): all-NaN (0 finite observations)
+  volume_zscore (horizon=EOD): all-NaN (0 finite observations)
+
+FAILED TRIALS (raised -- a RESULT, not dropped, per E5/obligation 11):
+  sweep::rv_to_vix_ratio {"feature": "rv_to_vix_ratio", "horizon": 1}: ValueError: realized_vol_ann must be a 1-D array
+  sweep::rv_to_vix_ratio {"feature": "rv_to_vix_ratio", "horizon": 5}: ValueError: realized_vol_ann must be a 1-D array
+  sweep::rv_to_vix_ratio {"feature": "rv_to_vix_ratio", "horizon": 15}: ValueError: realized_vol_ann must be a 1-D array
+  sweep::rv_to_vix_ratio {"feature": "rv_to_vix_ratio", "horizon": 30}: ValueError: realized_vol_ann must be a 1-D array
+  sweep::rv_to_vix_ratio {"feature": "rv_to_vix_ratio", "horizon": 60}: ValueError: realized_vol_ann must be a 1-D array
+  sweep::rv_to_vix_ratio {"feature": "rv_to_vix_ratio", "horizon": "EOD"}: ValueError: realized_vol_ann must be a 1-D array
+MERGE EXIT 0
