@@ -87,3 +87,70 @@ Dual independent suites per rule 1, from this spec alone.
    inputs — the anti-overstatement test.
 10. Promotion is evaluated on the recent window; a fixture where pooled passes and recent fails
     yields NO promotion.
+
+---
+
+## AMENDMENT 1 (2026-08-23) — five spec defects, found by two independent readings
+
+Both dual suites were written from this spec alone and each found defects the other did not. That
+is the mechanism working as designed; all five are mine.
+
+### D1. The scheme signature cannot express what obligation 2 demands (suite A)
+
+Line 34 declares every scheme a pure function `(signal, sigma, corr, mask) -> weights`. A bare
+array return **cannot report whether a clip bound**, which obligation 2 requires. A silently-void
+volatility target is the exact defect Phase A4 was written to prevent, so this cannot be dropped.
+
+FIX: schemes stay pure, and a shared `apply_weight_scheme(...) -> SchemeResult` wrapper carries
+`weights` plus `clip_binding: bool` and `gross_before_clip`. The obligation attaches to the wrapper.
+
+### D2. One `mask` argument conflates `present` and `tradable` — MY SPEC VIOLATES RULE 7 (suite A)
+
+Rule 7 states these are distinct concepts that must never be merged, and line 34 merges them into a
+single `mask`. Obligation 3 (no weight leaks to a present-but-not-tradable name) is unsatisfiable
+against a signature that cannot tell the two apart.
+
+FIX: the signature takes `present` and `tradable` as SEPARATE arrays. Weights may be non-zero only
+where `tradable`; `present` is for coverage bookkeeping. That the spec author broke rule 7 while
+writing a spec is the strongest argument available for why implementers do not get to resolve spec
+ambiguities silently.
+
+### D3. "the declared gross" is not a parameter (suite A)
+
+Line 34 requires weights "summing to the declared gross", but no gross appears in the signature.
+FIX: add an explicit `gross: float` parameter. A scheme cannot honour a target it is not given.
+
+### D4. `corr` is a SCALAR per row at its named source, but risk-parity needs a MATRIX (suite B)
+
+Line 44 names `median_pairwise_correlation` as the `corr` source. Verified: it returns shape
+`(n_rows,)` — one median correlation per row, NOT an (n_symbols, n_symbols) matrix. `risk_parity`
+and `covariance_aware` need the matrix.
+
+FIX: `corr` is an (n_symbols, n_symbols) causal estimate. `median_pairwise_correlation` is a
+SUMMARY DIAGNOSTIC, not the input — it may parameterise an equicorrelation matrix
+(`rho` off-diagonal, 1 on the diagonal) as the shrinkage target, and that is the only legitimate
+use of it here. Name the estimator explicitly; do not leave the seam to the implementer.
+
+### D5. Obligation 6 asserts an exact equivalence for an undefined formula (suite A)
+
+Obligation 6 requires `covariance_aware` to degenerate exactly to a known case, but the spec never
+defines its general formula. Only the boundary case is testable.
+FIX: define the estimator (EWMA covariance, diagonal-plus-shrinkage, causal), or restrict
+obligation 6 to the boundary case. Do not leave an exact-equivalence obligation against an
+undefined function — that is unimplementable-by-construction, like the bit-exactness demand in
+`specs/feature_layer.md` obligation 1.
+
+---
+
+## AMENDMENT 2 — the registry defect is TOTAL, not per-split
+
+`run_tilt` sets `config_hash = contract.contract_hash` (`tilt.py:636`), binding no `TiltConfig`
+field, AND hard-codes `split_id="full"` (`tilt.py:646`). With `UNIQUE(config_hash, split_id)` and
+`INSERT OR IGNORE`, **every tilt run collides with every other tilt run.** Only ONE tilt row can
+ever exist. Suite A reproduced it live: 4 distinct configs recorded, `assert 1 == 4` — 3 silently
+dropped; both hashes printed identically as `5800f1bb96347dea`, which matches my own probe.
+
+This must be fixed BEFORE any Phase G comparison runs. A seven-scheme sweep would record one row,
+understating the trial count that feeds `effective_n_trials` into the deflated Sharpe and PBO, and
+making the multiple-testing correction too PERMISSIVE — manufacturing exactly the spurious winner
+obligation 9 exists to prevent. Obligation 9 cannot be satisfied while this holds.
