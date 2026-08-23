@@ -8,7 +8,7 @@ This program found three things:
 
 1. **Four hypotheses are killed** (H1, H3, H4, H5) by cost hurdles, magnitude, or wrong sign.
 2. **One hypothesis is real** (H2, overnight cross-sectional reversal): -24.30 bps, t = -16.66, 8 of 8 years sign-stable. Its initial kill has collapsed under measurement. Two original kill reasons failed when tested rigorously: a hardcoded capacity clip was an artifact (clears at higher notional), and a concentration threshold was hand-chosen (sits at 27th percentile of a measured null, does not fire at its designed threshold).
-3. **A candidate exists** (long-only index-relative tilt using H2's signal, weight smoothing a=0.10): net-positive in all eight years pooled and in 2024-2025 individually, ~5.8% annualised net excess. Four unverified conditions gate confirmation: recent-window significance, boundary plateau check, liquidity decomposition, and out-of-sample holdout.
+3. **A candidate exists** (long-only index-relative tilt using H2's signal, weight smoothing a=0.10): net-positive in all eight years pooled and in 2024-2025 individually, ~5.8% annualised net excess. Of the four gating conditions, **1 is cleared** (boundary plateau check), **1 is partial** (recent-window significance), and **2 are NOT RUN** (liquidity decomposition, out-of-sample holdout).
 
 What is NOT established: that the candidate survives recent-window power testing, solves the concentration problem in the least-liquid decile, or confirms on unseen data.
 
@@ -117,15 +117,19 @@ The single construction net-positive in both 2024 and 2025, across all four (til
 
 Mild/full is net-positive in all eight years: 3.14, 1.65, 3.11, 2.14, 2.34, 2.56, 1.92, 0.84 bps/day. It survives on the continuous-coverage universe, so it is not purely a newly-listed-names artifact. No construction in this program has cleared costs in every measured year before.
 
-### Why This Is Not Yet a Result -- The Three Remaining Unverified Conditions
+### Why This Is Not Yet a Result -- Scorecard: 2 Cleared (1 with a vacuous half), 1 Partial, 1 NOT RUN
 
-State these prominently because they gate the finding:
+State these prominently because they gate the finding. Do not read "NOT RUN" as anything softer than it says: that check has not been executed.
 
-1. **Recent-window significance test HAS been run and result is PARTIAL.** On 2024-01-01..2025-07-31 alone (n=389 sessions, NET series), only mild/full-universe a=0.10 clears: +1.51 bps/day, se=0.55, t=2.75, p=0.0063. This survives Bonferroni at 4 comparisons (0.0125 threshold) but is 1 of 4 related constructions and depends on recently-listed names: continuous-coverage (like-for-like universe excluding the 18 names which IPO'd inside the window) does NOT clear at p=0.077. The plateau check PASSED: turnover glides smoothly from ~0.30 to ~0.011 across a in {0.20...0.01} with no discontinuity, and a=0.10 is not an isolated peak. Every a=1.0 control is decisively NEGATIVE in the same window (-6.44 to -10.82 bps/day, all p<0.002), confirming smoothing does something real relative to daily rebalancing. The construction is not a confirmed recent-window edge but is not ruled out either; its significance is universe-dependent and recently-listed-names-dependent.
+1. **Boundary plateau check -- PASSED.** Turnover glides smoothly from ~0.30 to ~0.011 across a in {0.20...0.01} with no discontinuity, and a=0.10 is not an isolated peak. Every a=1.0 control is decisively NEGATIVE in the same window (-6.44 to -10.82 bps/day, all p<0.002), confirming smoothing does something real relative to daily rebalancing.
 
-2. **No liquidity decomposition has been run on the low-turnover book.** H2's overnight reversal edge concentrates in the least-liquid decile. If this construction inherits that, it is not investable at the sizes tested.
+2. **Recent-window significance test -- PARTIAL.** On 2024-01-01..2025-07-31 alone (n=389 sessions, NET series), only mild/full-universe a=0.10 clears: +1.51 bps/day, se=0.55, t=2.75, p=0.0063. This survives Bonferroni at 4 comparisons (0.0125 threshold) but is 1 of 4 related constructions and depends on recently-listed names: continuous-coverage (like-for-like universe excluding the 18 names which IPO'd inside the window) does NOT clear at p=0.077. The construction is not a confirmed recent-window edge but is not ruled out either; its significance is universe-dependent and recently-listed-names-dependent.
 
-3. **The holdout (last 12 months) remains locked and unread.** No out-of-sample verification on withheld data.
+   **Newey-West update (measured 2026-08-21):** the tilt's daily excess returns are NOT autocorrelated (lag-1 -0.010, lag-2 -0.115), so the iid standard errors above were CONSERVATIVE. Newey-West (Bartlett kernel, L=5, n=389) raises full-universe t from 2.75 to 3.20, and continuous-coverage t from 1.77 to 2.0009. **Caveat, stated prominently:** t=2.0009 against a 1.96 threshold is razor-thin (p~0.046). A verdict that flips on the choice of standard-error estimator is FRAGILE, not established, and the 1-of-4-related-constructions multiple-testing concern above is unchanged by this recomputation.
+
+3. **Liquidity decomposition -- MEASURED; liquidity leg PASSES, time-of-day leg NOT EVALUABLE.** Concentration ratio 2.7596 against the measured 4.8695 threshold (~62nd percentile of the permutation null); all ten deciles populated, sign-consistent and individually significant. The book's realised excess is positive in every decile, but the bottom two deciles supply 33.0% of it against a 20% even-spread expectation -- a real lean toward less-liquid names that no measured null currently adjudicates. The time-of-day half of the criterion is structurally vacuous on the checkpoint geometry and is NOT claimed as cleared. Full tables and method: "Liquidity Decomposition of the Tilt -- Criterion 4, Measured" below; reproduce with `scripts/recon_tilt_liquidity_decomposition.py`.
+
+4. **Out-of-sample holdout -- NOT RUN.** The holdout window (last 12 months) has not been read. Note what "locked" means here: `HoldoutLock.record_read()` (`src/nifty_quant/research/splits.py`) appends a log entry and increments a counter -- it never inspects the count and never raises. The only consumer of `read_count()` in the repository is `cli.py:1432`, which prints it. Nothing in code prevents a second read; what prevents it is the `--allow-holdout` flag plus human discipline, not a technical lock.
 
 **The degenerate corner, recorded honestly:** Hysteresis b=1.00 on the aggressive tilt collapses turnover to ~0.0005-0.0086/day (a buy-once-never-trade book whose few-name concentration makes the no-trade threshold enormous relative to any weight change). Its positive recent numbers reflect almost no rebalancing over 7.5 years and must not be read as validating the hysteresis mechanism.
 
@@ -163,7 +167,23 @@ H2 at -24.30 bps passes the Rs 1L gate (16.53 bps) and the concentration thresho
 
 ### Still Open (Unverified Conditions on the Low-Turnover Candidate)
 
-The low-turnover variant (weight smoothing, a=0.10) passes the pooled test and survives 2024-2025 in every combination, but four specific conditions remain unverified (listed above in the Candidate section).
+The low-turnover variant (weight smoothing, a=0.10) passes the pooled test and survives 2024-2025 in every combination. Of the four gating conditions: boundary plateau is cleared; recent-window significance is partial; the liquidity decomposition is now measured and its liquidity leg PASSES (its time-of-day leg is not evaluable, and the illiquid-tail lean in section B is unadjudicated); the holdout remains NOT RUN. See the scorecard in the Candidate section above.
+
+---
+
+## Phase E -- Conditional-Analysis Sweep
+
+Run 2026-08-21 (`results/PHASE_E_SWEEP.md`). Panel 2018-01-01..2025-07-31, all_equity (149 symbols), 701,863 bars, 1,880 sessions, `holdout_intent="never"` (window ends two weeks before the holdout boundary).
+
+**No new edge found.** `effective_n_trials` = 19.2969 of 132 planned (the registry is correlated by construction, so 132 trials were ~19 independent looks). PBO (CSCV) = 0.0267. Every deflated Sharpe is 0.0000. Best raw pre-cost Sharpe in the sweep is `vol_ratio` at horizon h=1, +0.0349, decaying monotonically with horizon -- the signature of noise, not signal.
+
+**Only 10 of 22 features were genuinely measured; carry this caveat with any conclusion drawn from the sweep:**
+
+- **7 features were fed degenerate proxies and never actually tested** (`volume_zscore`, `signed_volume_proxy`, `breakout_strength`, `parkinson_volatility`, `garman_klass_volatility`, `rogers_satchell_volatility`, `close_location_value`). `run_sweep`'s pinned signature takes only `close` + `day_offsets`, so the registry synthesised `volume = ones_like(close)` and `high = low = open = close`, degenerating each of these to all-NaN or zero-variance. These are not null results -- they were not tested.
+- **4 features are market-level scalars or per-symbol-static values, structurally unsuited to cross-sectional ranking** (`breadth`, `cross_sectional_dispersion`, `median_pairwise_correlation`, `variance_ratio`). A value identical across symbols at each bar produces no dispersion and no spread -- a legitimate finding about the harness, not the signal.
+- **1 feature raised on all 6 horizons**: `rv_to_vix_ratio` (`ValueError: realized_vol_ann must be a 1-D array`), recorded as a failed trial.
+
+**Consequence for Phase F:** `specs/volume_breakout_v2.md` designed v2 around 4 components. Two now have measured, discouraging verdicts (`hurst_on_stitched` +0.0118, no monotone response; `beta_residual_return` -0.1066, worst in the sweep). The other two (`breakout_strength`, `volume_zscore`) fall in the degenerate-proxy category above and remain unmeasured; Phase F cannot proceed on them until the OHLCV plumbing is fixed.
 
 ---
 
@@ -227,7 +247,7 @@ We set out to beat the Nifty-100 index on a yearly basis using 1-minute intraday
 
 **One is real but incomplete** (H2, overnight cross-sectional reversal): -24.30 bps, t = -16.66, 8 of 8 years sign-stable, 63+ tests from multiple independent authors. It passes costs and concentration thresholds but is capacity-limited by recent-year decay (2024 -10.98 bps, 2025 -9.62 bps, both below Rs 1L hurdle at 16.53 bps). Its verdict is INCOMPLETE, not KILLED: criteria 5 and 6 (recent-window power, out-of-sample confirmation) remain NOT_EVALUATED. Recent performance is substantially carried by newly-listed names (2024: -10.98 bps full universe vs -3.04 bps continuous-coverage).
 
-**One is a candidate** (long-only index-relative tilt using H2's signal, weight smoothing a=0.10): net-positive in all eight measured years pooled, and specifically in 2024-2025, at ~5.8% annualised net excess (mild/full combination: 2.29 bps/day pooled, +1.92 bps/day in 2024, +0.84 bps/day in 2025). Four unverified conditions gate confirmation: (1) no short-window significance test on 2024-2025; (2) a=0.10 is the grid boundary; (3) no liquidity decomposition on the low-turnover book; (4) the out-of-sample holdout remains locked. The candidate is driveable via `nq tilt`.
+**One is a candidate** (long-only index-relative tilt using H2's signal, weight smoothing a=0.10): net-positive in all eight measured years pooled, and specifically in 2024-2025, at ~5.8% annualised net excess (mild/full combination: 2.29 bps/day pooled, +1.92 bps/day in 2024, +0.84 bps/day in 2025). Of the four gating conditions: (1) the boundary plateau check PASSED -- a=0.10 is not an isolated grid-edge artifact; (2) the recent-window significance test is PARTIAL -- full-universe clears (t=2.75, p=0.0063; Newey-West 3.20), continuous-coverage does not at the iid SE (p=0.077) and is razor-thin under Newey-West (t=2.0009, p~0.046); (3) the liquidity decomposition is now MEASURED -- concentration ratio 2.7596 vs the measured 4.8695 threshold, so the liquidity leg PASSES, though the time-of-day leg is structurally not evaluable and the bottom two liquidity deciles supply 33.0% of the realised excess against a 20% even-spread expectation; (4) the out-of-sample holdout is NOT RUN -- unread, and not technically prevented from being read (the lock records reads, it does not block them; see the scorecard above). The candidate is driveable via `nq tilt`.
 
 The methodological output remains valuable regardless:
 
@@ -236,4 +256,132 @@ The methodological output remains valuable regardless:
 3. **Explicit lookahead audit.** Deliberate side-by-side comparison of leaky vs. correct timings.
 4. **Recent years as ground truth.** Pooled statistics on this dataset overstate tradability.
 
-All code, test suites, and reconstruction scripts are committed to the repository and reproducible on demand. The four pending conditions listed above are the next open questions.
+All code, test suites, and reconstruction scripts are committed to the repository and reproducible on demand. Of the tilt's four gating conditions, two are cleared (one of them with a vacuous time-of-day half), one is partial, and one -- the holdout -- remains NOT RUN. That is the next open question.
+
+---
+
+## Liquidity Decomposition of the Tilt -- Criterion 4, Measured
+
+Scorecard item 3 ("Liquidity decomposition -- NOT RUN") is now run. Reproduce every number
+below with:
+
+```
+NQ_CACHE_ROOT=<scratch> .venv/bin/python scripts/recon_tilt_liquidity_decomposition.py
+```
+
+Window 2018-01-01..2025-07-31 (research period only), `all_equity` 149 symbols, 1868
+checkpoint sessions, seed 0, horizon 1, mild tilt, a=0.10. The `HoldoutLock` read count was
+7 before the run and 7 after: the holdout was not touched.
+
+**Path note, and it matters.** `research/tilt.py` imports `build_overnight_feature` from
+H2 -- the tilt is a long-only index-relative weighting of H2's overnight-reversal signal.
+The correct criterion-4 geometry is therefore H2's: the two-rows-per-session checkpoint
+panel (09:16 entry / 15:20 exit) with `horizon=1`, not the raw 1-minute panel. This is the
+geometry `lens.CONCENTRATION_RATIO_THRESHOLD = 4.8695` was calibrated on; the earlier
+5.5484 came from the raw minute panel with an expanding-mean liquidity proxy and was too
+permissive.
+
+### A. Lens criterion 4 -- signal spread by liquidity decile (decile 0 = LEAST liquid)
+
+Per decile, the cross-sectional 5-bucket expectancy spread (top quintile minus bottom
+quintile) of the next session's return. This is the quantity `Lens.verdict()` gates on.
+
+| decile | spread (bps) | t | rows | observations |
+|---|---|---|---|---|
+| 0 (least liquid) | -47.6493 | -11.4453 | 1867 | 26,690 |
+| 1 | -33.3115 | -7.7567 | 1867 | 25,366 |
+| 2 | -25.4835 | -6.0861 | 1867 | 26,088 |
+| 3 | -22.8008 | -5.5177 | 1867 | 25,699 |
+| 4 | -13.1114 | -3.1782 | 1867 | 25,465 |
+| 5 | -10.3371 | -2.4258 | 1867 | 26,279 |
+| 6 | -17.2667 | -3.9301 | 1867 | 25,831 |
+| 7 | -11.6343 | -2.6036 | 1867 | 25,564 |
+| 8 | -16.9234 | -3.7639 | 1867 | 25,636 |
+| 9 (most liquid) | -15.9510 | -3.0323 | 1867 | 26,910 |
+
+No decile is thin: all ten carry 1867 defined session-rows and 25k-27k symbol-observations.
+Every decile has the same (negative, i.e. reversal) sign and every one is individually
+significant at |t| > 2.4.
+
+**Concentration statistic:** max |spread| = 47.6493 (decile 0), median |spread| = 17.2667,
+**ratio = 2.7596** against the measured threshold **4.8695** -- the 95th percentile of a
+300-replicate within-session permutation null (seed 42, measured on this same checkpoint
+path; derivation at `research/lens.py:26-56`, where the bottom-is-argmax rate under the
+null is 10.7%). 2.7596 sits at roughly the 62nd percentile of that null.
+
+**Liquidity leg: PASS.** The bottom decile is the strongest single decile, but not by a
+margin that a permutation null would find surprising.
+
+*Control, and a caveat about what this does and does not establish.* 2.7596 is exactly the
+figure `lens.py` records for H2 on this path -- which is the point: the tilt's signal IS
+H2's signal, so this measurement confirms the script runs on the true production code path,
+and equally means section A is a statement about the SIGNAL, not about the tilt's long-only
+weighting. That is why section B was measured too.
+
+### A2. Time-of-day leg -- NOT EVALUABLE on this geometry
+
+| bucket | spread (bps) | t | rows |
+|---|---|---|---|
+| open (09:15-10:30) | -24.3049 | -16.6575 | 1868 |
+| close (14:00-15:30) | 0.0000 | 0.0000 | 0 |
+
+On the two-row checkpoint panel the EXIT row's `horizon=1` forward return runs off the
+session end and is NaN by construction, so only the entry-time bucket can ever carry a
+defined edge. The time-of-day half of criterion 4 is therefore **structurally vacuous**
+here: it cannot fail, and its PASS must not be read as evidence the edge is spread across
+the session. State it as NOT EVALUABLE, not as cleared.
+
+### B. Where the realised rupees actually came from
+
+Section A measures the signal's bucket spread. The tilt is long-only and index-relative, so
+its P&L is not that spread. Section B splits the book's realised gross excess by the SAME
+prior-ADV deciles, as an exact identity:
+
+`contribution_d = 1e4 * sum_{j in decile d} (w_book - w_benchmark) * r`, with
+`w_benchmark = valid / n_valid`. The ten rows sum to the session's gross excess in bps; the
+script asserts the identity and measured a gap of exactly 0.0.
+
+| decile | contribution (bps/session) | share of gross | mean book wt | mean bench wt | names/session |
+|---|---|---|---|---|---|
+| 0 (least liquid) | 0.5691 | 17.8% | 0.1006 | 0.1028 | 14.4 |
+| 1 | 0.4848 | 15.2% | 0.0929 | 0.0978 | 13.7 |
+| 2 | 0.3491 | 10.9% | 0.0976 | 0.1005 | 14.1 |
+| 3 | 0.3431 | 10.7% | 0.0981 | 0.0990 | 13.8 |
+| 4 | 0.2262 | 7.1% | 0.0974 | 0.0981 | 13.7 |
+| 5 | 0.2450 | 7.7% | 0.1010 | 0.1013 | 14.2 |
+| 6 | 0.3195 | 10.0% | 0.1000 | 0.0995 | 13.9 |
+| 7 | 0.1630 | 5.1% | 0.1003 | 0.0985 | 13.8 |
+| 8 | 0.2975 | 9.3% | 0.0992 | 0.0988 | 13.8 |
+| 9 (most liquid) | 0.2011 | 6.3% | 0.1080 | 0.1037 | 14.5 |
+| **total** | **3.1984** | 100% | | | |
+
+(1856 sessions; total matches the simulation's mean gross excess of 3.1984 bps exactly.)
+
+**Read this against the candidate, not for it.** Every decile contributes positively -- the
+edge is not a single-decile artifact, and the book is not overweight the illiquid tail
+(book weight 0.1006 vs benchmark 0.1028 in decile 0; the tilt is if anything slightly
+UNDERweight there). But the contribution profile is not flat: the bottom two deciles supply
+**33.0%** of the gross excess against a 20% even-spread expectation, the bottom three supply
+43.9%, and the top three supply 20.7%. The realised edge does lean toward the less-liquid
+half of the universe.
+
+**No verdict is attached to that lean, deliberately.** There is no measured null for "what
+share of a long-only index-relative book's excess should the bottom two deciles supply under
+the null", and rule 8 forbids inventing one. 33% vs 20% is reported as a number, not
+adjudicated as a threshold breach. `scripts/recon_tilt_liquidity.py` already carries the
+complementary robustness evidence (the exclusion ladder: does the edge survive dropping the
+illiquid tail), which is the right way to settle this question without a fabricated cutoff.
+
+### Criterion 4 verdict
+
+**PASS on the liquidity leg** (ratio 2.7596 vs measured threshold 4.8695, ~62nd percentile
+of the null; all ten deciles populated, sign-consistent and individually significant).
+**NOT EVALUABLE on the time-of-day leg** -- the checkpoint geometry admits only one bucket
+with a defined forward return, so that half of the criterion is vacuous and is not claimed
+as cleared.
+
+Two caveats stand with the PASS: (1) section A measures the tilt's SIGNAL, which is H2's
+signal, so it inherits H2's already-published concentration result rather than testing the
+tilt construction independently; section B is the construction-specific measurement, and
+(2) section B shows a real lean toward less-liquid names (33.0% of excess from the bottom
+20% of the universe) that no measured null currently adjudicates.
