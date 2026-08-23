@@ -127,7 +127,7 @@ State these prominently because they gate the finding. Do not read "NOT RUN" as 
 
    **Newey-West update (measured 2026-08-21):** the tilt's daily excess returns are NOT autocorrelated (lag-1 -0.010, lag-2 -0.115), so the iid standard errors above were CONSERVATIVE. Newey-West (Bartlett kernel, L=5, n=389) raises full-universe t from 2.75 to 3.20, and continuous-coverage t from 1.77 to 2.0009. **Caveat, stated prominently:** t=2.0009 against a 1.96 threshold is razor-thin (p~0.046). A verdict that flips on the choice of standard-error estimator is FRAGILE, not established, and the 1-of-4-related-constructions multiple-testing concern above is unchanged by this recomputation.
 
-3. **Liquidity decomposition -- MEASURED; liquidity leg PASSES, time-of-day leg NOT EVALUABLE.** Concentration ratio 2.7596 against the measured 4.8695 threshold (~62nd percentile of the permutation null); all ten deciles populated, sign-consistent and individually significant. The book's realised excess is positive in every decile, but the bottom two deciles supply 33.0% of it against a 20% even-spread expectation -- a real lean toward less-liquid names that no measured null currently adjudicates. The time-of-day half of the criterion is structurally vacuous on the checkpoint geometry and is NOT claimed as cleared. Full tables and method: "Liquidity Decomposition of the Tilt -- Criterion 4, Measured" below; reproduce with `scripts/recon_tilt_liquidity_decomposition.py`.
+3. **Liquidity decomposition -- MEASURED; liquidity leg PASSES, time-of-day leg NOT EVALUABLE.** Concentration ratio 2.7596 against the measured 4.8695 threshold (~62nd percentile of the permutation null); all ten deciles populated, sign-consistent and individually significant. The book's realised excess is positive in every decile, but the bottom two deciles supply 32.95% of it against a MEASURED p95 of 23.82% (10,000 within-session label permutations, seed 42) -- above every replicate drawn, 5.75 null standard deviations out. The lean toward less-liquid names is real and now adjudicated: the illiquid-tail leg FIRES even though the signal-spread leg passes. The time-of-day half of the criterion is structurally vacuous on the checkpoint geometry and is NOT claimed as cleared. Full tables and method: "Liquidity Decomposition of the Tilt -- Criterion 4, Measured" below; reproduce with `scripts/recon_tilt_liquidity_decomposition.py`.
 
 4. **Out-of-sample holdout -- NOT RUN.** The holdout window (last 12 months) has not been read. Note what "locked" means here: `HoldoutLock.record_read()` (`src/nifty_quant/research/splits.py`) appends a log entry and increments a counter -- it never inspects the count and never raises. The only consumer of `read_count()` in the repository is `cli.py:1432`, which prints it. Nothing in code prevents a second read; what prevents it is the `--allow-holdout` flag plus human discipline, not a technical lock.
 
@@ -167,7 +167,7 @@ H2 at -24.30 bps passes the Rs 1L gate (16.53 bps) and the concentration thresho
 
 ### Still Open (Unverified Conditions on the Low-Turnover Candidate)
 
-The low-turnover variant (weight smoothing, a=0.10) passes the pooled test and survives 2024-2025 in every combination. Of the four gating conditions: boundary plateau is cleared; recent-window significance is partial; the liquidity decomposition is now measured and its liquidity leg PASSES (its time-of-day leg is not evaluable, and the illiquid-tail lean in section B is unadjudicated); the holdout remains NOT RUN. See the scorecard in the Candidate section above.
+The low-turnover variant (weight smoothing, a=0.10) passes the pooled test and survives 2024-2025 in every combination. Of the four gating conditions: boundary plateau is cleared; recent-window significance is partial; the liquidity decomposition is now measured and its signal-spread leg PASSES, but its book-attribution leg FIRES against a measured null (bottom two ADV deciles supply 32.95% of realised excess vs p95 23.82%), and its time-of-day leg is not evaluable; the holdout remains NOT RUN. See the scorecard in the Candidate section above.
 
 ---
 
@@ -247,7 +247,7 @@ We set out to beat the Nifty-100 index on a yearly basis using 1-minute intraday
 
 **One is real but incomplete** (H2, overnight cross-sectional reversal): -24.30 bps, t = -16.66, 8 of 8 years sign-stable, 63+ tests from multiple independent authors. It passes costs and concentration thresholds but is capacity-limited by recent-year decay (2024 -10.98 bps, 2025 -9.62 bps, both below Rs 1L hurdle at 16.53 bps). Its verdict is INCOMPLETE, not KILLED: criteria 5 and 6 (recent-window power, out-of-sample confirmation) remain NOT_EVALUATED. Recent performance is substantially carried by newly-listed names (2024: -10.98 bps full universe vs -3.04 bps continuous-coverage).
 
-**One is a candidate** (long-only index-relative tilt using H2's signal, weight smoothing a=0.10): net-positive in all eight measured years pooled, and specifically in 2024-2025, at ~5.8% annualised net excess (mild/full combination: 2.29 bps/day pooled, +1.92 bps/day in 2024, +0.84 bps/day in 2025). Of the four gating conditions: (1) the boundary plateau check PASSED -- a=0.10 is not an isolated grid-edge artifact; (2) the recent-window significance test is PARTIAL -- full-universe clears (t=2.75, p=0.0063; Newey-West 3.20), continuous-coverage does not at the iid SE (p=0.077) and is razor-thin under Newey-West (t=2.0009, p~0.046); (3) the liquidity decomposition is now MEASURED -- concentration ratio 2.7596 vs the measured 4.8695 threshold, so the liquidity leg PASSES, though the time-of-day leg is structurally not evaluable and the bottom two liquidity deciles supply 33.0% of the realised excess against a 20% even-spread expectation; (4) the out-of-sample holdout is NOT RUN -- unread, and not technically prevented from being read (the lock records reads, it does not block them; see the scorecard above). The candidate is driveable via `nq tilt`.
+**One is a candidate** (long-only index-relative tilt using H2's signal, weight smoothing a=0.10): net-positive in all eight measured years pooled, and specifically in 2024-2025, at ~5.8% annualised net excess (mild/full combination: 2.29 bps/day pooled, +1.92 bps/day in 2024, +0.84 bps/day in 2025). Of the four gating conditions: (1) the boundary plateau check PASSED -- a=0.10 is not an isolated grid-edge artifact; (2) the recent-window significance test is PARTIAL -- full-universe clears (t=2.75, p=0.0063; Newey-West 3.20), continuous-coverage does not at the iid SE (p=0.077) and is razor-thin under Newey-West (t=2.0009, p~0.046); (3) the liquidity decomposition is now MEASURED and SPLITS -- the signal-spread leg PASSES (concentration ratio 2.7596 vs the measured 4.8695 threshold), the time-of-day leg is structurally not evaluable, and the book-attribution leg FIRES: the bottom two liquidity deciles supply 32.95% of the realised gross excess against a measured p95 of 23.82% (10,000 within-session label permutations, seed 42; above all 10,000 replicates, 5.75 null sd); (4) the out-of-sample holdout is NOT RUN -- unread, and not technically prevented from being read (the lock records reads, it does not block them; see the scorecard above). The candidate is driveable via `nq tilt`.
 
 The methodological output remains valuable regardless:
 
@@ -361,16 +361,86 @@ script asserts the identity and measured a gap of exactly 0.0.
 edge is not a single-decile artifact, and the book is not overweight the illiquid tail
 (book weight 0.1006 vs benchmark 0.1028 in decile 0; the tilt is if anything slightly
 UNDERweight there). But the contribution profile is not flat: the bottom two deciles supply
-**33.0%** of the gross excess against a 20% even-spread expectation, the bottom three supply
-43.9%, and the top three supply 20.7%. The realised edge does lean toward the less-liquid
-half of the universe.
+**32.95%** of the gross excess against a 20% even-spread expectation, the bottom three supply
+43.86%, and the top three supply 20.7%. The realised edge does lean toward the less-liquid
+half of the universe -- and section C measures a null for that lean rather than leaving the
+20% figure to stand as an intuition.
 
-**No verdict is attached to that lean, deliberately.** There is no measured null for "what
-share of a long-only index-relative book's excess should the bottom two deciles supply under
-the null", and rule 8 forbids inventing one. 33% vs 20% is reported as a number, not
-adjudicated as a threshold breach. `scripts/recon_tilt_liquidity.py` already carries the
-complementary robustness evidence (the exclusion ladder: does the edge survive dropping the
-illiquid tail), which is the right way to settle this question without a fabricated cutoff.
+### C. Measured null for the bottom-k share -- the lean is real
+
+The 20% even-spread figure above is an intuition, not a measurement, and gross-excess
+contribution is not obliged to be uniform across deciles even when liquidity is irrelevant:
+it depends on how many names and how much weight sit in each decile and on return
+dispersion, all of which vary systematically with liquidity. So the share was measured
+against a null rather than read against a round number.
+
+**Construction.** The same within-session permutation that calibrated 4.8695
+(`lens.py:24-50`): one column permutation per session, applied identically to every row of
+that session. The book's attribution has exactly one row per session, and it is the
+**liquidity decile label** that is permuted across symbols -- every symbol keeps its own
+realised active weight, its own return and therefore its own realised contribution, and only
+its liquidity rank is scrambled. Because a permutation is a bijection on the columns, the
+book's total gross excess, every decile's size and the unlabelled residual are invariant, so
+the share is well defined on every replicate. n = 10,000 replicates, seed 42, measured on
+exactly the arrays section B attributes -- not on a convenient stand-in, which is the
+geometry error that produced 5.5484.
+
+Share of gross excess supplied by the bottom k ADV deciles, in %:
+
+| k | observed | even spread | p50 | p75 | p90 | p95 | p99 | null max | null sd | (obs - p50)/sd | replicates >= observed |
+|---|---|---|---|---|---|---|---|---|---|---|---|
+| 1 | 17.7939 | 10 | 10.3399 | 11.4874 | 12.5299 | **13.1044** | 14.2547 | 16.6738 | 1.7084 | 4.36 | 0 / 10,000 |
+| 2 | 32.9505 | 20 | 20.1018 | 21.6246 | 22.9740 | **23.8221** | 25.2949 | 28.2646 | 2.2354 | 5.75 | 0 / 10,000 |
+| 3 | 43.8640 | 30 | 30.2160 | 31.8639 | 33.3575 | **34.2157** | 35.9981 | 39.2505 | 2.5127 | 5.43 | 0 / 10,000 |
+
+p95 is the repo's existing convention for turning a measured null into a cutoff
+(`CONCENTRATION_RATIO_THRESHOLD = 4.8695` is the p95 entry of its own grid). The three
+cutoffs are recorded as `BOTTOM_K_SHARE_THRESHOLDS` in
+`scripts/recon_tilt_liquidity_decomposition.py` with the derivation beside them, and the
+script re-measures the null on every run and refuses to finish if they do not reproduce.
+
+**The prior worry did not materialise.** The null centres on the even-spread value --
+p50 of 10.34 / 20.10 / 30.22 against 10 / 20 / 30. What the flat-20% intuition was missing
+was not its centre but its *width*: a standard deviation of 2.24 percentage points at k=2,
+so anything up to ~23.8% would have been unremarkable. 32.95% is not.
+
+**Verdict: the bottom-2 share FIRES.** The observed 32.95% sits above p99, above the
+**maximum of all 10,000 replicates** (empirical p < 1e-4), at 5.75 null standard deviations.
+k=1 and k=3 fire by the same margin (4.36 and 5.43 sd, both with zero replicates at or above
+the observed value). A tradability-stratified variant of the permutation -- exchanging
+columns only within {labelled, tradable} and {labelled, not tradable}, which additionally
+holds each decile's tradable-name count fixed -- gives p95 of 13.0661 / 23.8054 / 34.1893,
+indistinguishable from the unconditional null. The conclusion does not rest on how the
+permutation treats non-tradable names.
+
+**Mechanism (descriptive; no threshold reads it).** A decile's contribution can be large
+because the book deviates more there or because returns disperse more there, and the two
+have different remedies. Neither is operating here:
+
+| decile | mean abs(active weight) | sd(return), bps | names/session |
+|---|---|---|---|
+| 0 (least liquid) | 0.002352 | 200.96 | 14.4 |
+| 1 | 0.002255 | 207.47 | 13.7 |
+| 2 | 0.002121 | 201.57 | 14.1 |
+| 5 | 0.002194 | 206.08 | 14.2 |
+| 9 (most liquid) | 0.002325 | 226.03 | 14.5 |
+
+Active-weight magnitude is essentially flat across deciles (0.00212 to 0.00235, with the
+*most* liquid decile nearly as high as the least), and return dispersion is **lowest** in
+decile 0 and highest in decile 9 -- the opposite of what a volatility explanation requires.
+The concentration is therefore in the signal's hit rate per unit of active weight, not in
+bet size and not in noise. The tilt genuinely works better on less-liquid names.
+
+**What this does and does not overturn.** It does not change the section A PASS: the two
+statistics measure different things and section A is simply the less sensitive instrument
+here. Section A asks whether the signal's bucket spread is concentrated (2.7596 against
+4.8695, 62nd percentile -- and note the bottom decile *is* the argmax there, so it points
+the same way without clearing its bar); section C asks where the realised rupees came from
+and answers with five-plus standard deviations. Read together: the same lean is visible in
+both, and only the P&L-side measurement has the power to resolve it. The operational
+consequence is a capacity one, and `scripts/recon_tilt_liquidity.py`'s exclusion ladder --
+does the edge survive dropping the illiquid tail -- is the next thing to weigh, now with a
+measured reason to weigh it.
 
 ### Criterion 4 verdict
 
@@ -380,8 +450,16 @@ of the null; all ten deciles populated, sign-consistent and individually signifi
 with a defined forward return, so that half of the criterion is vacuous and is not claimed
 as cleared.
 
-Two caveats stand with the PASS: (1) section A measures the tilt's SIGNAL, which is H2's
-signal, so it inherits H2's already-published concentration result rather than testing the
-tilt construction independently; section B is the construction-specific measurement, and
-(2) section B shows a real lean toward less-liquid names (33.0% of excess from the bottom
-20% of the universe) that no measured null currently adjudicates.
+**FIRES on the book's realised attribution (section C).** The bottom two ADV deciles supply
+32.95% of the realised gross excess against a measured p95 of 23.82% -- above every one of
+10,000 permutation replicates, 5.75 null standard deviations out. This is now adjudicated,
+not merely reported.
+
+Two caveats stand with the section A PASS: (1) section A measures the tilt's SIGNAL, which
+is H2's signal, so it inherits H2's already-published concentration result rather than
+testing the tilt construction independently; section B/C is the construction-specific
+measurement, and (2) that measurement disagrees with section A in emphasis. The signal-side
+spread test passes; the P&L-side share test fails by a wide margin. The disagreement is a
+power difference, not a contradiction -- the bottom decile is the argmax in section A too --
+and the honest summary is that the tilt's edge is concentrated in less-liquid names to a
+degree that no permutation of the liquidity labels can reproduce.
