@@ -45,6 +45,15 @@ strictly before the live holdout boundary (2025-08-14). ``feature_sweep.run_swee
 both itself and RAISES otherwise; this script does not add, weaken, catch, or duplicate that
 check -- it is enforced exactly once, inside `run_sweep`, and left alone.
 
+AMENDMENT 4 (2026-08-23): each shard now loads ``close`` PLUS exactly the UNION of
+``open``/``high``/``low``/``volume`` its OWN feature partition declares via
+``FeatureSpec.required_fields`` (``required_panel_fields``, below) -- never a hardcoded
+``fields=("close",)`` and never all five fields regardless of need. Per-shard peak RSS
+therefore varies with which features that shard happens to draw (a shard containing none of
+the seven OHLCV-requiring features still loads close-only), not a fixed ~0.78 GB floor;
+``memmap=False`` is unchanged (a prior full-5-field ``memmap=True`` load caused cross-shard
+mmap contention -- see the comment at the ``load_panel`` call site).
+
 IMPORTANT: this script's plumbing has been verified ONLY on a small slice (a handful of
 sessions, >= 5 symbols, 2 features, 1 horizon) -- see the worker's final report for the
 command used. **The full 132-trial sweep has NOT been executed by this script.**
@@ -60,6 +69,7 @@ import sys
 import time
 import warnings
 from pathlib import Path
+from typing import Sequence
 
 import numpy as np
 
@@ -192,6 +202,34 @@ def shard_features_for(shard: int, n_shards: int) -> list[sf.FeatureSpec]:
     return list(sf.FEATURE_REGISTRY)[shard::n_shards]
 
 
+# `FeatureSpec.required_fields` names fields the way `feature_sweep.run_sweep`'s keyword
+# arguments are spelled (`open_`, with a trailing underscore, since `open` is a builtin);
+# `PanelSpec.fields`/`Panel.field()` spell the same panel column `"open"`. This is the one
+# translation site between the two naming conventions -- obligation 18 requires the loaded
+# set be exactly the union of declared fields, not a hardcoded list, so this dict is the only
+# thing that would need to grow if a future field is added to both vocabularies.
+_FIELD_NAME_TO_PANEL_FIELD: dict[str, str] = {
+    "open_": "open",
+    "high": "high",
+    "low": "low",
+    "volume": "volume",
+}
+
+
+def required_panel_fields(feature_specs: Sequence[sf.FeatureSpec]) -> tuple[str, ...]:
+    """The UNION of every `FeatureSpec.required_fields` across `feature_specs`, translated
+    to panel field names and sorted for a deterministic `PanelSpec.fields` tuple.
+
+    `close` is never included here -- it is unconditionally loaded regardless of what any
+    feature declares (obligation 18: "the runner's loaded field set is exactly their union"
+    refers to the OHLCV fields BEYOND close, since close alone is already guaranteed).
+    """
+    union: set[str] = set()
+    for spec in feature_specs:
+        union |= set(spec.required_fields)
+    return tuple(sorted(_FIELD_NAME_TO_PANEL_FIELD[name] for name in union))
+
+
 def _raw_spread_series(
     feature_values: np.ndarray,
     fwd_values: np.ndarray,
@@ -236,35 +274,49 @@ def run_shard(args: argparse.Namespace) -> Path:
     start = dt.date.fromisoformat(args.start) if args.start else base.START
     end = dt.date.fromisoformat(args.end) if args.end else base.END
 
+    shard_features = shard_features_for(args.shard, args.n_shards)
+    extra_fields = required_panel_fields(shard_features)  # AMENDMENT 4: union, not hardcoded
+
     spec = base.PanelSpec(
         freq="1",
-        # `run_sweep` consumes ONLY `close` (its signature takes close + day_offsets); the
-        # registry synthesises OHLC proxies internally. Loading all five fields cost 5x the
+        # AMENDMENT 4: `close` plus EXACTLY the union of OHLCV fields this shard's OWN
+        # feature partition declares via `FeatureSpec.required_fields` -- never all five
+        # fields regardless of need (a prior full-5-field `memmap=True` load cost 5x the
         # memory and, with 4 concurrent shards, caused memmap contention -- `ValueError: mmap
-        # length is greater than file size` and a SIGBUS. Load only what is used.
-        fields=("close",),
+        # length is greater than file size` and a SIGBUS).
+        fields=("close",) + extra_fields,
         symbols=symbols,
         start=start,
         end=end,
     )
     print(
         f"[shard {args.shard}/{args.n_shards}] loading panel {start}..{end} "
-        f"({len(symbols)} symbols), memmap=True",
+        f"({len(symbols)} symbols), fields={spec.fields}, memmap=False",
         flush=True,
     )
-    # memmap=False: with only `close` loaded this is ~0.39 GB (float32) per shard, so 4
-    # concurrent shards fit comfortably in the ~5.8 GB free -- and a private in-process array
-    # cannot race other shards on a shared cache file the way the memmap path did.
+    # memmap=False: a private in-process array cannot race other shards on a shared cache
+    # file the way the memmap path did.
     panel = base.load_panel(spec, memmap=False)
     close = np.asarray(panel.field("close"), dtype=np.float64)
     day_offsets = np.asarray(panel.day_offsets)
+    open_ = np.asarray(panel.field("open"), dtype=np.float64) if "open" in extra_fields else None
+    high = np.asarray(panel.field("high"), dtype=np.float64) if "high" in extra_fields else None
+    low = np.asarray(panel.field("low"), dtype=np.float64) if "low" in extra_fields else None
+    volume = (
+        np.asarray(panel.field("volume"), dtype=np.float64) if "volume" in extra_fields else None
+    )
+    field_values: dict[str, np.ndarray | None] = {
+        "open_": open_,
+        "high": high,
+        "low": low,
+        "volume": volume,
+    }
     print(
         f"[shard {args.shard}/{args.n_shards}] panel: {panel.n_rows()} rows, "
         f"{panel.n_days()} days, {panel.n_symbols()} symbols",
         flush=True,
     )
 
-    shard_features = shard_features_for(args.shard, args.n_shards)
     n_planned_shard = len(shard_features) * len(horizons)
     print(
         f"[shard {args.shard}/{args.n_shards}] {len(shard_features)} features x {len(horizons)} "
@@ -300,6 +352,10 @@ def run_shard(args: argparse.Namespace) -> Path:
         close=close,
         day_offsets=day_offsets,
         horizons=horizons,
+        open_=open_,
+        high=high,
+        low=low,
+        volume=volume,
         feature_registry=shard_features,
         n_buckets=args.n_buckets,
         seed=args.seed,
@@ -312,11 +368,14 @@ def run_shard(args: argparse.Namespace) -> Path:
     )
 
     # Recompute the row-aligned raw spread series for every trial that DIDN'T raise (obligation
-    # 11 already recorded the raises above; nothing further to compute for those).
+    # 11 already recorded the raises above; nothing further to compute for those). Mirrors
+    # `run_sweep`'s own call convention: each feature is called with EXACTLY the fields its
+    # own `required_fields` declares, never a proxy for a field it didn't ask for.
     spread_series: dict[tuple[str, str], np.ndarray] = {}
     for feat in shard_features:
         try:
-            feature_values = feat.fn(close, day_offsets)
+            call_kwargs = {f: field_values[f] for f in feat.required_fields}
+            feature_values = feat.fn(close, day_offsets, **call_kwargs)
         except Exception:
             continue
         for horizon in horizons:

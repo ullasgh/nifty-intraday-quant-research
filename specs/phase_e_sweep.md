@@ -258,3 +258,72 @@ the `@pytest.mark.holdout_aware` marker to receive the REAL boundary — or shou
 lock in `tmp_path` with a boundary the fixture window deliberately crosses.
 
 This is added as obligation 14.
+
+---
+
+# AMENDMENT 4 — 2026-08-23. `run_sweep` must receive OHLCV. Seven features were never measured.
+
+## The defect
+
+`run_sweep`'s signature takes only `close` + `day_offsets` (pinned in AMENDMENT 1 — my omission).
+`research/sweep_features.py` therefore synthesises proxies at 18 call sites:
+
+    volume = np.ones_like(close)          # constant
+    high = low = open_ = close            # zero range
+
+Consequence, measured on the full-panel run (`results/PHASE_E_SWEEP.md`): a z-score of constant
+volume is NaN; `log(H/L)` with `H == L` is exactly zero. Seven features returned ALL-NaN and were
+excluded from the trial matrix:
+
+    volume_zscore, signed_volume_proxy, breakout_strength,
+    parkinson_volatility, garman_klass_volatility, rogers_satchell_volatility,
+    close_location_value
+
+**These are not null results. They are measurements that did not happen.** The implementer flagged
+the proxy assumption and predicted the degeneration; I accepted it as "a legitimate recorded
+result", which was wrong. A feature fed constant inputs has not been tested, and reporting it
+alongside genuinely-measured features implies it has.
+
+This matters beyond tidiness: `breakout_strength` and `volume_zscore` are two of the four
+components `specs/volume_breakout_v2.md` designs v2 around. Phase F cannot proceed until they have
+real verdicts.
+
+## Required change
+
+`run_sweep` accepts the full OHLCV set. `close` remains required; the rest are optional and
+default to `None`:
+
+    run_sweep(*, contract, close, day_offsets, horizons,
+              open_=None, high=None, low=None, volume=None,
+              feature_registry=None, feature_registry_override=None,
+              n_buckets=..., seed=0) -> list[TrialRecord]
+
+**A feature whose required field is absent must RAISE, not silently substitute a proxy.** Each
+`FeatureSpec` declares the fields it needs; `run_sweep` checks them before running the trial and
+records a FAILED trial (obligation 11) naming the missing field. Silently substituting `close` for
+`high` is precisely what produced seven fake nulls, and the fix is worthless if the substitution
+merely moves.
+
+The runner (`scripts/run_phase_e_sweep.py`) loads the fields the registry declares, rather than
+hardcoding `fields=("close",)`.
+
+**Memory note:** the runner currently loads close-only deliberately — loading all five fields was
+5x the memory and contributed to a cache-contention failure. Load only the union of fields the
+registry actually declares, and keep `memmap=False`.
+
+## Test obligations (extending the existing suites)
+
+15. `run_sweep` accepts `open_`/`high`/`low`/`volume` and passes them to features that declare them.
+16. A feature declaring a field that is NOT supplied RAISES and is recorded as a failed trial naming
+    the missing field — it must NOT fall back to a proxy.
+17. With real (non-degenerate) OHLCV, each of the seven previously-excluded features produces a
+    spread series with **> 0 finite observations**. This is the regression test for the defect: it
+    would have failed on the committed run.
+18. `FeatureSpec` exposes its required fields, and the runner's loaded field set is exactly their
+    union — not a hardcoded list, so adding a feature that needs volume cannot silently regress.
+
+## Ownership
+
+This changes a signature both `tests/test_phase_e_sweep_a.py` and `_b.py` assert on, plus the
+registry and the runner. **ONE agent owns all of it.** This repo has already produced a broken build
+from two agents each correctly implementing opposite sides of one interface.

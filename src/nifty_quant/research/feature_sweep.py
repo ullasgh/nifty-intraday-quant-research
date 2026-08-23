@@ -140,6 +140,10 @@ def run_sweep(
     close: np.ndarray,
     day_offsets: np.ndarray,
     horizons: Sequence[int | str],
+    open_: np.ndarray | None = None,
+    high: np.ndarray | None = None,
+    low: np.ndarray | None = None,
+    volume: np.ndarray | None = None,
     feature_registry: Sequence[FeatureSpec] | None = None,
     feature_registry_override: Sequence[tuple[str, FeatureFn]] | None = None,
     n_buckets: int = _N_BUCKETS_DEFAULT,
@@ -147,11 +151,25 @@ def run_sweep(
 ) -> list[TrialRecord]:
     """Run every (feature, horizon) trial, writing one `TrialRecord` each (E5).
 
+    AMENDMENT 4: `open_`/`high`/`low`/`volume` are optional, keyword-only OHLCV panels,
+    each shaped like `close` when supplied. `close` remains the only required panel. Every
+    `FeatureSpec` in the registry declares the subset of these four names it actually needs
+    via `required_fields`; a feature is called with EXACTLY those fields as keyword
+    arguments (`fn(close, day_offsets, **{f: locals_by_name[f] for f in required_fields})`),
+    never with a proxy substituted for a field that was not supplied. If a feature declares
+    a required field that is `None` here, `run_sweep` raises before calling the feature at
+    all (see obligation 16 below) -- this is the fix for the defect where 18 call sites
+    silently synthesised `volume = np.ones_like(close)` / `high = low = open_ = close`,
+    which degenerated seven features to all-NaN output that was then excluded from the
+    trial matrix as though it were a measured null (`specs/phase_e_sweep.md` AMENDMENT 4).
+
     `feature_registry` overrides the default `FEATURE_REGISTRY` with a caller-supplied list
     of `FeatureSpec`s. `feature_registry_override` is a second, list-of-`(name, callable)`-
     tuples form used by one of the two independent test suites' obligation-11 fixture; both
     are accepted (see the implementer's final report) and `feature_registry_override` takes
-    precedence if both are given.
+    precedence if both are given. Entries built from `feature_registry_override` always have
+    empty `required_fields` (they declare none), so they are called exactly `fn(close,
+    day_offsets)`, matching their pre-AMENDMENT-4 call signature unchanged.
 
     Obligation 4 (the anti-silent-failure guard, do not soften): fewer than `MIN_NAMES`
     symbols RAISES before any trial runs, rather than letting `cross_sectional_rank` silently
@@ -166,9 +184,24 @@ def run_sweep(
     Obligation 11: a feature that raises is recorded as a FAILED trial (non-null `error`),
     never silently dropped.
 
+    Obligation 16 (AMENDMENT 4): a feature that declares a required field which was not
+    supplied to `run_sweep` (i.e. is `None`) RAISES a `ValueError` naming that field, caught
+    by the SAME per-trial handler that implements obligation 11 above, so it too is recorded
+    as a FAILED trial rather than silently dropped or, worse, silently substituted.
+
     Obligation 14 (AMENDMENT 3): the sweep's contract must declare `holdout_intent='never'`,
     and its declared data window (`contract.data['end']`, when present) must end strictly
     before the live `holdout_start`.
+
+    Performance note (coordinator review, 2026-08-23): `feature_spec.fn` is called EXACTLY
+    ONCE per feature, not once per (feature, horizon) -- a feature's values do not depend on
+    `horizon`, only the forward-return/expectancy step does. Measured on a real
+    3-month/149-symbol shard, recomputing inside the horizon loop cost `hurst_on_stitched`
+    ~36 minutes of shard wall time against a ~37s full-panel extrapolation of the feature
+    itself (a 20-30x gap, six of which came directly from this). `contract.register_trial()`
+    is still called once per (feature, horizon) -- obligation 2's trial-budget accounting is
+    unaffected -- and a feature that fails still yields one FAILED `TrialRecord` per horizon
+    (obligations 11/16), never fewer.
     """
     close64 = np.asarray(close, dtype=np.float64)
     if close64.ndim != 2:
@@ -184,6 +217,15 @@ def run_sweep(
         )
 
     day_offsets_arr = np.asarray(day_offsets, dtype=np.int64)
+
+    # AMENDMENT 4: cast whichever OHLCV panels were actually supplied to float64 (rule 3:
+    # float32 at rest, float64 in motion) -- fields NOT supplied stay `None`, never a proxy.
+    field_values: dict[str, np.ndarray | None] = {
+        "open_": None if open_ is None else np.asarray(open_, dtype=np.float64),
+        "high": None if high is None else np.asarray(high, dtype=np.float64),
+        "low": None if low is None else np.asarray(low, dtype=np.float64),
+        "volume": None if volume is None else np.asarray(volume, dtype=np.float64),
+    }
 
     _assert_holdout_intent_never(contract)
     _assert_window_before_holdout(contract)
@@ -202,27 +244,72 @@ def run_sweep(
     records: list[TrialRecord] = []
 
     for feature_spec in entries:
+        # A feature's own values do not depend on `horizon` -- only `_forward_returns_for_
+        # horizon`/`conditional_expectancy` below do. Computed ONCE per feature here, not
+        # once per (feature, horizon): measured on a real 3-month/149-symbol shard,
+        # recomputing inside the horizon loop cost `hurst_on_stitched` ~36 MIN of shard wall
+        # time against a ~37s full-panel extrapolation of the feature itself, and
+        # `median_pairwise_correlation` ~25 MIN against ~1-2 min -- a 20-30x gap, six of
+        # which (`len(HORIZONS) == 6`) came directly from this redundant recomputation.
+        #
+        # Obligation 16's missing-field check, and any exception `fn` itself raises, are
+        # therefore also evaluated ONCE per feature -- but the resulting error (if any) is
+        # still recorded on EVERY (feature, horizon) trial below, never collapsing the
+        # trial count (obligation 11: a failing feature must not silently reduce it).
+        feature_compute_start = time.monotonic()
+        feature_error: str | None = None
+        feature_values: np.ndarray | None = None
+        try:
+            # Obligation 16: a declared-but-missing field raises HERE, before `fn` is ever
+            # called, naming the field -- recorded as a FAILED trial below, never a proxy.
+            missing_fields = sorted(
+                f for f in feature_spec.required_fields if field_values.get(f) is None
+            )
+            if missing_fields:
+                raise ValueError(
+                    f"feature {feature_spec.name!r} requires field(s) {missing_fields} "
+                    "that were not supplied to run_sweep (AMENDMENT 4: no proxy "
+                    "fallback -- pass the real panel or drop this feature from the "
+                    "registry)"
+                )
+            call_kwargs = {f: field_values[f] for f in feature_spec.required_fields}
+            feature_values = feature_spec.fn(close64, day_offsets_arr, **call_kwargs)
+        except Exception as exc:  # noqa: BLE001 - obligations 11/16: a raise is a RESULT
+            feature_error = f"{type(exc).__name__}: {exc}"
+        # The shared feature-computation cost is amortised evenly across this feature's
+        # horizons below, rather than charged entirely to the first and zero to the rest --
+        # `wall_s` per trial stays a fair (if approximate) per-trial cost, not a bookkeeping
+        # artefact of WHERE the shared work happened to run.
+        amortised_feature_wall_s = (time.monotonic() - feature_compute_start) / max(
+            len(horizons), 1
+        )
+
         for horizon in horizons:
-            contract.register_trial()  # obligation 2: raises past n_planned_trials, uncaught
+            contract.register_trial()  # obligation 2: once per (feature, horizon), uncaught
 
             start_time = time.monotonic()
-            error_message: str | None = None
+            error_message = feature_error
             table: expectancy.ExpectancyTable | None = None
-            try:
-                feature_values = feature_spec.fn(close64, day_offsets_arr)
-                fwd = _forward_returns_for_horizon(close64, day_offsets_arr, horizon)
-                table = expectancy.conditional_expectancy(
-                    feature_values,
-                    fwd,
-                    day_offsets_arr,
-                    n_buckets=n_buckets,
-                    method="cross_sectional_rank",
-                    seed=seed,
-                    feature_name=feature_spec.name,
-                )
-            except Exception as exc:  # noqa: BLE001 - obligation 11: a raise is a RESULT
-                error_message = f"{type(exc).__name__}: {exc}"
-            wall_s = time.monotonic() - start_time
+            if error_message is None:
+                # Invariant: `feature_error is None` (hence `error_message is None` here,
+                # since it was just assigned from `feature_error`) only when the try block
+                # above completed without raising, which is the only place `feature_values`
+                # is assigned -- so it is never `None` on this branch.
+                assert feature_values is not None
+                try:
+                    fwd = _forward_returns_for_horizon(close64, day_offsets_arr, horizon)
+                    table = expectancy.conditional_expectancy(
+                        feature_values,
+                        fwd,
+                        day_offsets_arr,
+                        n_buckets=n_buckets,
+                        method="cross_sectional_rank",
+                        seed=seed,
+                        feature_name=feature_spec.name,
+                    )
+                except Exception as exc:  # noqa: BLE001 - obligation 11: a raise is a RESULT
+                    error_message = f"{type(exc).__name__}: {exc}"
+            wall_s = amortised_feature_wall_s + (time.monotonic() - start_time)
 
             records.append(
                 TrialRecord(

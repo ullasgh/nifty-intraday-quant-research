@@ -1,6 +1,13 @@
 # nifty_quant
 
-`nifty_quant` is a research toolkit for NSE India intraday (1-minute) equity data. It includes a data pipeline, feature library, strategy framework, a vectorized backtest engine with realistic cost and execution modelling, and a walk-forward research harness with overfitting controls (deflated Sharpe, PBO via CSCV, holdout lock). The dataset covers 153 symbols (149 tradable equities plus 4 index/vol series: NIFTY50, NIFTY100, NIFTYBANK, INDIAVIX), contains 121.3M 1-minute bars, and spans 2017-07 through 2026-08. Spot bars are corporate-action adjusted; NSE futures bars are unadjusted (see Limitations).
+`nifty_quant` is a research toolkit for NSE India intraday (1-minute) equity data. It includes a data pipeline, feature library, strategy framework, a vectorized backtest engine with realistic cost and execution modelling, and a walk-forward research harness with overfitting controls (deflated Sharpe, PBO via CSCV, and a holdout read LOG -- see below). The dataset covers 153 symbols (149 tradable equities plus 4 index/vol series: NIFTY50, NIFTY100, NIFTYBANK, INDIAVIX), contains 121.3M 1-minute bars, and spans 2017-07 through 2026-08. Spot bars are corporate-action adjusted; NSE futures bars are unadjusted (see Limitations).
+
+> **On the "holdout lock":** `HoldoutLock` RECORDS reads -- `record_read` appends a log
+> entry and increments a counter -- but it never inspects that counter and never raises.
+> The only consumer of `read_count()` is a `typer.echo` in `cli.py`. What actually prevents
+> a second read of the out-of-sample window is the explicit `--allow-holdout` flag plus
+> human discipline. It is an audit trail, not an enforcement mechanism, and it should not
+> be cited as one.
 
 ## Quickstart
 
@@ -114,7 +121,7 @@ Vectorized, causal-by-construction feature functions (`core.py`: volume z-score,
 
 ### nifty_quant/strategy/
 
-`Strategy` ABC plus a pydantic `Params` schema (`base.py`), a name-keyed registry (`registry.py`), and pluggable strategy implementations under `strategy/plugins/` (`volume_breakout`, `xsec_zscore`), auto-registered on import.
+`Strategy` ABC plus a pydantic `Params` schema (`base.py`), a name-keyed registry (`registry.py`), and pluggable strategy implementations under `strategy/plugins/` (`carver_trend`, `eod_overextension`, `volume_breakout`, `vwap_reversion`, `xsec_zscore`), auto-registered on import.
 
 ### nifty_quant/execution/
 

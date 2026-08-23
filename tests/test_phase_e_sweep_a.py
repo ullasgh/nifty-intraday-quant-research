@@ -469,6 +469,225 @@ def test_obligation11_raising_feature_is_recorded_not_dropped():
 
 
 # ---------------------------------------------------------------------------
+# AMENDMENT 4 (2026-08-23): `run_sweep` receives real OHLCV; no proxy fallback.
+# ---------------------------------------------------------------------------
+
+
+def _non_degenerate_ohlcv(rng: np.random.Generator, close: np.ndarray):
+    """Real (non-degenerate) high/low/open/volume derived from a close panel: high strictly
+    above close, low strictly below, open a small jitter off close, volume varying and
+    strictly positive. Exercises the exact shapes `PanelSpec` would hand `run_sweep`."""
+    spread_frac = rng.uniform(0.002, 0.01, size=close.shape)
+    high = close * (1.0 + spread_frac)
+    low = close * (1.0 - spread_frac)
+    open_ = close * (1.0 + rng.normal(0.0, 0.001, size=close.shape))
+    volume = rng.uniform(1_000.0, 5_000.0, size=close.shape)
+    return open_, high, low, volume
+
+
+def test_obligation15_run_sweep_accepts_and_forwards_new_ohlcv_fields():
+    """Obligation 15: `run_sweep` accepts `open_`/`high`/`low`/`volume` and passes them
+    through to a feature that declares them as required -- proven by round-tripping the
+    EXACT arrays back out of a custom feature function; if `run_sweep` failed to forward
+    them (or substituted a proxy), this feature would raise and the trial would record an
+    error instead of completing cleanly."""
+    from nifty_quant.research.sweep_features import FeatureSpec, run_sweep
+
+    rng = np.random.default_rng(15)
+    close = _random_walk_close(rng, [300], 6)
+    day_offsets = _single_session_day_offsets(300)
+    open_, high, low, volume = _non_degenerate_ohlcv(rng, close)
+
+    seen: dict[str, np.ndarray] = {}
+
+    def _capturing_feature(close, day_offsets, *, high, low, volume):  # noqa: ARG001
+        seen["high"] = high
+        seen["low"] = low
+        seen["volume"] = volume
+        return high - low
+
+    contract = minimal_contract(
+        validation={"scheme": "test", "holdout_intent": "never", "n_planned_trials": 1}
+    )
+    spec = FeatureSpec(
+        name="capturing",
+        fn=_capturing_feature,
+        required_fields=frozenset({"high", "low", "volume"}),
+    )
+    records = run_sweep(
+        contract=contract,
+        close=close,
+        day_offsets=day_offsets,
+        horizons=[1],
+        open_=open_,
+        high=high,
+        low=low,
+        volume=volume,
+        feature_registry=[spec],
+    )
+
+    assert len(records) == 1
+    assert records[0].error is None, (
+        f"a feature that only needs fields run_sweep was actually given must not fail: "
+        f"{records[0].error}"
+    )
+    np.testing.assert_array_equal(seen["high"], high)
+    np.testing.assert_array_equal(seen["low"], low)
+    np.testing.assert_array_equal(seen["volume"], volume)
+
+
+def test_obligation16_missing_required_field_raises_and_is_recorded_as_failed_trial():
+    """Obligation 16: a feature declaring a field that is NOT supplied to `run_sweep` RAISES
+    naming that field and is recorded as a FAILED trial -- it must NOT fall back to a proxy.
+    A call counter proves the feature function was never invoked at all."""
+    from nifty_quant.research.sweep_features import FeatureSpec, run_sweep
+
+    rng = np.random.default_rng(16)
+    close = _random_walk_close(rng, [300], 6)
+    day_offsets = _single_session_day_offsets(300)
+
+    call_count = {"n": 0}
+
+    def _needs_volume(close, day_offsets, *, volume):  # noqa: ARG001
+        call_count["n"] += 1
+        return volume
+
+    contract = minimal_contract(
+        validation={"scheme": "test", "holdout_intent": "never", "n_planned_trials": 1}
+    )
+    spec = FeatureSpec(name="needs_volume", fn=_needs_volume, required_fields=frozenset({"volume"}))
+
+    records = run_sweep(
+        contract=contract,
+        close=close,
+        day_offsets=day_offsets,
+        horizons=[1],
+        # volume deliberately NOT supplied
+        feature_registry=[spec],
+    )
+
+    assert len(records) == 1
+    assert records[0].error is not None
+    assert "volume" in records[0].error
+    assert call_count["n"] == 0, (
+        "the feature function must never be called when a required field is missing"
+    )
+
+
+def test_obligation17_seven_previously_excluded_features_yield_finite_spread_with_real_ohlcv():
+    """Obligation 17: the regression test. Against non-degenerate OHLCV (high > close > low,
+    volume varying), each of the seven features that AMENDMENT 4 documents as previously
+    degenerating to all-NaN under the old close-as-proxy substitution now yields > 0 finite
+    observations in its bucket-spread series. This test would have FAILED on the committed
+    (pre-fix) run: `volume = np.ones_like(close)` makes `volume_zscore` all-NaN, and
+    `high = low = close` makes every log(H/L)-based feature exactly zero-range / all-NaN.
+    """
+    from nifty_quant.research.feature_sweep import _bucket_spread_returns
+    from nifty_quant.research.sweep_features import FEATURE_REGISTRY
+
+    rng = np.random.default_rng(17)
+    close = _random_walk_close(rng, [200, 200], 6)
+    day_offsets = _multi_session_day_offsets([200, 200])
+    open_, high, low, volume = _non_degenerate_ohlcv(rng, close)
+    field_values = {"open_": open_, "high": high, "low": low, "volume": volume}
+
+    fwd = expectancy.forward_returns(close, day_offsets, horizon=1)
+    specs_by_name = {spec.name: spec for spec in FEATURE_REGISTRY}
+
+    seven_previously_excluded = {
+        "volume_zscore",
+        "signed_volume_proxy",
+        "breakout_strength",
+        "parkinson_volatility",
+        "garman_klass_volatility",
+        "rogers_satchell_volatility",
+        "close_location_value",
+    }
+    assert seven_previously_excluded <= set(specs_by_name), "all seven must still be registered"
+
+    for name in sorted(seven_previously_excluded):
+        spec = specs_by_name[name]
+        call_kwargs = {f: field_values[f] for f in spec.required_fields}
+        feature_values = spec.fn(close, day_offsets, **call_kwargs)
+        spread = _bucket_spread_returns(feature_values, fwd.values, day_offsets, n_buckets=5)
+        assert spread.size > 0, (
+            f"{name}: 0 finite spread observations with real OHLCV -- this is exactly the "
+            f"AMENDMENT 4 defect (would have been all-NaN under the old close-as-proxy path)"
+        )
+
+
+def test_feature_fn_is_invoked_exactly_once_per_feature_across_all_horizons():
+    """Coordinator review (2026-08-23): a feature's values do not depend on `horizon`, so
+    `run_sweep` must compute them ONCE per feature, not once per (feature, horizon) --
+    measured at a 20-30x real-shard wall-time cost when this was not the case. A counting
+    spy pins the fix: across 6 horizons, the feature callable must be called exactly once,
+    while `contract.register_trial()`-backed trial accounting still produces 6 records."""
+    from nifty_quant.research.sweep_features import run_sweep
+
+    rng = np.random.default_rng(19)
+    close = _random_walk_close(rng, [300], 6)
+    day_offsets = _single_session_day_offsets(300)
+
+    call_count = {"n": 0}
+
+    def _spy_feature(close, day_offsets):
+        call_count["n"] += 1
+        return close.copy()
+
+    contract = minimal_contract(
+        validation={"scheme": "test", "holdout_intent": "never", "n_planned_trials": 6}
+    )
+    records = run_sweep(
+        contract=contract,
+        close=close,
+        day_offsets=day_offsets,
+        horizons=[1, 5, 15, 30, 60, "EOD"],
+        feature_registry_override=[("spy", _spy_feature)],
+    )
+
+    assert len(records) == 6, "one TrialRecord per (feature, horizon) must still be produced"
+    assert call_count["n"] == 1, (
+        f"feature fn was called {call_count['n']} times across 6 horizons; it must be "
+        "computed once per feature, not once per (feature, horizon)"
+    )
+    assert all(r.error is None for r in records)
+
+
+def test_feature_fn_invoked_once_even_when_it_raises_but_every_horizon_still_recorded_failed():
+    """The failure-path mirror of the counting-spy test above: a feature that RAISES must
+    still be attempted only ONCE (not once per horizon), and EVERY horizon must still land
+    a FAILED TrialRecord naming the same error -- a raising feature must never silently
+    reduce the recorded trial count."""
+    from nifty_quant.research.sweep_features import run_sweep
+
+    rng = np.random.default_rng(20)
+    close = _random_walk_close(rng, [300], 6)
+    day_offsets = _single_session_day_offsets(300)
+
+    call_count = {"n": 0}
+
+    def _spy_raises(close, day_offsets):  # noqa: ARG001
+        call_count["n"] += 1
+        raise RuntimeError("deliberate failure for the hoisted-computation regression test")
+
+    contract = minimal_contract(
+        validation={"scheme": "test", "holdout_intent": "never", "n_planned_trials": 3}
+    )
+    records = run_sweep(
+        contract=contract,
+        close=close,
+        day_offsets=day_offsets,
+        horizons=[1, 5, 15],
+        feature_registry_override=[("spy_raises", _spy_raises)],
+    )
+
+    assert len(records) == 3, "a raising feature must still yield one record per horizon"
+    assert call_count["n"] == 1, "a raising feature must be attempted once, not once per horizon"
+    assert all(r.error is not None for r in records)
+    assert all("deliberate failure" in r.error for r in records)
+
+
+# ---------------------------------------------------------------------------
 # Obligation 12: promotion requires ALL FOUR E4 conditions; each independently blocks it.
 # ---------------------------------------------------------------------------
 

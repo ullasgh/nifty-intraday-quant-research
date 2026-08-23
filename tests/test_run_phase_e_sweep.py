@@ -63,6 +63,44 @@ def test_shard_features_for_rejects_out_of_range_shard_index():
         runner.shard_features_for(-1, 4)
 
 
+# ---------------------------------------------------------------------------
+# AMENDMENT 4 (2026-08-23) / obligation 18 -- the runner loads exactly the UNION of
+# fields the registry declares, not a hardcoded list.
+# ---------------------------------------------------------------------------
+
+
+def test_required_panel_fields_is_exactly_the_union_of_declared_required_fields():
+    """A synthetic mini-registry proves `required_panel_fields` is a real union computation,
+    not a hardcoded/coincidental list: adding a feature that needs a new field changes the
+    result, and a feature declaring no fields contributes nothing."""
+
+    def _fn(close, day_offsets, **_kwargs):
+        return close
+
+    specs = [
+        sf.FeatureSpec("a", _fn, required_fields=frozenset({"high"})),
+        sf.FeatureSpec("b", _fn, required_fields=frozenset({"low", "volume"})),
+        sf.FeatureSpec("c", _fn),  # declares nothing -- contributes nothing to the union
+    ]
+    assert runner.required_panel_fields(specs) == ("high", "low", "volume")
+
+    # A feature declaring a field NONE of the others need must appear in the union -- this
+    # is the exact regression obligation 18 guards against ("adding a feature that needs
+    # volume cannot silently regress").
+    specs_with_open = specs + [sf.FeatureSpec("d", _fn, required_fields=frozenset({"open_"}))]
+    assert runner.required_panel_fields(specs_with_open) == ("high", "low", "open", "volume")
+
+    # close is never part of this union -- it is loaded unconditionally, separately.
+    assert "close" not in runner.required_panel_fields(specs_with_open)
+
+
+def test_required_panel_fields_on_the_real_registry_matches_the_seven_declared_features():
+    """Run against the REAL `FEATURE_REGISTRY`, not a synthetic stand-in: the union must be
+    exactly the four OHLCV fields the seven previously-excluded features (AMENDMENT 4)
+    declare between them -- no more, no less."""
+    assert runner.required_panel_fields(sf.FEATURE_REGISTRY) == ("high", "low", "open", "volume")
+
+
 def test_raw_spread_series_matches_audited_helper_after_dropping_nans():
     """`_raw_spread_series` is a near-duplicate of `feature_sweep._bucket_spread_returns`
     that keeps NaN rows for cross-trial alignment; its finite entries must be IDENTICAL to

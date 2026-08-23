@@ -17,15 +17,24 @@ name until AMENDMENT 2. Both import paths resolve to the SAME function object; n
 duplicated. See the implementer's final report for the full list of places the two suites'
 guesses disagree.
 
-`run_sweep`'s pinned signature (`(*, contract, close, day_offsets, horizons,
-feature_registry=None)`) carries only `close`/`day_offsets` -- no separate OHLC, volume,
-sector, or market-index panel. Every registry entry below that needs more than a close panel
-therefore derives a PROXY from `close`/`day_offsets` alone, clearly commented at each call
-site. Real production use of this registry (once Phase E actually runs against the full
-panel) would pass real OHLCV; against a close-only synthetic fixture, several of these are
-expected to produce degenerate (e.g. always-zero or always-NaN) output, or to raise outright
--- both are legitimate sweep RESULTS per E1's own warning that 14 of 15 `features/market.py`
-functions have no production call site today.
+AMENDMENT 4 (2026-08-23): `run_sweep`'s signature now carries real `open_`/`high`/`low`/
+`volume` panels (keyword-only, default `None`), not just `close`/`day_offsets`. Before this
+amendment, every registry entry that needed more than a close panel silently synthesised a
+PROXY from `close` alone (`volume = np.ones_like(close)`, `high = low = open_ = close`) --
+which made a z-score of constant volume NaN and `log(H/L)` with `H == L` exactly zero,
+degenerating SEVEN features to all-NaN output that was then excluded from the trial matrix
+as if it were a measured null. **It was not measured at all.** Each such wrapper below now
+takes its real field(s) as keyword-only arguments and declares them on its `FeatureSpec` via
+`required_fields`; `run_sweep` validates every declared field is supplied BEFORE calling the
+wrapper and raises (recorded as a FAILED trial naming the field, reusing the obligation-11
+mechanism) rather than falling back to a proxy -- the whole point of the fix is that the
+silent substitution must not simply move somewhere else. Features that genuinely need only
+`close`/`day_offsets` are unchanged. Proxies that are NOT one of these four OHLCV fields
+(the `_minute_of_day_proxy` synthetic timestamp, `sector_relative_return`'s all-one sector
+id, `rv_to_vix_ratio`'s flat VIX level, `amihud_illiquidity`'s `|close|` traded-value
+notional) are out of this amendment's scope -- `run_sweep` was never given real sector
+metadata, a real VIX series, or real traded value/notional to substitute in their place, so
+there is nothing to wire through yet; they remain documented sharp edges of this registry.
 """
 
 from __future__ import annotations
@@ -46,15 +55,26 @@ from nifty_quant.features import persistence as _persistence
 # cross-sectional statistic need to be meaningful), not a new rule-8 threshold.
 MIN_NAMES = 5
 
-FeatureFn = Callable[[np.ndarray, np.ndarray], np.ndarray]
+FeatureFn = Callable[..., np.ndarray]
 
 
 @dataclass(frozen=True)
 class FeatureSpec:
-    """One registry entry: a name and a `(close, day_offsets) -> feature array` callable."""
+    """One registry entry: a name, a `(close, day_offsets, **fields) -> feature array`
+    callable, and the OHLCV fields (beyond `close`/`day_offsets`, which every callable
+    always receives positionally) it REQUIRES.
+
+    AMENDMENT 4: `run_sweep` validates that every name in `required_fields` was supplied
+    (non-`None`) to it before calling `fn`, then calls `fn` with EXACTLY those fields as
+    keyword arguments -- e.g. `required_fields=frozenset({"high", "low"})` is called as
+    `fn(close, day_offsets, high=..., low=...)`. The default, empty `required_fields`,
+    is called exactly `fn(close, day_offsets)`, unchanged from before this amendment --
+    every feature that never needed OHLCV keeps its original call signature verbatim.
+    """
 
     name: str
     fn: FeatureFn
+    required_fields: frozenset[str] = frozenset()
 
 
 # ---------------------------------------------------------------------------
@@ -109,32 +129,49 @@ def _broadcast_row_stat(stat_1d: np.ndarray, close: np.ndarray) -> np.ndarray:
 # ---------------------------------------------------------------------------
 
 
-def _volume_zscore(close: np.ndarray, day_offsets: np.ndarray) -> np.ndarray:
+def _volume_zscore(
+    close: np.ndarray, day_offsets: np.ndarray, *, volume: np.ndarray
+) -> np.ndarray:
     minute_of_day = _minute_of_day_proxy(close, day_offsets)
-    volume = np.ones_like(close, dtype=np.float64)  # proxy: no real volume reaches run_sweep
     return _core.volume_zscore(volume, minute_of_day, _DEFAULT_WINDOW, day_offsets=day_offsets)
 
 
-def _breakout_strength(close: np.ndarray, day_offsets: np.ndarray) -> np.ndarray:
-    # proxy: high = low = close (no separate OHLC reaches run_sweep)
-    return _core.breakout_strength(
-        close, close, close, _DEFAULT_WINDOW, day_offsets=day_offsets
-    )
+def _breakout_strength(
+    close: np.ndarray, day_offsets: np.ndarray, *, high: np.ndarray, low: np.ndarray
+) -> np.ndarray:
+    return _core.breakout_strength(close, high, low, _DEFAULT_WINDOW, day_offsets=day_offsets)
 
 
-def _parkinson_volatility(close: np.ndarray, day_offsets: np.ndarray) -> np.ndarray:
-    return _core.parkinson_volatility(close, close, _DEFAULT_WINDOW, day_offsets=day_offsets)
+def _parkinson_volatility(
+    close: np.ndarray, day_offsets: np.ndarray, *, high: np.ndarray, low: np.ndarray
+) -> np.ndarray:
+    del close  # unused: parkinson_volatility is purely a high/low range statistic
+    return _core.parkinson_volatility(high, low, _DEFAULT_WINDOW, day_offsets=day_offsets)
 
 
-def _garman_klass_volatility(close: np.ndarray, day_offsets: np.ndarray) -> np.ndarray:
+def _garman_klass_volatility(
+    close: np.ndarray,
+    day_offsets: np.ndarray,
+    *,
+    open_: np.ndarray,
+    high: np.ndarray,
+    low: np.ndarray,
+) -> np.ndarray:
     return _core.garman_klass_volatility(
-        close, close, close, close, _DEFAULT_WINDOW, day_offsets=day_offsets
+        open_, high, low, close, _DEFAULT_WINDOW, day_offsets=day_offsets
     )
 
 
-def _rogers_satchell_volatility(close: np.ndarray, day_offsets: np.ndarray) -> np.ndarray:
+def _rogers_satchell_volatility(
+    close: np.ndarray,
+    day_offsets: np.ndarray,
+    *,
+    open_: np.ndarray,
+    high: np.ndarray,
+    low: np.ndarray,
+) -> np.ndarray:
     return _core.rogers_satchell_volatility(
-        close, close, close, close, _DEFAULT_WINDOW, day_offsets=day_offsets
+        open_, high, low, close, _DEFAULT_WINDOW, day_offsets=day_offsets
     )
 
 
@@ -218,15 +255,23 @@ def _rv_to_vix_ratio(close: np.ndarray, day_offsets: np.ndarray) -> np.ndarray:
     return _market.rv_to_vix_ratio(rv_ann, vix_proxy)
 
 
-def _close_location_value(close: np.ndarray, day_offsets: np.ndarray) -> np.ndarray:
+def _close_location_value(
+    close: np.ndarray, day_offsets: np.ndarray, *, high: np.ndarray, low: np.ndarray
+) -> np.ndarray:
     del day_offsets
-    return _market.close_location_value(close, close, close)  # proxy: high = low = close
+    return _market.close_location_value(high, low, close)
 
 
-def _signed_volume_proxy(close: np.ndarray, day_offsets: np.ndarray) -> np.ndarray:
+def _signed_volume_proxy(
+    close: np.ndarray,
+    day_offsets: np.ndarray,
+    *,
+    high: np.ndarray,
+    low: np.ndarray,
+    volume: np.ndarray,
+) -> np.ndarray:
     del day_offsets
-    volume = np.ones_like(close, dtype=np.float64)  # proxy: no real volume in run_sweep
-    return _market.signed_volume_proxy(close, close, close, volume)
+    return _market.signed_volume_proxy(high, low, close, volume)
 
 
 def _amihud_illiquidity(close: np.ndarray, day_offsets: np.ndarray) -> np.ndarray:
@@ -245,27 +290,44 @@ def _overnight_return(close: np.ndarray, day_offsets: np.ndarray) -> np.ndarray:
     return out
 
 
-def _tradable_overnight_return(close: np.ndarray, day_offsets: np.ndarray) -> np.ndarray:
+def _tradable_overnight_return(
+    close: np.ndarray, day_offsets: np.ndarray, *, open_: np.ndarray
+) -> np.ndarray:
     minute_of_day = _minute_of_day_proxy(close, day_offsets)
-    # proxy: open_ = close (no separate open series in run_sweep)
-    return _market.tradable_overnight_return(close, close, day_offsets, minute_of_day)
+    return _market.tradable_overnight_return(open_, close, day_offsets, minute_of_day)
 
 
-def _opening_range(close: np.ndarray, day_offsets: np.ndarray) -> np.ndarray:
-    # proxy: high = low = close (no separate OHLC in run_sweep); reduce the (high, low)
-    # pair opening_range returns to a single range-width array.
+def _opening_range(
+    close: np.ndarray, day_offsets: np.ndarray, *, high: np.ndarray, low: np.ndarray
+) -> np.ndarray:
+    del close  # unused: opening_range is purely a high/low range statistic
+    # reduce the (or_high, or_low) pair opening_range returns to a single range-width array.
     high_range, low_range = _market.opening_range(
-        close, close, day_offsets, _DEFAULT_OPENING_RANGE_BARS
+        high, low, day_offsets, _DEFAULT_OPENING_RANGE_BARS
     )
     return np.asarray(high_range - low_range, dtype=np.float64)
 
 
 FEATURE_REGISTRY: tuple[FeatureSpec, ...] = (
-    FeatureSpec("volume_zscore", _volume_zscore),
-    FeatureSpec("breakout_strength", _breakout_strength),
-    FeatureSpec("parkinson_volatility", _parkinson_volatility),
-    FeatureSpec("garman_klass_volatility", _garman_klass_volatility),
-    FeatureSpec("rogers_satchell_volatility", _rogers_satchell_volatility),
+    FeatureSpec("volume_zscore", _volume_zscore, required_fields=frozenset({"volume"})),
+    FeatureSpec(
+        "breakout_strength", _breakout_strength, required_fields=frozenset({"high", "low"})
+    ),
+    FeatureSpec(
+        "parkinson_volatility",
+        _parkinson_volatility,
+        required_fields=frozenset({"high", "low"}),
+    ),
+    FeatureSpec(
+        "garman_klass_volatility",
+        _garman_klass_volatility,
+        required_fields=frozenset({"open_", "high", "low"}),
+    ),
+    FeatureSpec(
+        "rogers_satchell_volatility",
+        _rogers_satchell_volatility,
+        required_fields=frozenset({"open_", "high", "low"}),
+    ),
     FeatureSpec("efficiency_ratio", _efficiency_ratio),
     FeatureSpec("hurst_on_stitched", _hurst_on_stitched),
     FeatureSpec("variance_ratio", _variance_ratio),
@@ -277,12 +339,22 @@ FEATURE_REGISTRY: tuple[FeatureSpec, ...] = (
     FeatureSpec("median_pairwise_correlation", _median_pairwise_correlation),
     FeatureSpec("vol_ratio", _vol_ratio),
     FeatureSpec("rv_to_vix_ratio", _rv_to_vix_ratio),
-    FeatureSpec("close_location_value", _close_location_value),
-    FeatureSpec("signed_volume_proxy", _signed_volume_proxy),
+    FeatureSpec(
+        "close_location_value", _close_location_value, required_fields=frozenset({"high", "low"})
+    ),
+    FeatureSpec(
+        "signed_volume_proxy",
+        _signed_volume_proxy,
+        required_fields=frozenset({"high", "low", "volume"}),
+    ),
     FeatureSpec("amihud_illiquidity", _amihud_illiquidity),
     FeatureSpec("overnight_return", _overnight_return),
-    FeatureSpec("tradable_overnight_return", _tradable_overnight_return),
-    FeatureSpec("opening_range", _opening_range),
+    FeatureSpec(
+        "tradable_overnight_return",
+        _tradable_overnight_return,
+        required_fields=frozenset({"open_"}),
+    ),
+    FeatureSpec("opening_range", _opening_range, required_fields=frozenset({"high", "low"})),
 )
 
 # E2: horizons in {1, 5, 15, 30, 60 bars, EOD}. "EOD" is a distinguished sentinel handled by

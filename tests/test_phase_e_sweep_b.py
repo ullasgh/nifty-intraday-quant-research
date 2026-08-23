@@ -57,7 +57,7 @@ from nifty_quant.research.feature_sweep import (
     run_sweep,
 )
 from nifty_quant.research.ic import information_coefficient
-from nifty_quant.research.sweep_features import HORIZONS, n_planned_trials
+from nifty_quant.research.sweep_features import HORIZONS, FeatureSpec, n_planned_trials
 from tests.contract_fixtures import minimal_contract
 
 
@@ -404,6 +404,200 @@ def test_obligation_11_raising_feature_recorded_as_failed_trial_with_exception()
     assert len(records) == 1
     assert records[0].error is not None
     assert "RuntimeError" in records[0].error
+
+
+# ---------------------------------------------------------------------------
+# AMENDMENT 4 (2026-08-23) -- run_sweep receives real OHLCV, no proxy fallback.
+# ---------------------------------------------------------------------------
+
+
+def _make_ohlcv(n_symbols: int, n_rows: int = 40, seed: int = 0, n_sessions: int = 1):
+    """A real, non-degenerate OHLCV panel: high strictly above close, low strictly below,
+    open a small jitter off close, volume varying and strictly positive -- everything the
+    old `high = low = open_ = close` / `volume = np.ones_like(close)` proxy was not.
+
+    `n_sessions` splits `n_rows` into that many equal sessions (`day_offsets` gets that many
+    boundaries) rather than one -- `volume_zscore`'s deseasonalize-by-minute-of-day step
+    needs each minute-of-day to recur across >= 2 sessions to produce a non-trivial
+    per-minute statistic; a single session gives every minute exactly one observation and
+    is all-NaN by construction, which is a property of deseasonalization, not this fix.
+    """
+    per_session = n_rows // n_sessions
+    n_rows = per_session * n_sessions
+    rng0 = np.random.default_rng(seed)
+    log_returns = rng0.normal(0.0, 0.01, size=(n_rows, n_symbols)).astype(np.float64)
+    close = 100.0 * np.exp(np.cumsum(log_returns, axis=0))
+    day_offsets = np.array(
+        [i * per_session for i in range(n_sessions + 1)], dtype=np.int64
+    )
+    rng = np.random.default_rng(seed + 1000)
+    band = rng.uniform(0.002, 0.01, size=close.shape)
+    high = close * (1.0 + band)
+    low = close * (1.0 - band)
+    open_ = close * (1.0 + rng.normal(0.0, 0.001, size=close.shape))
+    volume = rng.uniform(500.0, 5000.0, size=close.shape)
+    return close, day_offsets, open_, high, low, volume
+
+
+def test_obligation_15_run_sweep_forwards_supplied_ohlcv_fields_to_declaring_feature():
+    """Obligation 15: `run_sweep` accepts the four new keyword-only panels and forwards
+    each one a feature declares to that feature's call -- checked by an identity assertion
+    inside the feature itself, which would raise (and fail the trial) if the wrong array,
+    or no array, arrived."""
+    close, day_offsets, open_, high, low, volume = _make_ohlcv(n_symbols=5)
+
+    def _requires_open_high_low_volume(close, day_offsets, *, open_, high, low, volume):
+        assert open_.shape == close.shape
+        assert high.shape == close.shape
+        assert low.shape == close.shape
+        assert volume.shape == close.shape
+        assert np.all(high >= low)
+        return high - low
+
+    spec = FeatureSpec(
+        name="all_fields",
+        fn=_requires_open_high_low_volume,
+        required_fields=frozenset({"open_", "high", "low", "volume"}),
+    )
+    contract = minimal_contract()
+
+    records = run_sweep(
+        contract=contract,
+        close=close,
+        day_offsets=day_offsets,
+        horizons=[1],
+        open_=open_,
+        high=high,
+        low=low,
+        volume=volume,
+        feature_registry=[spec],
+    )
+
+    assert len(records) == 1
+    assert records[0].error is None
+
+
+def test_obligation_16_declared_field_not_supplied_raises_named_and_never_calls_fn():
+    """Obligation 16: a feature declaring `high`/`low` as required, run against a
+    `run_sweep` call that supplies neither, RAISES naming the missing fields and is
+    recorded as a failed trial -- and the feature callable is never invoked (proof there
+    is no proxy substituted in its place)."""
+    close, day_offsets, _open_, _high, _low, _volume = _make_ohlcv(n_symbols=5)
+
+    invoked = []
+
+    def _requires_high_low(close, day_offsets, *, high, low):  # noqa: ARG001
+        invoked.append(True)
+        return high - low
+
+    spec = FeatureSpec(
+        name="needs_hl", fn=_requires_high_low, required_fields=frozenset({"high", "low"})
+    )
+    contract = minimal_contract()
+
+    records = run_sweep(
+        contract=contract,
+        close=close,
+        day_offsets=day_offsets,
+        horizons=[1],
+        # high/low deliberately omitted
+        feature_registry=[spec],
+    )
+
+    assert len(records) == 1
+    assert records[0].error is not None
+    assert "high" in records[0].error
+    assert "low" in records[0].error
+    assert invoked == [], "a feature must never be called once a required field is missing"
+
+
+def test_obligation_17_previously_all_nan_features_now_produce_finite_spread_observations():
+    """Obligation 17, the regression test: against real (non-degenerate) OHLCV, every one
+    of the seven features AMENDMENT 4 documents as having silently degenerated to all-NaN
+    under the OLD close-as-proxy substitution now clears `> 0` finite bucket-spread
+    observations. Constructed independently of suite A's version of this same obligation."""
+    from nifty_quant.research.feature_sweep import _bucket_spread_returns
+    from nifty_quant.research.sweep_features import FEATURE_REGISTRY
+
+    close, day_offsets, open_, high, low, volume = _make_ohlcv(
+        n_symbols=6, n_rows=200, seed=17, n_sessions=2
+    )
+    field_values = {"open_": open_, "high": high, "low": low, "volume": volume}
+    fwd = forward_returns(close, day_offsets, horizon=1)
+
+    previously_all_nan = [
+        "volume_zscore",
+        "signed_volume_proxy",
+        "breakout_strength",
+        "parkinson_volatility",
+        "garman_klass_volatility",
+        "rogers_satchell_volatility",
+        "close_location_value",
+    ]
+    by_name = {spec.name: spec for spec in FEATURE_REGISTRY}
+
+    for name in previously_all_nan:
+        spec = by_name[name]
+        kwargs = {f: field_values[f] for f in spec.required_fields}
+        feature_values = spec.fn(close, day_offsets, **kwargs)
+        spread = _bucket_spread_returns(feature_values, fwd.values, day_offsets, n_buckets=5)
+        assert spread.size > 0, f"{name} produced 0 finite spread observations"
+
+
+# ---------------------------------------------------------------------------
+# Coordinator review (2026-08-23) -- feature fn must run ONCE per feature, not once per
+# (feature, horizon). Measured 20-30x real-shard wall-time cost when it did not.
+# ---------------------------------------------------------------------------
+
+
+def test_feature_callable_invoked_once_across_multiple_horizons_success_path():
+    close, day_offsets = _make_close(n_symbols=5)
+    contract = minimal_contract()
+
+    calls = {"n": 0}
+
+    def _counting_feature(close, day_offsets):
+        calls["n"] += 1
+        return close.copy()
+
+    records = run_sweep(
+        contract=contract,
+        close=close,
+        day_offsets=day_offsets,
+        horizons=[1, 5, 15, 30],
+        feature_registry_override=[("counting", _counting_feature)],
+    )
+
+    assert len(records) == 4
+    assert calls["n"] == 1, "the feature must be computed once, not once per horizon"
+    assert all(r.error is None for r in records)
+
+
+def test_feature_callable_invoked_once_across_multiple_horizons_failure_path():
+    """A raising feature is attempted exactly once, and every horizon still gets its OWN
+    FAILED TrialRecord naming that same failure -- the trial count must not shrink."""
+    close, day_offsets = _make_close(n_symbols=5)
+    contract = minimal_contract(
+        validation={"scheme": "test", "holdout_intent": "never", "n_planned_trials": 4}
+    )
+
+    calls = {"n": 0}
+
+    def _counting_raiser(close, day_offsets):  # noqa: ARG001
+        calls["n"] += 1
+        raise ValueError("independent-suite regression fixture for hoisted computation")
+
+    records = run_sweep(
+        contract=contract,
+        close=close,
+        day_offsets=day_offsets,
+        horizons=[1, 5, 15, 30],
+        feature_registry_override=[("counting_raiser", _counting_raiser)],
+    )
+
+    assert len(records) == 4, "every horizon must still yield its own recorded (failed) trial"
+    assert calls["n"] == 1, "the feature must be attempted once, not once per horizon"
+    assert all(r.error is not None and "independent-suite" in r.error for r in records)
 
 
 # ---------------------------------------------------------------------------

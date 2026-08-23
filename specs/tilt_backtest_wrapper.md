@@ -152,7 +152,7 @@ here. Getting this wrong doubles the cost and inverts the conclusion.
 
     Tilt backtest  mild / smoothing 0.10 / capital Rs 10,00,000
     Universe all_equity (149 names)   2024-01-01 .. 2025-07-31   389 sessions
-    Clip per name Rs 66,667   round-trip 4.55 bps   breakeven turnover 1.23
+    Clip per name Rs 66,667   round-trip 10.62 bps   breakeven turnover 1.23
 
     year   sessions   gross_bps   turnover   cost_bps   net_bps   ann_net%
     2024        246        4.12      0.110       0.50      3.62      9.13
@@ -160,7 +160,7 @@ here. Getting this wrong doubles the cost and inverts the conclusion.
     ------------------------------------------------------------------
     ALL         389        3.73      0.109       0.50      3.23      8.14
 
-Numbers are illustrative of FORMAT only — the tests must not assert these values.
+Numbers are illustrative of FORMAT only — the tests must not assert these values. (Round-trip figure corrected 2026-08-23: `research/tilt.py:552` uses a plain `NSEIntradayEquityCosts()`, which prices Rs 66,667 at 10.62 bps round-trip, not the previously published 4.55 bps.)
 
 `explain()` states the universe, window, holdout boundary, the one-leg cost convention, and any
 warnings (skipped sessions and why).
