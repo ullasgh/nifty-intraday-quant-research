@@ -87,3 +87,57 @@ Dual independent suites per rule 1, from this spec alone.
 7. Capacity derived from turnover is LOWER than the ADV-based figure on the tilt's ~11% daily
    turnover — assert the ordering, since the whole point is that ADV alone overstates.
 8. `FixedBpsCost(0.0)` yields gross results identical to `ZeroCost`.
+
+---
+
+## AMENDMENT 1 (2026-08-23) — H3's required ordering is WRONG. Lead's error.
+
+H3 above says the ADV-based figure "is an upper bound", i.e. that turnover-based capacity comes out
+LOWER. **That is backwards for this book, and test suite A was correct to refuse to invent a
+formula that produced the required ordering.** Both suites' authors flagged the tension rather than
+resolving it silently; that is exactly the behaviour rule 1's dual-suite design exists to produce.
+
+### The correction
+
+A position limit and a daily-trade limit are **two different constraints on two different risks**,
+not two estimates of one number:
+
+    position (liquidation risk):  AUM <= cap * ADV_i / w_i
+    daily trade (impact risk):    AUM <= cap * ADV_i / (w_i * turnover_frac)
+
+The trade constraint is the position constraint divided by `turnover_frac`. So:
+
+    turnover_frac < 1  ->  trade constraint is LOOSER  ->  POSITION limit binds
+    turnover_frac > 1  ->  trade constraint is TIGHTER ->  TRADE limit binds
+
+Measured for the tilt, from the frozen pre-registration (`turnover = 0.1272107659289835`):
+
+    ratio = 1 / 0.1272 = 7.861x LOOSER
+
+So the trade constraint does not bind at all, and the ~Rs 400 crore ADV-based figure is the
+**operative** number rather than an upper bound to be revised downward. H3's premise — "the tilt
+turns its book over ~11% daily, so the binding constraint is the DAILY TRADE" — inverts the
+implication: low turnover is precisely what makes the trade constraint NOT bind.
+
+### What obligation 7 must assert instead
+
+REMOVE the required ordering `turnover_capacity < adv_capacity`. Replace with:
+
+1. `turnover_capacity / adv_capacity == 1 / turnover_frac`, to tolerance. This is the real
+   relationship and it is directionless — it holds for high- and low-turnover books alike.
+2. Reported capacity is `min(position_capacity, trade_capacity)`, with WHICH ONE BOUND recorded in
+   the output. A capacity figure that does not say which constraint produced it is not actionable.
+3. A regression pinning that at `turnover_frac < 1` the position limit is the binding one, and at
+   `turnover_frac > 1` the trade limit is — so the direction cannot silently flip again.
+
+### Consequence for the candidate, and why H3 now interacts with the liquidity finding
+
+Low turnover is a genuine capacity ADVANTAGE, worth ~7.9x on the trade-impact constraint. But it
+does NOT rescue the position constraint, and the position constraint is exactly where the
+2026-08-23 liquidity result bites: the tilt's edge is concentrated in the bottom two ADV deciles
+(32.95% of gross excess vs a null p95 of 23.82%, above the max of 10,000 replicates). Those names
+have the SMALLEST ADV, so `cap * ADV_i / w_i` is smallest precisely where the edge lives.
+
+**Therefore capacity must be computed PER LIQUIDITY DECILE, not on a pooled average.** A pooled
+figure averages the binding constraint away and will overstate capacity for this strategy
+specifically. Add this as obligation 9; it is now the most important number in Phase H.
