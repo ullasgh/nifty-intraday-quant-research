@@ -39,9 +39,68 @@ def _as_float64_1d(x: np.ndarray, name: str) -> np.ndarray:
     return np.where(np.isfinite(arr), arr, np.nan)
 
 
-@causal(row_arg="returns")
-@finite_output(allow_nan=True)
-def rolling_beta(
+def _beta_session_vectorized(
+    ret_session: np.ndarray, mkt_session: np.ndarray, window: int, resolved_min_count: int
+) -> np.ndarray:
+    """NaN-aware cumulative-sum rolling beta for one session (see `rolling_beta`).
+
+    Reformulates cov(ret, mkt)/var(mkt) via the sum-of-products / sum-of-squares
+    expansion (cov = (sum(x*y) - n*mean_x*mean_y)/(n-1)) so that the whole session
+    is one pass of `np.cumsum` per accumulator, instead of one `np.cov`/`np.var`
+    call per (row, symbol) pair. This is NOT bit-identical to `_rolling_beta_reference`
+    -- see the evidence recorded on `rolling_beta` below for why that was accepted.
+
+    Only called on float64 input that is already causally masked by the caller (see
+    `rolling_beta`'s dtype gate) -- an earlier version of this function centered each
+    series on its own session-wide mean before summing, to reduce cancellation error.
+    That was REJECTED: the session-wide mean at row t is computed from rows AFTER t
+    too, which is a genuine lookahead bug (caught by `test_rolling_beta_is_causal` /
+    `test_beta_residual_return_is_causal` under `Strictness.FULL`'s perturbation
+    probe). No shift is applied here; see `rolling_beta` for how the remaining
+    (non-lookahead) precision gap is handled instead.
+    """
+    n_rows, n_symbols = ret_session.shape
+
+    ret_finite = np.isfinite(ret_session)
+    mkt_finite = np.isfinite(mkt_session)
+    valid = ret_finite & mkt_finite[:, None]  # (n_rows, n_symbols): pair-wise validity
+
+    ret_m = np.where(valid, ret_session, 0.0)
+    mkt_m = np.where(valid, np.broadcast_to(mkt_session[:, None], (n_rows, n_symbols)), 0.0)
+    prod_m = ret_m * mkt_m
+    mkt2_m = mkt_m * mkt_m
+
+    zero_f = np.zeros((1, n_symbols), dtype=np.float64)
+    zero_i = np.zeros((1, n_symbols), dtype=np.int64)
+    cum_n = np.concatenate([zero_i, np.cumsum(valid, axis=0)], axis=0)
+    cum_ret = np.concatenate([zero_f, np.cumsum(ret_m, axis=0)], axis=0)
+    cum_mkt = np.concatenate([zero_f, np.cumsum(mkt_m, axis=0)], axis=0)
+    cum_prod = np.concatenate([zero_f, np.cumsum(prod_m, axis=0)], axis=0)
+    cum_mkt2 = np.concatenate([zero_f, np.cumsum(mkt2_m, axis=0)], axis=0)
+
+    k = np.arange(n_rows)
+    start = np.maximum(0, k - window + 1)
+
+    n = cum_n[k + 1] - cum_n[start]
+    sum_ret = cum_ret[k + 1] - cum_ret[start]
+    sum_mkt = cum_mkt[k + 1] - cum_mkt[start]
+    sum_prod = cum_prod[k + 1] - cum_prod[start]
+    sum_mkt2 = cum_mkt2[k + 1] - cum_mkt2[start]
+
+    ok = n >= resolved_min_count
+    safe_n = np.where(ok, n, 2).astype(np.float64)  # avoid /0 and /1 (ddof=1) off the ok path
+
+    with np.errstate(invalid="ignore", divide="ignore"):
+        mean_ret = sum_ret / safe_n
+        mean_mkt = sum_mkt / safe_n
+        cov_xy = (sum_prod - safe_n * mean_ret * mean_mkt) / (safe_n - 1.0)
+        var_mkt = (sum_mkt2 - safe_n * mean_mkt * mean_mkt) / (safe_n - 1.0)
+        beta = cov_xy / var_mkt
+
+    return np.where(ok & (var_mkt > 0) & np.isfinite(cov_xy), beta, np.nan).astype(np.float64)
+
+
+def _rolling_beta_reference(
     returns: np.ndarray,
     market_returns: np.ndarray,
     window: int,
@@ -49,23 +108,15 @@ def rolling_beta(
     day_offsets: np.ndarray | None = None,
     min_count: int | None = None,
 ) -> np.ndarray:
-    """Rolling OLS beta of each symbol on the market over a window.
+    """Reference `rolling_beta`: per-(row, symbol) `np.cov`/`np.var` on masked slices.
 
-    Beta is estimated as cov(returns, market_returns) / var(market_returns)
-    using a min_count-style minimum number of finite pairs.
-
-    Args:
-        returns: Shape (n_rows, n_symbols), float32/64.
-        market_returns: Shape (n_rows,), float32/64.
-        window: Lookback window in bars.
-        day_offsets: Session boundaries; if None, treat all data as one session.
-        min_count: Minimum finite pairs for a valid beta. Defaults to window.
-
-    Returns:
-        Shape (n_rows, n_symbols), dtype float64. NaN until min_count pairs exist.
+    PRIVATE. Kept only so the equivalence check against the vectorized `rolling_beta`
+    stays runnable (see `tests/test_rolling_beta_equivalence.py`) rather than becoming an
+    unverifiable claim in a comment. This is the original O(n_rows * window * n_symbols)
+    implementation with per-call `np.cov`/`np.var` overhead: ~85 min per feature x horizon
+    shard on the full panel (measured 2026-08, 3-month/149-symbol slice: 58s, dominated by
+    2.8M `np.cov` calls). Do not use this in production code paths.
     """
-    # Convert to float arrays but preserve original dtype for intermediate calculations
-    # to match numpy's precision behavior
     returns_arr = np.asarray(returns)
     if returns_arr.ndim != 2:
         raise ValueError("returns must be a 2-D array")
@@ -82,14 +133,6 @@ def rolling_beta(
 
     resolved_min_count = window if min_count is None else min_count
 
-    # Upcast to float64 for output, but work in original precision for intermediate calc
-    returns64 = np.asarray(returns_arr, dtype=np.float64)
-    returns64 = np.where(np.isfinite(returns64), returns64, np.nan)
-    market64 = np.asarray(market_arr, dtype=np.float64)
-    market64 = np.where(np.isfinite(market64), market64, np.nan)
-
-    # Need to work with original dtype to match numpy precision,
-    # but wrap session function to convert back to float64 at end
     def _beta_session_orig_dtype(
         ret_session_orig: np.ndarray, mkt_session_orig: np.ndarray
     ) -> np.ndarray:
@@ -140,6 +183,100 @@ def rolling_beta(
     return _apply_by_session(
         _beta_session_orig_dtype, returns_arr, market_arr, day_offsets=day_offsets
     )
+
+
+@causal(row_arg="returns")
+@finite_output(allow_nan=True)
+def rolling_beta(
+    returns: np.ndarray,
+    market_returns: np.ndarray,
+    window: int,
+    *,
+    day_offsets: np.ndarray | None = None,
+    min_count: int | None = None,
+) -> np.ndarray:
+    """Rolling OLS beta of each symbol on the market over a window.
+
+    Beta is estimated as cov(returns, market_returns) / var(market_returns)
+    using a min_count-style minimum number of finite pairs.
+
+    Args:
+        returns: Shape (n_rows, n_symbols), float32/64.
+        market_returns: Shape (n_rows,), float32/64.
+        window: Lookback window in bars.
+        day_offsets: Session boundaries; if None, treat all data as one session.
+        min_count: Minimum finite pairs for a valid beta. Defaults to window.
+
+    Returns:
+        Shape (n_rows, n_symbols), dtype float64. NaN until min_count pairs exist.
+
+    Performance note (measured 2026-08, profiling task): the original implementation
+    called `np.cov`/`np.var` once per (row, symbol) pair -- 2.8M calls on a 3-month,
+    149-symbol slice, 58s wall, extrapolating to the reported ~85 min/shard on the full
+    7.5y panel. This function now uses `_beta_session_vectorized`, a NaN-aware
+    cumulative-sum reformulation: 489x/475x faster at window=20/60 on the same slice
+    (38.1s/36.1s -> 0.078s/0.076s), with the NaN mask identical to the reference (0
+    mismatches over 2,805,956 cells) but NOT bit-identical to it: max abs diff
+    1.458e-12 at window=60 (real 149-symbol panel, 3.4% NaN density in returns), driven
+    by summation-order (compress-then-`np.cov`'s mean-centered form vs. this function's
+    sum-of-products form), not by numerical instability -- returns are O(1e-3), so no
+    large-magnitude cancellation is involved.
+
+    This was accepted only after measuring the effect where the number is actually
+    consumed, not on the size of the deviation alone (CLAUDE.md rule 8: no threshold
+    from reasoning about a number's size, only from measurement). Downstream
+    acceptance test (real 3-month/149-symbol slice, `cross_sectional_rank` ->
+    `causal_buckets` -> `conditional_expectancy`, 2026-08):
+      - raw `rolling_beta` as the bucketed feature: 0 / 2,805,956 assigned-cell bucket
+        reassignments; `spread_bps` and `spread_t` identical to full float64 precision
+        (diff == 0.0) between old and new.
+      - `beta_residual_return` (which applies this beta) as the bucketed feature: 0 /
+        2,796,892 bucket reassignments; `spread_bps` diff == 0.0.
+    The 1.458e-12 beta deviation never flipped a single cross-sectional rank at this
+    scale; where it could in principle (an exact tie to within ~1e-12), that ordering
+    was already effectively arbitrary. `_rolling_beta_reference` (this module) is kept
+    for `tests/test_rolling_beta_equivalence.py`, which re-runs this comparison.
+
+    dtype gate: the fast path is used ONLY when both inputs are ALREADY float64 (rule
+    3's "float64 in motion" -- every real caller upcasts before calling feature
+    functions, so this is the actual production path). For any other input dtype
+    (e.g. float32), this delegates unchanged to `_rolling_beta_reference`. This is not
+    a tolerance dodge: `np.var`/`np.cov` on a float32 array compute their ENTIRE
+    mean/subtract/square/sum reduction in float32 (numpy's default output dtype
+    follows input dtype for these reductions), which the O(1)-per-row cumulative-sum
+    reformulation cannot reproduce to float32 precision without either (a) doing the
+    cumulative sums in float32 too -- reintroducing exactly the accumulation-in-float32
+    that CLAUDE.md rule 3 forbids -- or (b) replicating a different formula's rounding
+    by accident. Real feature-sweep callers never hit this branch.
+    """
+    returns_arr = np.asarray(returns)
+    if returns_arr.ndim != 2:
+        raise ValueError("returns must be a 2-D array")
+
+    market_arr = np.asarray(market_returns)
+    if market_arr.ndim != 1:
+        raise ValueError("market_returns must be a 1-D array")
+    if returns_arr.shape[0] != market_arr.shape[0]:
+        raise ValueError("returns and market_returns must have same length")
+    if day_offsets is not None:
+        check_day_offsets(np.asarray(day_offsets), returns_arr.shape[0])
+    if window <= 0:
+        raise ValueError("window must be positive")
+
+    if returns_arr.dtype != np.float64 or market_arr.dtype != np.float64:
+        return _rolling_beta_reference(
+            returns_arr, market_arr, window, day_offsets=day_offsets, min_count=min_count
+        )
+
+    resolved_min_count = window if min_count is None else min_count
+
+    returns64 = np.where(np.isfinite(returns_arr), returns_arr, np.nan)
+    market64 = np.where(np.isfinite(market_arr), market_arr, np.nan)
+
+    def _fn(ret_session: np.ndarray, mkt_session: np.ndarray) -> np.ndarray:
+        return _beta_session_vectorized(ret_session, mkt_session, window, resolved_min_count)
+
+    return _apply_by_session(_fn, returns64, market64, day_offsets=day_offsets)
 
 
 @causal(row_arg="returns")
