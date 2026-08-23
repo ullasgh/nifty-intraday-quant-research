@@ -1,0 +1,70 @@
+{
+  "code_version": "0.1.0",
+  "config_hash": "121c5640226f5c27",
+  "contract_hash": "d12b91b5db230e54",
+  "frozen_params": {
+    "capital": 1000000.0,
+    "continuous_only": false,
+    "entry_hhmm": "09:16",
+    "exit_hhmm": "15:20",
+    "rebalance_every": 1,
+    "seed": 0,
+    "smoothing": 0.1,
+    "tilt": "mild",
+    "universe": "all_equity"
+  },
+  "git_sha": "9ac6c05706794c621d0a7b59278408dd9226842d-dirty",
+  "holdout_end": "2026-08-14",
+  "holdout_start": "2025-08-14",
+  "purpose": "preregistration",
+  "research_end": "2025-07-31",
+  "research_result": {
+    "ann_net_pct": 8.102126328132156,
+    "breakeven_turnover": 0.4298248600518746,
+    "clip_per_name": 9345.794392523365,
+    "cost_bps": 1.351553326827803,
+    "gross_bps": 4.5666828221183415,
+    "max_n_held": 73,
+    "max_weight_sum_deviation": 4.440892098500626e-16,
+    "min_weight_seen": 0.0,
+    "n_sessions": 388,
+    "n_symbols": 149,
+    "n_warnings": 7,
+    "net_bps": 3.215129495290538,
+    "per_year": [
+      {
+        "ann_net_pct": 9.780621908725509,
+        "cost_bps": 1.342587556063371,
+        "gross_bps": 5.223786726192541,
+        "n_sessions": 242,
+        "net_bps": 3.8811991701291704,
+        "turnover": 0.12636689055725545,
+        "year": 2024
+      },
+      {
+        "ann_net_pct": 5.319962420573308,
+        "cost_bps": 1.3664143989167934,
+        "gross_bps": 3.4775105975569955,
+        "n_sessions": 146,
+        "net_bps": 2.111096198640202,
+        "turnover": 0.1286095182574642,
+        "year": 2025
+      }
+    ],
+    "round_trip_bps": 10.624519999999997,
+    "turnover": 0.1272107659289835
+  },
+  "research_start": "2024-01-01",
+  "result_table": "Tilt backtest  mild / smoothing 0.10 / capital Rs 1,000,000\nUniverse all_equity (149 names)   2024-01-01 .. 2025-07-31   388 sessions\nClip per name Rs 9,346   round-trip 10.62 bps   breakeven turnover 0.43\n\nyear   sessions   gross_bps   turnover   cost_bps   net_bps   ann_net%\n2024   242            5.22     0.1264      1.34     3.88     9.78\n2025   146            3.48     0.1286      1.37     2.11     5.32\n--------------------------------------------------------------------\nALL    388            4.57     0.1272      1.35     3.22     8.10",
+  "split_id": "prereg_holdout_2025-08-14_2026-08-14",
+  "ts": "2026-08-23T12:25:33+00:00",
+  "warnings": [
+    "2024-03-02: missing 09:16 or 15:20 checkpoint, session skipped",
+    "2024-05-18: missing 09:16 or 15:20 checkpoint, session skipped",
+    "2024-11-01: missing 09:16 or 15:20 checkpoint, session skipped",
+    "2024-01-01: only 0 valid names (need >= 5), session skipped",
+    "2024-03-04: only 0 valid names (need >= 5), session skipped",
+    "2024-05-21: only 0 valid names (need >= 5), session skipped",
+    "2024-11-04: only 0 valid names (need >= 5), session skipped"
+  ]
+}
