@@ -109,10 +109,21 @@ def _isolated_holdout_lock(request, tmp_path, monkeypatch):
 # Delete each entry as its implementation lands. An entry left here after implementation
 # would silently stop gating real code, so the list is deliberately explicit rather than a
 # wildcard.
-_PENDING_SUITES: tuple[str, ...] = ()
-# EMPTY, and that is the correct state: every tests-first suite dispatched so far has had
-# its implementation land. Entries go in only while a suite is RED by design, and come out
-# the moment it goes green -- a stale entry would silently stop gating real code.
+_PENDING_SUITES: tuple[str, ...] = (
+    # ADDED 2026-08-23, tests-first per rule 1: written from spec ALONE by two independent
+    # authors before any implementation exists. RED BY DESIGN -- the modules they import
+    # (`nifty_quant.execution.capacity`, the Phase G weighting schemes) are not built yet.
+    # REMOVE EACH ENTRY THE MOMENT ITS IMPLEMENTATION GOES GREEN. A stale entry here
+    # silently stops gating real code, which is the one failure this list exists to prevent.
+    "test_execution_capacity_a.py",
+    "test_execution_capacity_b.py",
+    "test_portfolio_construction_a.py",
+    "test_portfolio_construction_b.py",
+)
+# Entries go in ONLY while a suite is RED by design, and come out the moment it goes green.
+# Note this list is inert unless NQ_SKIP_PENDING=1 -- an unqualified `make gate` still runs
+# these suites and still fails on them, which is deliberate: the exemption has to be an
+# explicit, visible act rather than the default.
 
 # Removed as their implementations landed and went green, which is the point of the list being
 # explicit: test_research_contract_{a,b}, test_tca_record_{a,b}, test_overlap_se_{a,b},
