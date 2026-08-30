@@ -572,8 +572,6 @@ def _variance_ratio_1d_daily(
     """
     x = np.asarray(x, dtype=np.float64)
     offs = np.asarray(day_offsets, dtype=np.int64)
-    if not np.all(np.isfinite(x)):
-        return np.nan
 
     segments = _segment_bounds(offs, x.shape[0])
     ratios: list[float] = []
@@ -581,7 +579,9 @@ def _variance_ratio_1d_daily(
 
     for start, end in segments:
         seg = x[start : end + 1]
-        if seg.shape[0] < 2 or q >= seg.shape[0]:
+        # A missing bar invalidates its own day's segment, never the whole series (rule 6).
+        # Skip any day segment containing a non-finite value alongside length/q checks.
+        if not np.all(np.isfinite(seg)) or seg.shape[0] < 2 or q >= seg.shape[0]:
             continue
         vr = _variance_ratio_1d_contiguous(seg, q)
         if np.isfinite(vr):

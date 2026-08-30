@@ -251,8 +251,12 @@ def _rv_to_vix_ratio(close: np.ndarray, day_offsets: np.ndarray) -> np.ndarray:
     rv_ann = _core.ewma_volatility_ann(
         close, day_offsets, halflife=_DEFAULT_HALFLIFE_BARS
     )
-    vix_proxy = np.full_like(rv_ann, _VIX_PROXY_LEVEL)  # proxy: no VIX series in run_sweep
-    return _market.rv_to_vix_ratio(rv_ann, vix_proxy)
+    n_rows, n_symbols = rv_ann.shape
+    out = np.empty((n_rows, n_symbols), dtype=np.float64)
+    vix_proxy_1d = np.full(n_rows, _VIX_PROXY_LEVEL)  # proxy: no VIX series in run_sweep
+    for s in range(n_symbols):
+        out[:, s] = _market.rv_to_vix_ratio(rv_ann[:, s], vix_proxy_1d)
+    return out
 
 
 def _close_location_value(

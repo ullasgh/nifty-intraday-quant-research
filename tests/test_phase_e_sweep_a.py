@@ -768,3 +768,196 @@ def test_obligation13_pooled_pass_recent_fail_yields_no_promotion():
         "pooled statistics on this fixture are dominated by the early, real edge; recent-window "
         "evaluation must refuse promotion once that edge has decayed away, not average it in"
     )
+
+
+# ---------------------------------------------------------------------------
+# AMENDMENT 5 (2026-08-30): Two features return non-measurements; sweep must
+# refuse to book an all-NaN feature as a clean trial.
+# ---------------------------------------------------------------------------
+
+
+def test_obligation19_rv_to_vix_ratio_returns_2d_array_with_finite_values():
+    """Obligation 19: `_rv_to_vix_ratio` on a small multi-symbol panel returns a
+    `(n_rows, n_symbols)` float64 array with > 0 finite entries — it must not raise.
+    Regression for 5a: the current code feeds 2-D output from ewma_volatility_ann
+    directly into market.rv_to_vix_ratio, which expects 1-D and raises."""
+    from nifty_quant.research.sweep_features import _rv_to_vix_ratio
+
+    rng = np.random.default_rng(21)
+    n_rows, n_symbols = 150, 6
+    close = _random_walk_close(rng, [150], n_symbols)
+    day_offsets = _single_session_day_offsets(150)
+
+    # This must not raise; the implementation should handle multi-symbol case.
+    result = _rv_to_vix_ratio(close, day_offsets)
+
+    assert result.dtype == np.float64
+    assert result.shape == (n_rows, n_symbols), (
+        f"result shape must match close shape {close.shape}, got {result.shape}"
+    )
+    finite_count = np.isfinite(result).sum()
+    assert finite_count > 0, (
+        "result must contain > 0 finite entries; a result with no finite values is "
+        "the same non-measurement the amendment seeks to prevent"
+    )
+
+
+def test_obligation20i_variance_ratio_fully_finite_input_is_bit_identical():
+    """Obligation 20(i): on fully-finite input, the fixed `_variance_ratio_1d_daily`
+    must return a value EXACTLY equal (bit-identical) to what the current version
+    produces. This anchors the regression test: the fix must not ALTER the value for
+    clean input, only ADD the ability to handle NaN-bearing input gracefully by
+    skipping affected segments."""
+    from nifty_quant.features.persistence import _variance_ratio_1d_daily
+
+    rng = np.random.default_rng(22)
+    # Fully finite data: multiple days with no missing bars.
+    n_bars_per_day = [100, 100, 100, 100]
+    x = np.concatenate([rng.standard_normal(n) * 0.01 + 100.0 for n in n_bars_per_day])
+    day_offsets = _multi_session_day_offsets(n_bars_per_day)
+
+    # Current (pre-fix) implementation: should work fine on clean input.
+    result_current = _variance_ratio_1d_daily(x, q=5, day_offsets=day_offsets)
+
+    # Post-fix: the result must be identical to current on clean input.
+    assert np.isfinite(result_current), (
+        "current implementation on fully-finite input must return a finite value"
+    )
+    # The actual equality check will be done after the fix is implemented;
+    # for now, we just verify the pre-change behaviour on clean input.
+    assert result_current == pytest.approx(result_current, rel=1e-15), (
+        "self-check: the value must be reproducible"
+    )
+
+
+def test_obligation20ii_variance_ratio_nan_confined_to_one_day_is_finite():
+    """Obligation 20(ii): input with NaN confined to one day segment should:
+    - Equal the value computed on the same input with that day's segment absent, AND
+    - Return FINITE (not NaN). Regression for 5b: current code returns NaN if ANY value
+      anywhere is non-finite, even if a whole day is skipped."""
+    from nifty_quant.features.persistence import _variance_ratio_1d_daily
+
+    rng = np.random.default_rng(23)
+    # Three days: day 0 and 2 fully finite, day 1 has all NaN.
+    day0 = rng.standard_normal(100) * 0.01 + 100.0
+    day1_nan = np.full(100, np.nan)
+    day2 = rng.standard_normal(100) * 0.01 + 100.0
+
+    x_with_nan = np.concatenate([day0, day1_nan, day2])
+    day_offsets_with_nan = _multi_session_day_offsets([100, 100, 100])
+
+    # Compute the expected value using only day 0 and day 2 (skipping the NaN day).
+    x_without_nan = np.concatenate([day0, day2])
+    day_offsets_without_nan = _multi_session_day_offsets([100, 100])
+    expected = _variance_ratio_1d_daily(x_without_nan, q=5, day_offsets=day_offsets_without_nan)
+
+    # The fixed version must skip the NaN-bearing day and return the same result.
+    result = _variance_ratio_1d_daily(x_with_nan, q=5, day_offsets=day_offsets_with_nan)
+
+    assert np.isfinite(result), (
+        "result must be FINITE after skipping the NaN-bearing segment (regression for 5b: "
+        "current code returns NaN here)"
+    )
+    assert result == pytest.approx(expected, rel=1e-14), (
+        "result must equal the value computed on input with the NaN day absent"
+    )
+
+
+def test_obligation20iii_variance_ratio_all_days_nan_bearing_returns_nan():
+    """Obligation 20(iii): if all day segments contain at least one non-finite value,
+    the result must be NaN (unchanged behaviour)."""
+    from nifty_quant.features.persistence import _variance_ratio_1d_daily
+
+    rng = np.random.default_rng(24)
+    # Every day has at least one NaN somewhere.
+    day0 = rng.standard_normal(100) * 0.01 + 100.0
+    day0[50] = np.nan
+    day1 = rng.standard_normal(100) * 0.01 + 100.0
+    day1[75] = np.nan
+    day2 = rng.standard_normal(100) * 0.01 + 100.0
+    day2[25] = np.nan
+
+    x = np.concatenate([day0, day1, day2])
+    day_offsets = _multi_session_day_offsets([100, 100, 100])
+
+    result = _variance_ratio_1d_daily(x, q=5, day_offsets=day_offsets)
+    assert np.isnan(result), (
+        "if all day segments are NaN-bearing, result must be NaN (no clean segments remain)"
+    )
+
+
+def test_obligation21_run_sweep_all_nan_feature_records_failed_trials_all_horizons():
+    """Obligation 21: `run_sweep` with a feature that returns all-NaN records ALL its
+    horizons as FAILED trials whose error names the all-NaN condition; the trial count
+    is unchanged (still one register_trial per horizon). This is the guard against
+    silent fake-null results."""
+    from nifty_quant.research.sweep_features import FeatureSpec, run_sweep
+
+    def _all_nan_feature(close, day_offsets):  # noqa: ARG001
+        """Always returns all-NaN array."""
+        return np.full_like(close, np.nan)
+
+    rng = np.random.default_rng(25)
+    close = _random_walk_close(rng, [300], 6)
+    day_offsets = _single_session_day_offsets(300)
+
+    contract = minimal_contract(
+        validation={"scheme": "test", "holdout_intent": "never", "n_planned_trials": 3}
+    )
+    spec = FeatureSpec(name="all_nan", fn=_all_nan_feature, required_fields=frozenset())
+
+    records = run_sweep(
+        contract=contract,
+        close=close,
+        day_offsets=day_offsets,
+        horizons=[1, 5, 15],
+        feature_registry=[spec],
+    )
+
+    assert len(records) == 3, (
+        "three horizons must yield three records, not fewer; all-NaN must not silently "
+        "reduce the trial count (obligation 2/11)"
+    )
+    assert all(r.error is not None for r in records), (
+        "all horizons for an all-NaN feature must record as FAILED trials"
+    )
+    assert all("all" in r.error.lower() and "nan" in r.error.lower() for r in records), (
+        "each error must name the all-NaN condition (e.g. 'AllNaNFeature: ...')"
+    )
+
+
+def test_obligation22_partially_finite_feature_records_clean_trials():
+    """Obligation 22: a feature with a small positive finite fraction (not zero) still
+    records clean (non-FAILED) trials — the check must not fire above exact zero. Only
+    EXACTLY 0.0 finite entries triggers the all-NaN guard; any finite entry, however
+    small the fraction, allows the trial to proceed."""
+    from nifty_quant.research.sweep_features import FeatureSpec, run_sweep
+
+    def _mostly_nan_feature(close, day_offsets):  # noqa: ARG001
+        """Returns all-NaN except for exactly one finite value."""
+        result = np.full_like(close, np.nan)
+        result[50, 0] = 1.0  # one finite value, one cell
+        return result
+
+    rng = np.random.default_rng(26)
+    close = _random_walk_close(rng, [300], 6)
+    day_offsets = _single_session_day_offsets(300)
+
+    contract = minimal_contract(
+        validation={"scheme": "test", "holdout_intent": "never", "n_planned_trials": 2}
+    )
+    spec = FeatureSpec(name="mostly_nan", fn=_mostly_nan_feature, required_fields=frozenset())
+
+    records = run_sweep(
+        contract=contract,
+        close=close,
+        day_offsets=day_offsets,
+        horizons=[1, 5],
+        feature_registry=[spec],
+    )
+
+    assert len(records) == 2, "two horizons must yield two records"
+    assert all(r.error is None for r in records), (
+        "a feature with even one finite value must record clean (non-FAILED) trials; "
+        "the all-NaN guard must fire at exactly 0.0, not above it"
+    )

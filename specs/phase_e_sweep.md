@@ -327,3 +327,68 @@ registry actually declares, and keep `memmap=False`.
 This changes a signature both `tests/test_phase_e_sweep_a.py` and `_b.py` assert on, plus the
 registry and the runner. **ONE agent owns all of it.** This repo has already produced a broken build
 from two agents each correctly implementing opposite sides of one interface.
+
+
+# AMENDMENT 5 — 2026-08-30. Two features record non-measurements as results. The sweep must
+# refuse to book an all-NaN feature as a clean trial.
+
+## The defects, both verified by reading the code (not conjecture)
+
+**5a. `rv_to_vix_ratio` raises unconditionally at EVERY window length.** The adapter
+`sweep_features._rv_to_vix_ratio` feeds the 2-D `(n_rows, n_symbols)` output of
+`core.ewma_volatility_ann` straight into `market.rv_to_vix_ratio`, whose contract is 1-D
+(`_as_float64_1d` at `market.py:586` raises on 2-D input). Every trial for this feature records
+as FAILED — which obligation 11 treats as a result, but an unconditional shape mismatch is a
+HARNESS defect, not a feature verdict. 1 of 22 registry entries has never been measurable.
+
+**5b. `variance_ratio` books a fake null at production length.** `_variance_ratio_1d_daily`
+(`persistence.py:575-576`) returns NaN if ANY value in the whole series is non-finite — even
+though the very next lines process days as independent segments. At the production window
+(701,863 rows) every symbol has at least one missing bar, so all 149 symbols return NaN, the
+feature is all-NaN, and the sweep records a clean trial that reads as "no edge". On 1- and
+3-month slices 62-66% of symbols are complete, so every short-slice smoke test passes. This is
+the same shape as the seven AMENDMENT-4 fake nulls: a measurement that did not happen,
+indistinguishable in the output from a genuine negative.
+
+## Required changes
+
+**C1 (`sweep_features.py`).** `_rv_to_vix_ratio` applies the 1-D feature per symbol — loop over
+columns exactly as `_overnight_return` already does. Do NOT change `market.rv_to_vix_ratio`'s
+1-D contract; it is decorated, documented and tested as 1-D.
+
+**C2 (`persistence.py`).** In `_variance_ratio_1d_daily`, remove the whole-series finiteness
+gate. Instead, skip any day segment containing a non-finite value (alongside the existing
+too-short-segment skip). Rationale: rule 6 — NaN means "no bar occurred"; a missing bar
+invalidates its own day's segment, never the whole year. If every segment is skipped the result
+stays NaN (unchanged). On fully-finite input the result must be BIT-IDENTICAL to today's — this
+change may only ADD segments' worth of data relative to the current all-or-nothing behaviour on
+NaN-bearing input, and must change nothing on clean input. No forward-filling, no interpolation.
+
+**C3 (`feature_sweep.py`).** Per-feature finite-fraction check in `run_sweep`: after
+`feature_values` is computed, if the fraction of finite entries is EXACTLY 0.0, record every
+horizon's trial as FAILED with an error naming the condition (e.g.
+`"AllNaNFeature: feature 'variance_ratio' produced 0 finite values over <n> cells"`), never a
+clean trial. Rule-8 note: 0.0 is not a tuned threshold — it is exact degeneracy, "no measurement
+occurred". Any cutoff ABOVE 0.0 would be a hand-chosen constant and is deliberately NOT
+introduced; a partially-finite feature records normally and its finite fraction is already
+visible via `n_defined`.
+
+## Test obligations (extending the existing dual suites; numbering continues AMENDMENT 4)
+
+19. `_rv_to_vix_ratio` on a small multi-symbol panel returns a `(n_rows, n_symbols)` float64
+    array with > 0 finite entries — it must not raise. (Regression for 5a: it raises today.)
+20. `variance_ratio` (1-D + day_offsets path): (i) fully-finite input → bit-identical to the
+    pre-change value; (ii) input with NaN confined to one day → equals the value computed on
+    the same input with that day's segment absent, and is FINITE (regression for 5b: NaN
+    today); (iii) all days NaN-bearing → NaN.
+21. `run_sweep` with a feature that returns all-NaN records ALL its horizons as FAILED trials
+    whose error names the all-NaN condition; the trial count is unchanged (obligation 2/11:
+    still one register_trial per horizon).
+22. A feature with a small positive finite fraction still records clean (non-FAILED) trials —
+    the check must not fire above exact zero.
+
+## Ownership
+
+C1, C2, C3 are three files with NO shared interface — one agent per file is safe here. The two
+test-suite extensions are written INDEPENDENTLY from this amendment alone (one author per suite,
+neither sees the other's tests, before any implementation exists), per rule 1.

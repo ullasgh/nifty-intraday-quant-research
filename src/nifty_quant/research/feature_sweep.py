@@ -276,6 +276,18 @@ def run_sweep(
             feature_values = feature_spec.fn(close64, day_offsets_arr, **call_kwargs)
         except Exception as exc:  # noqa: BLE001 - obligations 11/16: a raise is a RESULT
             feature_error = f"{type(exc).__name__}: {exc}"
+
+        # C3 (AMENDMENT 5): Check for all-NaN feature (obligation 21). If the fraction of
+        # finite entries is EXACTLY 0.0, record every horizon's trial as FAILED. Rule 8: 0.0
+        # is exact degeneracy, not a tuned threshold; any cutoff ABOVE 0.0 would be
+        # hand-chosen and is forbidden.
+        if feature_error is None and feature_values is not None:
+            if not np.isfinite(feature_values).any():
+                feature_error = (
+                    f"AllNaNFeature: feature {feature_spec.name!r} produced 0 finite values "
+                    f"over {feature_values.size} cells"
+                )
+
         # The shared feature-computation cost is amortised evenly across this feature's
         # horizons below, rather than charged entirely to the first and zero to the rest --
         # `wall_s` per trial stays a fair (if approximate) per-trial cost, not a bookkeeping

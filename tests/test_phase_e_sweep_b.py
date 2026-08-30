@@ -766,3 +766,211 @@ def test_obligation_14_data_window_must_end_before_holdout_start(end_date, expec
     else:
         records = call()
         assert len(records) == 1
+
+
+# ---------------------------------------------------------------------------
+# AMENDMENT 5 (2026-08-30) -- Two features record non-measurements as results.
+# ---------------------------------------------------------------------------
+
+
+def test_obligation_19_rv_to_vix_ratio_adapter_on_multisymbol_panel():
+    """Obligation 19: `_rv_to_vix_ratio` on a small multi-symbol panel returns a
+    `(n_rows, n_symbols)` float64 array with > 0 finite entries — it must not raise.
+    (Regression for AMENDMENT 5a: it raises today because it feeds 2-D output of
+    `ewma_volatility_ann` directly to `market.rv_to_vix_ratio` which expects 1-D.)
+    """
+    from nifty_quant.research.sweep_features import _rv_to_vix_ratio
+
+    close, day_offsets = _make_close(n_symbols=5, n_rows=50, seed=19)
+
+    # Must NOT raise; the old code raises on 2-D input from ewma_volatility_ann.
+    result = _rv_to_vix_ratio(close, day_offsets)
+
+    assert isinstance(result, np.ndarray)
+    assert result.shape == close.shape
+    assert result.dtype == np.float64
+    assert np.count_nonzero(np.isfinite(result)) > 0, "result must have > 0 finite entries"
+
+
+def test_obligation_20i_variance_ratio_fully_finite_bit_identical():
+    """Obligation 20(i): variance_ratio on fully-finite input returns a value
+    bit-identical to the pre-change computation.
+
+    The expected value is computed via the AMENDMENT 5 independent reference:
+    per-day segments via persistence._variance_ratio_1d_contiguous, weighted by
+    segment length minus one, exactly as the amendment describes the segment combination.
+    """
+    from nifty_quant.features.persistence import (
+        _segment_bounds,
+        _variance_ratio_1d_contiguous,
+        variance_ratio,
+    )
+
+    # Construct a 1-D fully-finite log-price series with known segments.
+    rng = np.random.default_rng(20)
+    seg1 = np.cumsum(rng.normal(0.0, 0.01, size=30)).astype(np.float64)
+    seg2 = np.cumsum(rng.normal(0.0, 0.01, size=40)).astype(np.float64)
+    seg3 = np.cumsum(rng.normal(0.0, 0.01, size=25)).astype(np.float64)
+
+    x = np.concatenate([seg1, seg2, seg3])
+    day_offsets = np.array([0, len(seg1), len(seg1) + len(seg2), len(x)], dtype=np.int64)
+    q = 5
+
+    # Compute expected value via the spec's independent reference:
+    # per-day segments via _variance_ratio_1d_contiguous, weighted by (segment_length - 1).
+    segments = _segment_bounds(day_offsets, x.shape[0])
+    ratios = []
+    weights = []
+    for start, end in segments:
+        seg = x[start : end + 1]
+        if seg.shape[0] < 2 or q >= seg.shape[0]:
+            continue
+        vr = _variance_ratio_1d_contiguous(seg, q)
+        if np.isfinite(vr):
+            ratios.append(vr)
+            weights.append(float(seg.shape[0] - 1))
+
+    expected = np.nan
+    if ratios:
+        ratios_arr = np.asarray(ratios, dtype=np.float64)
+        weights_arr = np.asarray(weights, dtype=np.float64)
+        expected = float(np.sum(weights_arr * ratios_arr) / np.sum(weights_arr))
+
+    result = variance_ratio(x, q, day_offsets=day_offsets)
+
+    # Bit-identical comparison using exact equality.
+    assert np.isnan(expected) or np.isnan(result) or result == expected, (
+        f"expected {expected}, got {result}"
+    )
+
+
+def test_obligation_20ii_variance_ratio_nan_confined_to_one_day():
+    """Obligation 20(ii): variance_ratio on input with NaN confined to one day equals
+    the value computed on the same input with that day's segment absent, and is FINITE.
+    (Regression for AMENDMENT 5b: NaN today because _variance_ratio_1d_daily returns NaN
+    if ANY value in the series is non-finite, even though code processes days independently.)
+    """
+    from nifty_quant.features.persistence import (
+        variance_ratio,
+    )
+
+    # Construct a 3-segment series with NaN in the middle segment.
+    rng = np.random.default_rng(20)
+    seg1 = np.cumsum(rng.normal(0.0, 0.01, size=30)).astype(np.float64)
+    seg2_full = np.cumsum(rng.normal(0.0, 0.01, size=40)).astype(np.float64)
+    seg2_with_nan = seg2_full.copy()
+    seg2_with_nan[15] = np.nan  # Put a single NaN in the middle segment
+    seg3 = np.cumsum(rng.normal(0.0, 0.01, size=25)).astype(np.float64)
+
+    x_with_nan = np.concatenate([seg1, seg2_with_nan, seg3])
+    day_offsets = np.array(
+        [0, len(seg1), len(seg1) + len(seg2_with_nan), len(x_with_nan)], dtype=np.int64
+    )
+    q = 5
+
+    # Compute expected: same segments but WITHOUT the NaN-bearing day (seg2).
+    x_without_seg2 = np.concatenate([seg1, seg3])
+    day_offsets_without_seg2 = np.array([0, len(seg1), len(x_without_seg2)], dtype=np.int64)
+
+    expected = variance_ratio(x_without_seg2, q, day_offsets=day_offsets_without_seg2)
+
+    result = variance_ratio(x_with_nan, q, day_offsets=day_offsets)
+
+    # Result must be FINITE (regression: it's NaN today).
+    assert np.isfinite(result), f"result must be finite, got {result}"
+    # Result must equal the no-nan-segment value.
+    assert result == expected, f"expected {expected}, got {result}"
+
+
+def test_obligation_20iii_variance_ratio_all_days_nan_bearing():
+    """Obligation 20(iii): variance_ratio on all-NaN or all-NaN-bearing input returns NaN."""
+    from nifty_quant.features.persistence import variance_ratio
+
+    # All-NaN input.
+    x_all_nan = np.full(50, np.nan, dtype=np.float64)
+    day_offsets = np.array([0, 25, 50], dtype=np.int64)
+    q = 5
+
+    result = variance_ratio(x_all_nan, q, day_offsets=day_offsets)
+
+    assert np.isnan(result), f"all-NaN input should produce NaN, got {result}"
+
+
+def test_obligation_21_all_nan_feature_records_failed_trials_for_all_horizons():
+    """Obligation 21: run_sweep with a feature that returns all-NaN records ALL its
+    horizons as FAILED trials whose error names the all-NaN condition; the trial count
+    is unchanged (obligation 2/11: still one register_trial per horizon).
+
+    This tests the sweep-level check (C3 in the amendment): after feature_values is
+    computed, if the fraction of finite entries is EXACTLY 0.0, record every horizon's
+    trial as FAILED.
+    """
+    close, day_offsets = _make_close(n_symbols=5, n_rows=40, seed=21)
+    contract = minimal_contract(
+        validation={"scheme": "test", "holdout_intent": "never", "n_planned_trials": 3}
+    )
+
+    def _all_nan_feature(close: np.ndarray, day_offsets: np.ndarray) -> np.ndarray:
+        return np.full_like(close, np.nan, dtype=np.float64)
+
+    horizons = [1, 5, 15]
+
+    records = run_sweep(
+        contract=contract,
+        close=close,
+        day_offsets=day_offsets,
+        horizons=horizons,
+        feature_registry_override=[("all_nan", _all_nan_feature)],
+    )
+
+    # Trial count unchanged: one trial per horizon.
+    assert len(records) == len(horizons), (
+        f"expected {len(horizons)} trials (one per horizon), got {len(records)}"
+    )
+
+    # Every trial must be FAILED.
+    for i, rec in enumerate(records):
+        assert rec.error is not None, f"trial {i} (horizon {horizons[i]}) must be FAILED"
+        # Error message should name the all-NaN condition.
+        assert "AllNaN" in rec.error or "all-NaN" in rec.error or "0 finite" in rec.error, (
+            f"trial {i} error should name all-NaN condition, got: {rec.error}"
+        )
+
+
+def test_obligation_22_partially_finite_feature_records_clean_trials():
+    """Obligation 22: A feature with a small positive finite fraction still records
+    clean (non-FAILED) trials — the all-NaN check must not fire above exact zero.
+
+    The all-NaN detection fires ONLY at finite_fraction == 0.0 exactly, never above it.
+    """
+    close, day_offsets = _make_close(n_symbols=5, n_rows=40, seed=22)
+    contract = minimal_contract(
+        validation={"scheme": "test", "holdout_intent": "never", "n_planned_trials": 2}
+    )
+
+    def _mostly_nan_feature(close: np.ndarray, day_offsets: np.ndarray) -> np.ndarray:
+        # Feature that is 99% NaN but has a few finite values.
+        result = np.full_like(close, np.nan, dtype=np.float64)
+        n_finite = max(1, close.size // 100)  # At least 1 finite value.
+        result.flat[:n_finite] = 1.0
+        return result
+
+    horizons = [1, 15]
+
+    records = run_sweep(
+        contract=contract,
+        close=close,
+        day_offsets=day_offsets,
+        horizons=horizons,
+        feature_registry_override=[("mostly_nan", _mostly_nan_feature)],
+    )
+
+    # Trial count unchanged.
+    assert len(records) == len(horizons)
+
+    # Trials must be CLEAN (not FAILED) because finite fraction > 0.
+    for i, rec in enumerate(records):
+        assert rec.error is None, (
+            f"trial {i} (horizon {horizons[i]}) should be clean (finite fraction > 0), "
+            f"but got error: {rec.error}"
+        )
