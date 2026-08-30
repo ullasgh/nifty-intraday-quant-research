@@ -80,6 +80,7 @@
     "src/nifty_quant/research/hypotheses/h2_overnight_reversal.py": 100,
     "src/nifty_quant/research/hypotheses/h3_intraday_xsec_reversal.py": 100,
     "src/nifty_quant/research/ic.py": 100,
+    "src/nifty_quant/research/latency.py": 100,
     "src/nifty_quant/research/lens.py": 100,
     "src/nifty_quant/research/provenance.py": 100,
     "src/nifty_quant/research/registry.py": 100,
