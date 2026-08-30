@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import dataclasses
 import datetime
+import hashlib
 import json
 from collections import defaultdict
 from typing import TYPE_CHECKING
@@ -341,6 +342,7 @@ def run_tilt(
     *,
     contract: ResearchContract,
     registry: "TrialRegistry | None" = None,
+    split_id: str = "full",
 ) -> TiltResult:
     """Run the parameterised tilt backtest.
 
@@ -353,14 +355,16 @@ def run_tilt(
             only construction in this repo that has beaten the index net of costs,
             and this is the regression test for `research/tilt.py` previously
             containing zero references to the research spine.
-        registry: If given, a completed run writes one `TrialRecord` to it whose
-            `contract_hash`/`config_hash` match `contract.contract_hash`, with
+        registry: If given, a completed run writes one `TrialRecord` to it with
             non-null `seed` and `git_sha` (obligation 7). Chosen deliberately as
             an explicit, optional, injected dependency rather than a seam
             `run_tilt` constructs for itself: the CLI `tilt` command supplies its
             own `TrialRegistry(settings.RESULTS_ROOT / "trials.db")`, and tests can
             supply an isolated one -- `run_tilt` never reaches for
             `nifty_quant.settings` itself.
+        split_id: Registry split identifier (defaults to "full"); passed through to
+            `TrialRecord.split_id` to allow partitioning runs by hold-out vs.
+            exploration splits.
 
     Returns:
         TiltResult with per-year rows, total aggregates, and diagnostics.
@@ -633,17 +637,23 @@ def run_tilt(
         from nifty_quant.research.provenance import get_git_sha
         from nifty_quant.research.registry import TrialRecord
 
-        chash = contract.contract_hash
+        # config_hash must bind every TiltConfig field or differing runs silently
+        # collapse to one registry row (UNIQUE(config_hash, split_id) + INSERT OR
+        # IGNORE). contract.contract_hash does NOT include smoothing, tilt, capital,
+        # entry_hhmm, exit_hhmm, rebalance_every, universe, continuous_only, seed.
+        contract_hash = contract.contract_hash
+        config_json = json.dumps(dataclasses.asdict(config), default=str, sort_keys=True)
+        config_hash = hashlib.sha256((contract_hash + config_json).encode()).hexdigest()
         registry.record(
             TrialRecord(
-                config_hash=chash,
-                contract_hash=chash,
+                config_hash=config_hash,
+                contract_hash=contract_hash,
                 ts=datetime.datetime.now(datetime.timezone.utc).isoformat(
                     timespec="seconds"
                 ),
                 strategy="tilt",
                 params_json=json.dumps(dataclasses.asdict(config), default=str),
-                split_id="full",
+                split_id=split_id,
                 purpose="exploration",
                 sharpe_gross=None,
                 sharpe_net=None,
