@@ -1,5 +1,93 @@
 # Phase E — conditional-analysis sweep
 
+## DEFINITIVE RUN 2026-08-30 (supersedes the 2026-08-21 run below)
+
+Re-run after `specs/phase_e_sweep.md` AMENDMENTS 4+5: real OHLCV loaded per-shard (union of
+declared fields, no proxies), `rv_to_vix_ratio` adapter fixed, `variance_ratio` per-segment NaN
+handling fixed, all-NaN features fail loudly. Panel 2018-01-01..2025-07-31, all_equity
+(149 symbols), 701,863 bars. `holdout_intent="never"`; window ends two weeks before the holdout
+boundary and `run_sweep` asserts it. Raw report:
+`results/phase_e_sweep_report_2026-08-30.txt` (git-ignored, regenerable from
+`results/phase_e_shards/` via `merge_shards`).
+
+### Headline
+
+**No new edge. This time the claim covers 19 of 22 features genuinely measured** (vs 10 last
+run); the remaining 3 are structurally untestable by cross-sectional ranking (below), reported
+as exclusions rather than fake nulls.
+
+    TRIAL MATRIX (T x n_trials) = 514,070 x 114
+      rows 701,863 -> 514,070 after the finite-row intersection (187,793 dropped, 26.76%)
+    MEASURED effective_n_trials = 18.7607     (planned = 132)
+    PBO (CSCV)                  = 0.0002
+    var_trial_sharpes (MEASURED)= 0.0389957   (expected_max_sharpe -> DSR sr0 = 0.369744)
+
+**Every deflated Sharpe is 0.0000.** PBO=0.0002 with all Sharpes ~0 means the sweep reliably
+ranks nothing — stable noise, as in the prior run. `var_trial_sharpes = 0.0389957` is the value
+criterion 6 should consume (supersedes 0.0310657 from the partially-degenerate run).
+
+### Best raw Sharpe per feature (any horizon, pre-cost), all deflated to 0.0000
+
+    volume_zscore               +0.1080  (h=1, decaying monotonically with horizon)
+    efficiency_ratio            +0.0728
+    opening_range               +0.0392
+    variance_ratio              +0.0384  (now finite everywhere: the C2 fix worked in prod)
+    vol_ratio                   +0.0349
+    hurst_on_stitched           +0.0118
+    rv_to_vix_ratio             +0.0058  (now measurable at all: the C1 fix worked in prod)
+    rolling_beta                +0.0055
+    parkinson_volatility        +0.0062
+    garman_klass_volatility     +0.0040
+    rogers_satchell_volatility  +0.0022
+    amihud_illiquidity          -0.0010
+    tradable_overnight_return   -0.0131
+    overnight_return            -0.0170
+    breakout_strength           -0.0526  (best is NEGATIVE; worst -0.1817 at h=1)
+    signed_volume_proxy         -0.0981
+    sector_relative_return      -0.0953
+    close_location_value        -0.1668  (worst -1.1196 at h=1)
+    beta_residual_return        -0.1066  (worst -0.8367 at h=1)
+
+None approaches the E4 promotion bar. `volume_zscore`'s +0.1080 at h=1 pre-cost echoes the
+killed `volume_breakout` finding exactly: a short-horizon volume signal whose economics died at
+1 minute of latency and the spread — and its deflated Sharpe here is 0.0000 anyway.
+
+### Excluded (structural, not defects): 3 broadcast features
+
+`breadth`, `cross_sectional_dispersion`, `median_pairwise_correlation` are market-level row
+stats broadcast to every symbol — cross-sectionally constant, so rank bucketing is undefined.
+All-NaN spread series, excluded from the matrix and reported as exclusions. They could only be
+tested as regime conditioners on another signal, a different harness. (`variance_ratio`, in
+this category last run, is per-symbol and IS now measured.)
+
+### No trials raised. 132 planned, 132 recorded.
+
+### What this means for Phase F
+
+All four v2 components now have measured verdicts, and all four fail the spec's own bar:
+
+    hurst_on_stitched     +0.0118, no monotone response  -> does not go in (unchanged)
+    beta_residual_return  -0.8367 at h=1                 -> does not go in (unchanged)
+    breakout_strength     NEGATIVE at every horizon      -> newly measured, dead
+    volume_zscore         +0.1080 raw, deflated 0.0000   -> newly measured, does not clear
+
+Per the kill criteria declared in `specs/volume_breakout_v2.md` BEFORE the build, v2 cannot be
+assembled. **Phase F is dead on its own pre-declared terms** — pending only the formal
+write-up against the spec's kill-criteria list.
+
+### Cost actuals (sequential, --workers 1, nice 15, 16 GB host)
+
+Shards (LPT-balanced): 12 / 13 / 24 / 33 min; merge ~37 min cold (~3 min warm — dominated by
+cold shard I/O + `pbo_cscv`'s 12,870 full-matrix passes). The 2026-08-23 cost table under-reads
+full-panel cost ~2x uniformly. DO NOT run 4 workers on a 16 GB host: post-AMENDMENT-4 shards
+load the OHLCV union (up to ~5x the close-only RSS) and 4-way concurrency swap-thrashed the
+machine. Owed: pbo_cscv via per-block sufficient statistics (~100x), runner persists its own
+merged report (print-only nearly lost this run's result).
+
+---
+
+# SUPERSEDED — run 2026-08-21 (7 features fed degenerate proxies; kept as history)
+
 Run 2026-08-21. Panel 2018-01-01..2025-07-31, all_equity (149 symbols), 701,863 bars, 1,880
 sessions. Contract `holdout_intent="never"`; the window ends 2025-07-31, two weeks before the
 holdout boundary at 2025-08-14, and `run_sweep` asserts this.

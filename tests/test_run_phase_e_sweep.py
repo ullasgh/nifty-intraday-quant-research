@@ -63,6 +63,87 @@ def test_shard_features_for_rejects_out_of_range_shard_index():
         runner.shard_features_for(-1, 4)
 
 
+@pytest.mark.parametrize("n_shards", [1, 2, 3, 4])
+def test_lpt_shards_are_disjoint_and_union_is_whole_registry(n_shards):
+    """LPT partitioning must produce disjoint shards whose union is exactly FEATURE_REGISTRY.
+
+    This test duplicates the existing invariant for the new LPT scheme, ensuring load
+    balancing does not regress the partition property.
+    """
+    registry = list(sf.FEATURE_REGISTRY)
+    shards = [runner.shard_features_for(i, n_shards) for i in range(n_shards)]
+
+    union_names = []
+    for shard in shards:
+        union_names.extend(f.name for f in shard)
+    assert sorted(union_names) == sorted(f.name for f in registry)
+
+    seen = set()
+    for shard in shards:
+        names = {f.name for f in shard}
+        assert not (names & seen), "shards must be pairwise disjoint"
+        seen |= names
+
+
+def test_lpt_is_deterministic():
+    """Two calls to shard_features_for with the same arguments must return identical partitions."""
+    n_shards = 4
+    partitions = [runner.shard_features_for(i, n_shards) for i in range(n_shards)]
+    partitions_again = [runner.shard_features_for(i, n_shards) for i in range(n_shards)]
+
+    for i in range(n_shards):
+        partition_names = [f.name for f in partitions[i]]
+        partition_names_again = [f.name for f in partitions_again[i]]
+        assert partition_names == partition_names_again, f"shard {i} produced different results"
+
+
+def test_lpt_heavy_features_in_different_shards():
+    """The two heaviest features (rolling_beta, beta_residual_return at 480s each) must
+    land in different shards at n_shards=4, preventing load imbalance."""
+    n_shards = 4
+    shards = [runner.shard_features_for(i, n_shards) for i in range(n_shards)]
+
+    shard_containing_rolling_beta = None
+    shard_containing_beta_residual = None
+
+    for shard_idx, shard in enumerate(shards):
+        feature_names = [f.name for f in shard]
+        if "rolling_beta" in feature_names:
+            shard_containing_rolling_beta = shard_idx
+        if "beta_residual_return" in feature_names:
+            shard_containing_beta_residual = shard_idx
+
+    assert shard_containing_rolling_beta is not None, "rolling_beta not found in any shard"
+    assert shard_containing_beta_residual is not None, "beta_residual_return not found in any shard"
+    assert (
+        shard_containing_rolling_beta != shard_containing_beta_residual
+    ), "heavy features must be in different shards"
+
+
+def test_lpt_max_load_better_than_round_robin():
+    """Max shard load (sum of costs) at n_shards=4 must not exceed round-robin's max load.
+
+    LPT should load-balance better than simple round-robin sharding.
+    """
+    n_shards = 4
+
+    # Compute round-robin max load: features[shard::n_shards] with sum of costs.
+    features = list(sf.FEATURE_REGISTRY)
+    rr_max_load = 0.0
+    for shard_idx in range(n_shards):
+        rr_shard = features[shard_idx::n_shards]
+        rr_shard_load = sum(runner._get_feature_cost(f.name) for f in rr_shard)
+        rr_max_load = max(rr_max_load, rr_shard_load)
+
+    # Compute LPT max load.
+    lpt_shards = [runner.shard_features_for(i, n_shards) for i in range(n_shards)]
+    lpt_max_load = max(sum(runner._get_feature_cost(f.name) for f in shard) for shard in lpt_shards)
+
+    assert lpt_max_load <= rr_max_load, (
+        f"LPT max load {lpt_max_load} exceeds round-robin max load {rr_max_load}"
+    )
+
+
 # ---------------------------------------------------------------------------
 # AMENDMENT 4 (2026-08-23) / obligation 18 -- the runner loads exactly the UNION of
 # fields the registry declares, not a hardcoded list.

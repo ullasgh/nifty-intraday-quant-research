@@ -182,16 +182,65 @@ def _parse_horizons(spec: str | None) -> list[int | str]:
 # ---------------------------------------------------------------------------
 
 
+# Measured per-feature computational cost (seconds, 1 feature x 6 horizons) on the
+# production window, post-horizon-hoist (measured 2026-08-23). Used ONLY for load
+# balancing -- a wrong or missing entry affects speed, never correctness. Features
+# not in the dict get the MEDIAN of the listed values.
+_MEASURED_FEATURE_COST_S: dict[str, float] = {
+    "rolling_beta": 480.0,
+    "hurst_on_stitched": 438.0,
+    "beta_residual_return": 480.0,
+    "median_pairwise_correlation": 90.0,
+    "sector_relative_return": 400.0,
+    "volume_zscore": 86.0,
+    "vol_ratio": 82.0,
+    "amihud_illiquidity": 71.0,
+    "breakout_strength": 62.0,
+    "overnight_return": 61.0,
+    "rogers_satchell_volatility": 55.0,
+    "efficiency_ratio": 58.0,
+    "garman_klass_volatility": 49.0,
+    "tradable_overnight_return": 48.0,
+    "opening_range": 46.0,
+    "signed_volume_proxy": 47.0,
+    "close_location_value": 37.0,
+    "parkinson_volatility": 41.0,
+    "rv_to_vix_ratio": 22.0,
+    "breadth": 30.0,
+    "cross_sectional_dispersion": 30.0,
+    "variance_ratio": 60.0,
+}
+
+
+def _get_feature_cost(feature_name: str) -> float:
+    """Get measured cost for a feature, or the median cost for unknown features."""
+    if feature_name in _MEASURED_FEATURE_COST_S:
+        return _MEASURED_FEATURE_COST_S[feature_name]
+    # Median of the measured values: sorted = [22, 30, 30, 37, 41, 46, 47, 48, 49, 55, 58, 60, 61,
+    # 62, 71, 82, 86, 90, 400, 438, 480, 480]; median = (60 + 61) / 2 = 60.5
+    return 60.5
+
+
 def _shard_output_path(output_dir: Path, shard: int, n_shards: int) -> Path:
     return output_dir / f"shard_{shard}_of_{n_shards}.pkl"
 
 
 def shard_features_for(shard: int, n_shards: int) -> list[sf.FeatureSpec]:
-    """This shard's slice of `sweep_features.FEATURE_REGISTRY`: features[shard::n_shards].
+    """Partition FEATURE_REGISTRY into shards using Longest Processing Time (LPT) algorithm.
 
-    Every shard uses this SAME function with its own index, so the N slices are pairwise
-    disjoint and their union is the whole registry by construction (Python slice semantics),
-    never a hand-partitioned list that could drift out of sync with the registry.
+    LPT assigns each feature to the currently least-loaded shard (ties broken by shard index),
+    after sorting features by measured cost (descending) and name (ascending) for determinism.
+    The partition is derived from the registry and never a hand-partitioned list.
+
+    Args:
+        shard: shard index (0 <= shard < n_shards).
+        n_shards: total number of shards.
+
+    Returns:
+        List of FeatureSpec objects assigned to this shard via LPT.
+
+    Raises:
+        ValueError: if shard or n_shards are out of range.
     """
     if n_shards < 1:
         raise ValueError("n_shards must be >= 1")
@@ -199,7 +248,25 @@ def shard_features_for(shard: int, n_shards: int) -> list[sf.FeatureSpec]:
         raise ValueError(
             f"shard must satisfy 0 <= shard < n_shards; got shard={shard}, n_shards={n_shards}"
         )
-    return list(sf.FEATURE_REGISTRY)[shard::n_shards]
+
+    # Sort features by (cost DESC, name ASC) for deterministic tie-breaking.
+    features = list(sf.FEATURE_REGISTRY)
+    sorted_features = sorted(
+        features, key=lambda f: (-_get_feature_cost(f.name), f.name)
+    )
+
+    # LPT: assign each feature to the currently least-loaded shard (ties -> lowest shard index).
+    shard_loads: list[float] = [0.0] * n_shards
+    shard_assignments: list[list[sf.FeatureSpec]] = [[] for _ in range(n_shards)]
+
+    for feature in sorted_features:
+        cost = _get_feature_cost(feature.name)
+        # Find the shard with minimum load (ties broken by index, min() is stable).
+        min_shard = min(range(n_shards), key=lambda i: (shard_loads[i], i))
+        shard_assignments[min_shard].append(feature)
+        shard_loads[min_shard] += cost
+
+    return shard_assignments[shard]
 
 
 # `FeatureSpec.required_fields` names fields the way `feature_sweep.run_sweep`'s keyword
