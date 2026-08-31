@@ -56,6 +56,17 @@ CONCENTRATION_THRESHOLD: float = CONCENTRATION_RATIO_THRESHOLD
 # per CLAUDE.md rule 8/9.
 DSR_SIGNIFICANCE: float = 0.95
 
+# Measured variance of trial Sharpes, per CLAUDE.md rule 8.
+#
+# var_trial_sharpes (MEASURED) = 0.0389957
+# source: feature_sweep.measure_var_trial_sharpes over the 114 usable trials' own finite
+# observations; recorded in results/phase_e_sweep_report_2026-08-30.txt (committed).
+#
+# Supersedes the earlier 1.0 placeholder and the partially-degenerate first sweep's 0.0310657.
+# When a future sweep re-measures it, the constant is updated WITH its new provenance line,
+# never silently.
+VAR_TRIAL_SHARPES_PHASE_E: float = 0.0389957
+
 
 # ---------------------------------------------------------------------------
 # FeatureKindError
@@ -847,11 +858,11 @@ class Lens:
                     f"trials={effective_n_trials}"
                 )
             else:
-                # var_trial_sharpes=1.0 is an unmeasured placeholder, not a
-                # measurement; metrics.effective_n_trials exists to measure trial
-                # structure from data but is not wired in here.
+                # var_trial_sharpes=VAR_TRIAL_SHARPES_PHASE_E is now measured (see above),
+                # not a placeholder; it was derived from the definitive Phase E sweep
+                # by feature_sweep.measure_var_trial_sharpes over 114 usable trials.
                 exp_max_sharpe = expected_max_sharpe(
-                    effective_n_trials, var_trial_sharpes=1.0
+                    effective_n_trials, var_trial_sharpes=VAR_TRIAL_SHARPES_PHASE_E
                 )
                 dsr = deflated_sharpe(finite_returns, sr0=exp_max_sharpe)
                 if np.isnan(dsr):
