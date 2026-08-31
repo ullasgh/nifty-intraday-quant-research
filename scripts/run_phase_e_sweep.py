@@ -712,7 +712,12 @@ def _fmt(value: float, spec: str = ".4f") -> str:
     return format(value, spec) if np.isfinite(value) else "nan"
 
 
-def print_report(merged: dict) -> None:
+def format_report(merged: dict) -> str:
+    """Format the merged statistics report as a string.
+
+    This function computes the report text without printing; the caller is responsible
+    for directing the output to stdout, files, or both.
+    """
     n_eff = merged["n_eff"]
     pbo = merged["pbo"]
     var_ts = merged["var_trial_sharpes"]
@@ -722,34 +727,35 @@ def print_report(merged: dict) -> None:
     rows_dropped = merged["rows_dropped"]
     rows_dropped_pct = merged["rows_dropped_pct"]
 
-    print("=" * 88)
+    lines = []
+    lines.append("=" * 88)
     # Matrix shape FIRST -- if T collapsed, it is visible here, not merely inferable from a nan.
-    print(f"TRIAL MATRIX SHAPE (T x n_trials) = {t} x {n_trials}")
+    lines.append(f"TRIAL MATRIX SHAPE (T x n_trials) = {t} x {n_trials}")
     if n_before is not None:
         pct_str = f"{rows_dropped_pct:.2f}%" if rows_dropped_pct is not None else "n/a"
-        print(
+        lines.append(
             f"  rows: {n_before} before the finite-row intersection -> {n_after} after "
             f"({rows_dropped} dropped, {pct_str})"
         )
     else:
-        print("  rows: no usable trial series existed to intersect")
-    print(
+        lines.append("  rows: no usable trial series existed to intersect")
+    lines.append(
         f"MEASURED effective_n_trials = {_fmt(n_eff)}   "
         f"(this run's PLANNED trial count = {merged['n_planned_run']}; "
         f"full-registry production planned count = {sf.n_planned_trials()})"
     )
     if merged["n_eff_note"]:
-        print(f"  {merged['n_eff_note']}")
-    print(f"PBO (CSCV)                  = {_fmt(pbo)}")
+        lines.append(f"  {merged['n_eff_note']}")
+    lines.append(f"PBO (CSCV)                  = {_fmt(pbo)}")
     if merged["pbo_note"]:
-        print(f"  {merged['pbo_note']}")
-    print(
+        lines.append(f"  {merged['pbo_note']}")
+    lines.append(
         f"var_trial_sharpes (MEASURED)= {_fmt(var_ts, '.6g')}   "
         f"(expected_max_sharpe used as DSR sr0 = {_fmt(merged['exp_max_sharpe'], '.6g')})"
     )
     if merged["exp_max_sharpe_note"]:
-        print(f"  {merged['exp_max_sharpe_note']}")
-    print("=" * 88)
+        lines.append(f"  {merged['exp_max_sharpe_note']}")
+    lines.append("=" * 88)
 
     rows = []
     for key, dsr in merged["per_trial_dsr"].items():
@@ -757,22 +763,32 @@ def print_report(merged: dict) -> None:
         rows.append((name, horizon, merged["per_trial_sharpe"][key], dsr))
     rows.sort(key=lambda r: (-r[3] if np.isfinite(r[3]) else float("inf")))
 
-    print(f"{'feature':30s} {'horizon':>8s} {'sharpe':>10s} {'deflated_sharpe':>16s}")
+    lines.append(f"{'feature':30s} {'horizon':>8s} {'sharpe':>10s} {'deflated_sharpe':>16s}")
     for name, horizon, sharpe, dsr in rows:
-        print(f"{name:30s} {horizon:>8s} {sharpe:10.4f} {dsr:16.4f}")
+        lines.append(f"{name:30s} {horizon:>8s} {sharpe:10.4f} {dsr:16.4f}")
 
     excluded = merged["excluded_trials"]
     if excluded:
-        print("\nEXCLUDED FROM THE TRIAL MATRIX (all-NaN / zero-variance) -- a RESULT, not a bug:")
+        lines.append(
+            "\nEXCLUDED FROM THE TRIAL MATRIX (all-NaN / zero-variance) -- a RESULT, not a bug:"
+        )
         for (name, horizon), reason in sorted(excluded.items()):
-            print(f"  {name} (horizon={horizon}): {reason}")
+            lines.append(f"  {name} (horizon={horizon}): {reason}")
 
     if merged["failed_records"]:
-        print("\nFAILED TRIALS (raised -- a RESULT, not dropped, per E5/obligation 11):")
+        lines.append("\nFAILED TRIALS (raised -- a RESULT, not dropped, per E5/obligation 11):")
         for r in merged["failed_records"]:
-            print(f"  {r.strategy} {r.params_json}: {r.error}")
+            lines.append(f"  {r.strategy} {r.params_json}: {r.error}")
     else:
-        print("\nNo trials raised.")
+        lines.append("\nNo trials raised.")
+
+    return "\n".join(lines)
+
+
+def print_report(merged: dict) -> None:
+    """Print the merged statistics report to stdout."""
+    report_text = format_report(merged)
+    print(report_text)
 
 
 # ---------------------------------------------------------------------------
@@ -793,7 +809,14 @@ def main(argv: list[str] | None = None) -> None:
             f"{time.monotonic() - t0:.1f}s",
             flush=True,
         )
-        print_report(merged)
+        # Persist merged statistics to disk FIRST, before printing (write first to avoid
+        # data loss if printing later fails; see nifty-intraday-quant-research memory:
+        # agent-background-wait-deadlock).
+        report_text = format_report(merged)
+        (args.output_dir / "merged.pkl").write_bytes(pickle.dumps(merged))
+        (args.output_dir / "merged_report.txt").write_text(report_text)
+        # Then print to stdout (behavior unchanged).
+        print(report_text)
     else:
         run_shard(args)
 

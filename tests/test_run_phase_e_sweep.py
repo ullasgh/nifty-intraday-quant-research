@@ -459,3 +459,117 @@ def test_merge_shards_notes_insufficient_rows_after_exclusion_instead_of_bare_na
     assert np.isnan(merged["pbo"])
     assert merged["pbo_note"] is not None
     assert "T=1" in merged["pbo_note"]
+
+
+# ---------------------------------------------------------------------------
+# DEFECT FIX (2026-08-30): Persist merged statistics to disk.
+# ---------------------------------------------------------------------------
+
+
+def test_format_report_returns_string(tmp_path):
+    """format_report must return a formatted string, not print."""
+    rng = np.random.default_rng(10)
+    n_rows = 100
+    base_series = rng.normal(scale=0.01, size=n_rows)
+
+    series = {
+        ("feat_a", "1"): base_series,
+        ("feat_b", "1"): base_series + rng.normal(scale=1e-6, size=n_rows),
+    }
+    records = [
+        _fake_trial_record("sweep::feat_a", None),
+        _fake_trial_record("sweep::feat_b", None),
+    ]
+    _write_fake_shard(tmp_path, 0, 1, series, records)  # tmp_path, never cwd (repo hygiene)
+    merged = runner.merge_shards(tmp_path, 1)
+
+    report_text = runner.format_report(merged)
+    assert isinstance(report_text, str)
+    assert "TRIAL MATRIX SHAPE" in report_text
+    assert "MEASURED effective_n_trials" in report_text
+    assert "PBO (CSCV)" in report_text
+
+
+def test_print_report_uses_format_report(capsys, tmp_path):
+    """print_report must emit the exact same text as format_report (no divergence)."""
+    rng = np.random.default_rng(11)
+    n_rows = 100
+    base_series = rng.normal(scale=0.01, size=n_rows)
+
+    series = {
+        ("feat_a", "1"): base_series,
+        ("feat_b", "1"): base_series + rng.normal(scale=1e-6, size=n_rows),
+    }
+    records = [
+        _fake_trial_record("sweep::feat_a", None),
+        _fake_trial_record("sweep::feat_b", None),
+    ]
+    _write_fake_shard(tmp_path, 0, 1, series, records)  # tmp_path, never cwd (repo hygiene)
+    merged = runner.merge_shards(tmp_path, 1)
+
+    # Capture what print_report writes to stdout.
+    runner.print_report(merged)
+    captured = capsys.readouterr()
+    printed_text = captured.out.rstrip("\n")  # strip trailing newline from print()
+
+    # Get what format_report returns.
+    formatted_text = runner.format_report(merged)
+
+    # They must be identical (one source of truth).
+    assert printed_text == formatted_text
+
+
+def test_merged_pkl_and_report_txt_persisted_and_consistent(tmp_path):
+    """When main() runs in parallel mode, merged.pkl and merged_report.txt must be written
+    to output_dir, and their contents must match what merge_shards and format_report returned."""
+    import io
+    from unittest.mock import patch
+
+    # Build a minimal merged dict via merge_shards.
+    rng = np.random.default_rng(12)
+    n_rows = 100
+    base_series = rng.normal(scale=0.01, size=n_rows)
+
+    series = {
+        ("feat_a", "1"): base_series,
+        ("feat_b", "1"): base_series + rng.normal(scale=1e-6, size=n_rows),
+    }
+    records = [
+        _fake_trial_record("sweep::feat_a", None),
+        _fake_trial_record("sweep::feat_b", None),
+    ]
+    _write_fake_shard(tmp_path, 0, 1, series, records)
+    merged_expected = runner.merge_shards(tmp_path, 1)
+
+    # Mock launch_shards to do nothing (it's already been done via _write_fake_shard).
+    # Call main() with args that will trigger parallel mode, merge, and persist.
+    with patch("run_phase_e_sweep.launch_shards"):
+        with patch("sys.stdout", new=io.StringIO()):
+            runner.main(
+                [
+                    "--parallel",
+                    "--n-shards",
+                    "1",
+                    "--output-dir",
+                    str(tmp_path),
+                ]
+            )
+
+    # Verify merged.pkl was written and unpickles correctly.
+    pkl_path = tmp_path / "merged.pkl"
+    assert pkl_path.exists(), "merged.pkl was not written"
+    with open(pkl_path, "rb") as f:
+        merged_loaded = pickle.load(f)
+
+    # The loaded dict must have the same n_eff and pbo (key indicators).
+    assert merged_loaded["n_eff"] == merged_expected["n_eff"]
+    assert merged_loaded["pbo"] == merged_expected["pbo"]
+    assert merged_loaded["matrix_shape"] == merged_expected["matrix_shape"]
+
+    # Verify merged_report.txt was written and matches format_report.
+    report_path = tmp_path / "merged_report.txt"
+    assert report_path.exists(), "merged_report.txt was not written"
+    report_text_on_disk = report_path.read_text()
+    report_text_expected = runner.format_report(merged_expected)
+
+    assert report_text_on_disk == report_text_expected
