@@ -187,3 +187,55 @@ class TestPboCscvReferenceMaintainsCoverage:
 
         assert isinstance(result, float)
         assert 0.0 <= result <= 1.0
+
+
+class TestPboCscvDegeneratePaths:
+    """Gate-speed coverage for paths the slow-marked sweep left ungated (lead addition):
+    the reference's validation raises moved out of public reach when the old
+    implementation became `_pbo_cscv_reference`, and three degenerate branches of
+    `_sharpes_from_stats`."""
+
+    def test_reference_validation_raises(self) -> None:
+        good = np.random.default_rng(0).normal(0.0, 0.01, size=(16, 3))
+        with pytest.raises(ValueError, match="at least 2"):
+            _pbo_cscv_reference(good, n_splits=1)
+        with pytest.raises(ValueError, match="even"):
+            _pbo_cscv_reference(good, n_splits=3)
+        with pytest.raises(ValueError, match="2-D"):
+            _pbo_cscv_reference(good[:, 0], n_splits=2)
+        with pytest.raises(ValueError, match="two trial columns"):
+            _pbo_cscv_reference(good[:, :1], n_splits=2)
+        with pytest.raises(ValueError, match="exceed"):
+            _pbo_cscv_reference(good, n_splits=32)
+
+    def test_partition_with_fewer_than_two_observations_matches_reference(self) -> None:
+        """T=2 with n_splits=2 gives one row per partition -- count < 2 without any
+        NaN, exercising the count-guard continue in _sharpes_from_stats."""
+        mat = np.array([[0.01, 0.02], [0.015, -0.01]], dtype=np.float64)
+        assert pbo_cscv(mat, n_splits=2) == _pbo_cscv_reference(mat, n_splits=2)
+
+    def test_constant_column_negligible_std_matches_reference(self) -> None:
+        """A constant trial column has exactly zero variance -- the negligible-std
+        continue -- and must agree with the reference bitwise."""
+        rng = np.random.default_rng(7)
+        mat = np.column_stack(
+            [np.full(64, 0.01), rng.normal(0.0, 0.01, 64), rng.normal(0.0, 0.01, 64)]
+        )
+        assert pbo_cscv(mat, n_splits=8) == _pbo_cscv_reference(mat, n_splits=8)
+
+    def test_sharpes_from_stats_accepts_none_nan_tracking(self) -> None:
+        """block_has_nans=None (the documented all-NaN-free shortcut) must behave as
+        if no partition had NaNs."""
+        from nifty_quant.backtest.metrics import _sharpes_from_stats
+
+        rng = np.random.default_rng(9)
+        mat = rng.normal(0.0, 0.01, size=(40, 3))
+        blocks = np.array_split(mat, 4, axis=0)
+        sums = np.array([b.sum(axis=0) for b in blocks])
+        sumsq = np.array([(b**2).sum(axis=0) for b in blocks])
+        counts = np.array([np.full(3, b.shape[0]) for b in blocks], dtype=np.float64)
+        with_none = _sharpes_from_stats(sums, sumsq, counts, [0, 1], 3, block_has_nans=None)
+        with_flags = _sharpes_from_stats(
+            sums, sumsq, counts, [0, 1], 3, block_has_nans=np.zeros((4, 3), dtype=bool)
+        )
+        np.testing.assert_array_equal(with_none, with_flags)

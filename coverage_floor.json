@@ -60,6 +60,7 @@
     "src/nifty_quant/data/panel_builder.py": 100,
     "src/nifty_quant/data/validate.py": 99,
     "src/nifty_quant/execution/__init__.py": 100,
+    "src/nifty_quant/execution/capacity.py": 100,
     "src/nifty_quant/execution/costs.py": 98,
     "src/nifty_quant/execution/fills.py": 100,
     "src/nifty_quant/features/__init__.py": 100,
