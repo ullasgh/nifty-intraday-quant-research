@@ -557,16 +557,15 @@ def _per_trial_sharpe(return_matrix: np.ndarray) -> np.ndarray:
     return out
 
 
-def pbo_cscv(trial_matrix: np.ndarray, n_splits: int = 16) -> float:
-    """Return Combinatorially Symmetric Cross-Validation PBO.
+def _pbo_cscv_reference(trial_matrix: np.ndarray, n_splits: int = 16) -> float:
+    """Reference `pbo_cscv`: per-partition matrix concatenation and _per_trial_sharpe.
 
-    The rows are split into ``n_splits`` contiguous blocks.  Every balanced combination
-    of ``n_splits // 2`` blocks is used once as in-sample (IS); the complement is
-    out-of-sample (OOS).  Per-trial non-annualized Sharpe ratios are computed in both
-    halves.  For the best IS trial, its relative OOS rank is mapped to ``(0,1)`` via
-    ``omega = rank / (n_trials + 1)``, where ``rank`` is 1-indexed and ascending from
-    ``stats.rankdata(..., method="average")``.  The result is logit-transformed, and the
-    PBO is the fraction of partitions where the logit is ``< 0``.
+    PRIVATE. Kept only so the equivalence check against the fast `pbo_cscv`
+    stays runnable (see `tests/test_pbo_cscv_equivalence.py`) rather than becoming an
+    unverifiable claim in a comment. This is the original implementation with
+    per-partition full-matrix concatenation and per-call np.mean/np.std: on a
+    514,070 x 114 matrix at n_splits=16, took ~37 minutes. Do not use in
+    production code paths.
     """
     if n_splits < 2:
         raise ValueError("n_splits must be at least 2")
@@ -597,6 +596,173 @@ def pbo_cscv(trial_matrix: np.ndarray, n_splits: int = 16) -> float:
 
         is_sharpes = _per_trial_sharpe(is_mat)
         oos_sharpes = _per_trial_sharpe(oos_mat)
+
+        best_is_idx = int(np.argmax(is_sharpes))
+
+        ranks = stats.rankdata(oos_sharpes, method="average")
+        rank_of_best = ranks[best_is_idx]
+        omega_bar = rank_of_best / (n_trials + 1.0)
+        omega_bar = float(np.clip(omega_bar, 1e-12, 1.0 - 1e-12))
+
+        lambda_c = math.log(omega_bar / (1.0 - omega_bar))
+        if lambda_c < 0.0:
+            count_lambda_lt_zero += 1
+
+        partitions += 1
+
+    return float(count_lambda_lt_zero / partitions)
+
+
+def _sharpes_from_stats(
+    block_sums: np.ndarray,
+    block_sumsq: np.ndarray,
+    block_counts: np.ndarray,
+    block_indices: list[int],
+    n_trials: int,
+    block_has_nans: np.ndarray | None = None,
+) -> np.ndarray:
+    """Compute per-trial Sharpes from precomputed block statistics.
+
+    Parameters
+    ----------
+    block_sums : np.ndarray
+        Shape (n_splits, n_trials), sum of returns per block per trial.
+    block_sumsq : np.ndarray
+        Shape (n_splits, n_trials), sum of squared returns per block per trial.
+    block_counts : np.ndarray
+        Shape (n_splits, n_trials), count of returns per block per trial.
+    block_indices : list[int]
+        Indices of blocks to combine (e.g., IS or OOS block indices).
+    n_trials : int
+        Number of trials.
+    block_has_nans : np.ndarray | None
+        Boolean array of shape (n_splits, n_trials) indicating which (block, trial)
+        pairs have NaNs. If None, all pairs are assumed NaN-free.
+
+    Returns
+    -------
+    np.ndarray
+        Shape (n_trials,), per-trial Sharpes or -inf for degenerate columns.
+
+    Notes
+    -----
+    This function replicates the behavior of _per_trial_sharpe when invoked on
+    concatenated blocks. If any block in the partition has NaNs for a trial,
+    the trial's Sharpe is set to -inf (matching reference behavior where
+    np.mean/np.std on arrays with NaNs return NaN, which are marked negligible).
+    """
+    # Sum the statistics for the selected blocks
+    combined_sums = np.sum(block_sums[block_indices, :], axis=0)
+    combined_sumsq = np.sum(block_sumsq[block_indices, :], axis=0)
+    combined_counts = np.sum(block_counts[block_indices, :], axis=0)
+
+    out = np.full(n_trials, -np.inf, dtype=np.float64)
+
+    # Check if this partition has any NaNs per trial
+    partition_has_nans = np.zeros(n_trials, dtype=bool)
+    if block_has_nans is not None:
+        for idx in block_indices:
+            partition_has_nans |= block_has_nans[idx, :]
+
+    for j in range(n_trials):
+        # CRITICAL: If the partition has any NaNs for trial j, np.mean/np.std
+        # would return NaN (not skip them), which marks std as negligible.
+        # Match that behavior exactly.
+        if partition_has_nans[j]:
+            continue  # Leave as -inf
+
+        n = int(combined_counts[j])
+        if n < 2:
+            continue
+
+        # Compute mean and variance from sufficient statistics
+        s = float(combined_sums[j])
+        sq = float(combined_sumsq[j])
+        count_f = float(n)
+
+        mean = s / count_f
+        # Variance with Bessel's correction (ddof=1): (sum(x^2) - n*mean^2) / (n-1)
+        var = (sq / count_f - mean * mean) * count_f / (count_f - 1.0)
+
+        if not np.isfinite(var) or var < 0.0:
+            continue
+
+        std = math.sqrt(var)
+
+        # Use proxy scale (sum-of-squares based) to match negligibility check
+        proxy_scale = max(1.0, math.sqrt(sq / count_f))
+        if std <= 1e-9 * proxy_scale:
+            continue
+
+        out[j] = mean / std
+
+    return out
+
+
+def pbo_cscv(trial_matrix: np.ndarray, n_splits: int = 16) -> float:
+    """Return Combinatorially Symmetric Cross-Validation PBO.
+
+    The rows are split into ``n_splits`` contiguous blocks.  Every balanced combination
+    of ``n_splits // 2`` blocks is used once as in-sample (IS); the complement is
+    out-of-sample (OOS).  Per-trial non-annualized Sharpe ratios are computed in both
+    halves.  For the best IS trial, its relative OOS rank is mapped to ``(0,1)`` via
+    ``omega = rank / (n_trials + 1)``, where ``rank`` is 1-indexed and ascending from
+    ``stats.rankdata(..., method="average")``.  The result is logit-transformed, and the
+    PBO is the fraction of partitions where the logit is ``< 0``.
+    """
+    if n_splits < 2:
+        raise ValueError("n_splits must be at least 2")
+    if n_splits % 2 != 0:
+        raise ValueError("n_splits must be even")
+
+    mat = np.asarray(trial_matrix, dtype=np.float64)
+    if mat.ndim != 2:
+        raise ValueError("trial_matrix must be a 2-D array")
+    if mat.shape[1] < 2:
+        raise ValueError("trial_matrix must have at least two trial columns")
+    if n_splits > mat.shape[0]:
+        raise ValueError("n_splits must not exceed the number of return rows")
+
+    # Precompute per-block sufficient statistics
+    blocks = np.array_split(mat, n_splits, axis=0)
+    n_trials = mat.shape[1]
+
+    block_sums = np.zeros((n_splits, n_trials), dtype=np.float64)
+    block_sumsq = np.zeros((n_splits, n_trials), dtype=np.float64)
+    block_counts = np.zeros((n_splits, n_trials), dtype=np.float64)
+    block_has_nans = np.zeros((n_splits, n_trials), dtype=bool)
+
+    for i, block in enumerate(blocks):
+        # Each block is (n_rows_in_block, n_trials)
+        # Count finite values per trial
+        finite_mask = np.isfinite(block)
+        block_counts[i, :] = np.sum(finite_mask, axis=0)
+
+        # Track if any NaNs exist per trial in this block
+        block_has_nans[i, :] = np.any(~finite_mask, axis=0)
+
+        # Sum of finite values per trial
+        block_finite = np.where(finite_mask, block, 0.0)
+        block_sums[i, :] = np.sum(block_finite, axis=0)
+
+        # Sum of squared finite values per trial
+        block_sumsq[i, :] = np.sum(block_finite * block_finite, axis=0)
+
+    count_lambda_lt_zero = 0
+    partitions = 0
+
+    for is_idx_tuple in combinations(range(n_splits), n_splits // 2):
+        is_set = set(is_idx_tuple)
+        oos_idx_list = [i for i in range(n_splits) if i not in is_set]
+
+        is_sharpes = _sharpes_from_stats(
+            block_sums, block_sumsq, block_counts, list(is_idx_tuple), n_trials,
+            block_has_nans
+        )
+        oos_sharpes = _sharpes_from_stats(
+            block_sums, block_sumsq, block_counts, oos_idx_list, n_trials,
+            block_has_nans
+        )
 
         best_is_idx = int(np.argmax(is_sharpes))
 
