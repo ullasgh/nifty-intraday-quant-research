@@ -1,8 +1,8 @@
-# Phase G3 experiment design — 7-scheme comparison on the tilt candidate. DRAFT, NOT FROZEN.
+# Phase G3 experiment design — 7-scheme comparison on the tilt candidate. FROZEN 2026-08-31.
 
-Status: DRAFT for review. Author: lead, 2026-08-31. **No trial may be registered against this
-document until the DRAFT marker is removed** — freezing the design IS the pre-registration,
-and this draft contains one open decision (D1) that determines what the experiment compares.
+Status: FROZEN. Author: lead. D1 decided by Ullas's delegation ("pick your best"): option (b),
+the lead's on-record recommendation. This document is the pre-registration; the 7 trials it
+declares are charged on top of the program's existing trial history.
 
 ## What runs
 
@@ -37,10 +37,38 @@ The tilt candidate is LONG-ONLY index-relative; schemes emit signed weights. Opt
       weight (index + active) at zero per name — truest to "index-relative tilt", but adds
       an index-book construction the tilt wrapper does not currently expose.
 
-RECOMMENDATION: (b), because it compares the seven schemes as alternative TRANSFORMS of the
-same nonnegative tilt intent — the question G3 actually asks — and needs no new engine
-surface. (c) is the better experiment in principle but is Phase-H-adjacent scope. Decide,
-record the decision here, remove DRAFT, then implement.
+DECIDED: (b). It compares the seven schemes as alternative TRANSFORMS of the same
+nonnegative tilt intent — the question G3 actually asks — and needs no new engine surface.
+(c) remains the better experiment in principle and is recorded as Phase-H-adjacent follow-up,
+a NEW registered trial set if ever run.
+
+## Frozen parameters (completing the "What runs" section in checkpoint-panel units)
+
+The tilt wrapper operates on a 2-rows-per-session checkpoint panel with no minute bars, so
+the AMENDMENT-4 estimator constants are reinterpreted in SESSION units, stated explicitly:
+
+- mapped signal at session t: cross-sectional rank-percentile of (-overnight_return) among
+  tradable names, in [0, 1] — losers highest, the tilt's own reversal intent. NaN feature ->
+  not tradable that session.
+- sigma at session t: EWMA (halflife 20 SESSIONS) of per-session entry->exit log returns,
+  `sigma_risk`-floored; sessions before the estimator warms up leave the name out of the book.
+- corr at session t: median pairwise correlation of the same per-session returns over a
+  trailing 30-SESSION window (consumed only by risk_parity / covariance_aware as the
+  equicorrelation rho).
+- schemes called with gross=1.0, max_weight=0.05 via apply_weight_scheme — 0.05 is the tilt
+  program's existing clip convention (capital/clip discipline in the tilt wrapper), not a new
+  constant; clip_binding is recorded per session per scheme.
+- returns: session entry->exit, weights fixed within session, rebalanced daily (tilt's
+  rebalance_every=1); excess = book return minus the equal-weight tradable-universe return.
+- costs: `NSEIntradayEquityCosts` round-trip at clip = capital/n_held, capital Rs 1,000,000,
+  ONE leg on turnover sum|w_t - w_{t-1}| — the tilt wrapper's own accounting, reused not
+  reimplemented where the code allows.
+- window: the tilt research window (recon_low_turnover_tilt START/END), ending before the
+  holdout boundary; the runner asserts this (holdout_intent="never").
+- CALIBRATION NULL, asserted by the runner before recording anything: the `equal_weight`
+  scheme over all tradable names IS the equal-weight benchmark book, so its gross excess must
+  be ~0 by construction (|mean| below its own SE). A runner failing this check has broken
+  accounting and must refuse to write trials.
 
 ## Cost of running
 
