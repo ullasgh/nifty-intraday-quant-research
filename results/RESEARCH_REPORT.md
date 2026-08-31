@@ -8,9 +8,22 @@ This program found three things:
 
 1. **Four hypotheses are killed** (H1, H3, H4, H5) by cost hurdles, magnitude, or wrong sign.
 2. **One hypothesis is real** (H2, overnight cross-sectional reversal): -24.30 bps, t = -16.66, 8 of 8 years sign-stable. Its initial kill has collapsed under measurement. Two original kill reasons failed when tested rigorously: a hardcoded capacity clip was an artifact (clears at higher notional), and a concentration threshold was hand-chosen (sits at 27th percentile of a measured null, does not fire at its designed threshold).
-3. **A candidate exists** (long-only index-relative tilt using H2's signal, weight smoothing a=0.10): net-positive in all eight years pooled and in 2024-2025 individually, ~5.8% annualised net excess. Of the four gating conditions, **1 is cleared** (boundary plateau check), **1 is partial** (recent-window significance), and **2 are NOT RUN** (liquidity decomposition, out-of-sample holdout).
+3. **A candidate exists** (long-only index-relative tilt using H2's signal, weight smoothing a=0.10): net-positive in all eight years pooled and in 2024-2025 individually, ~5.8% annualised net excess. Of the four gating conditions, **2 are cleared** (boundary plateau; liquidity decomposition -- the edge is genuinely concentrated in the bottom-2 ADV deciles, 32.95% of gross excess vs a permutation null of 20.1%, z=5.75), **1 is partial** (recent-window significance: Newey-West t=3.20 full-universe, but the continuous-coverage subset sits at p~0.046 and flips on estimator choice), and **1 is NOT RUN** (the out-of-sample holdout -- deliberately last, spending it requires a reviewed code change).
 
-What is NOT established: that the candidate survives recent-window power testing, solves the concentration problem in the least-liquid decile, or confirms on unseen data.
+What is NOT established: that the candidate survives at size (its edge lives exactly where capacity binds), or that it confirms on unseen data.
+
+---
+
+## Program status update -- 2026-08-31
+
+Everything below reflects the definitive Phase E re-run and the completion of Phases F-H.
+
+- **Phase E (feature sweep), definitive:** 19 of 22 registry features genuinely measured on real OHLCV (the first run had fed 7 features degenerate proxies). Trial matrix 514,070 x 114; measured effective_n_trials 18.76 of 132 planned; PBO 0.0002; **every deflated Sharpe 0.0000**. Three market-level broadcast features are structurally untestable under cross-sectional ranking and are reported as exclusions, not nulls. `var_trial_sharpes` measured at 0.0389957 and now wired into the lens's criterion 6, replacing the 1.0 placeholder.
+- **Phase F (volume_breakout v2): KILLED at its own pre-registered component gate.** All four components have measured verdicts and none passes: hurst (no monotone response), beta-residual (worst in sweep), breakout_strength (negative at every horizon), volume_zscore (+0.108 raw at h=1, deflated 0.0000 -- and the exact short-horizon volume shape whose economics v1 already measured as dead at one minute of latency). Criteria 1-5 never ran; nothing survived to build.
+- **Phase G (portfolio construction): built and closed.** Seven-scheme weighting registry, VolTargetSizer wired through the engine with honest clip/vol-target reporting, and the pre-registered G3 comparison run on the tilt signal: **no scheme promotes** at the 0.95 recent-window DSR bar (closest 0.9485); measured effective_n_trials 1.65 of 7 (inverse_vol and risk_parity are structurally identical under diagonal-first ERC). The signal-carrying schemes die on their own turnover costs. The tilt's own low-turnover construction remains the only candidate. Seven trials registered; the registry's config-hash fix verified in production (7 distinct rows, where the old defect would have silently kept 1).
+- **Phase H (execution & capacity): built.** The cost/participation ladder, the derived brokerage crossover (Rs 66,666.67 = flat/pct, bps constant below and decaying above), and the corrected two-constraint capacity result: a position limit and a daily-trade limit bound different risks, the trade constraint is the position constraint divided by turnover fraction, so at the tilt's 0.127 daily turnover the trade constraint is 7.9x LOOSER and **the position limit is the operative bound** -- the ~Rs 400 crore ADV-based figure stands, not as an upper bound to revise down, but per-liquidity-decile evaluation of it is still owed where the edge concentrates.
+- **Trial accounting to date:** trials.db carries 31 rows across sweep, tilt pre-registration, and the G3 comparison; every multiple-testing statistic in this report is computed against measured effective trial counts, never planned ones.
+- **The holdout remains unspent** (read-count 7, unchanged). It is the final gate and requires an explicit, reviewed decision.
 
 ---
 
