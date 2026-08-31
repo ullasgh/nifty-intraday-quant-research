@@ -220,6 +220,30 @@ class NSEIntradayEquityCosts:
         total_charges = self.charges(fills).sum()
         return total_charges.total / notional_per_leg * 10_000.0
 
+    @property
+    def brokerage_crossover_notional(self) -> float:
+        """Brokerage crossover notional: below this, percentage binds; above, flat cap.
+
+        Derived as brokerage_flat / brokerage_pct. Below this notional the percentage
+        brokerage binds and round-trip bps is CONSTANT; above it the flat Rs cap binds
+        and bps DECAYS with size.
+
+        Measured round-trip bps values (spec H2, line 47):
+        - 10.6245 at notional <= crossover (e.g., 50k / 66,666 / 66,667)
+        - 8.2645 at 100k notional (above crossover)
+        - 3.5917 at 1 crore notional (well above crossover)
+        """
+        return self.brokerage_flat / self.brokerage_pct
+
+
+def brokerage_crossover_notional(model: NSEIntradayEquityCosts) -> float:
+    """Accessor for the brokerage crossover notional from a cost model.
+
+    Thin delegate to NSEIntradayEquityCosts.brokerage_crossover_notional property.
+    Returns brokerage_flat / brokerage_pct.
+    """
+    return model.brokerage_crossover_notional
+
 
 @dataclass(frozen=True)
 class NSEDeliveryEquityCosts:

@@ -115,11 +115,12 @@ _PENDING_SUITES: tuple[str, ...] = (
     # (`nifty_quant.execution.capacity`, the Phase G weighting schemes) are not built yet.
     # REMOVE EACH ENTRY THE MOMENT ITS IMPLEMENTATION GOES GREEN. A stale entry here
     # silently stops gating real code, which is the one failure this list exists to prevent.
-    "test_execution_capacity_a.py",
-    "test_execution_capacity_b.py",
 )
 # test_portfolio_construction_{a,b} REMOVED 2026-08-31: Phase G implementation landed
 # (weighting.py, engine wiring, portfolio_comparison.py) and both suites went green 45/45.
+# test_execution_capacity_{a,b} REMOVED 2026-08-31: Phase H implementation landed
+# (execution/capacity.py, costs crossover) and both suites went green 27/27. The list is
+# now EMPTY -- every tests-first suite in the repo gates real code.
 # Entries go in ONLY while a suite is RED by design, and come out the moment it goes green.
 # Note this list is inert unless NQ_SKIP_PENDING=1 -- an unqualified `make gate` still runs
 # these suites and still fails on them, which is deliberate: the exemption has to be an
