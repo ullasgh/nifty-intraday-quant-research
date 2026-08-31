@@ -11,6 +11,9 @@ SPEC DEFECTS / ASSUMPTIONS MADE (mirrors the style of tests/test_causality_guard
   of a scheme function. This suite assumes:
 
       from nifty_quant.backtest.schemes import SCHEME_REGISTRY  # dict[str, Callable]
+      # ADJUDICATED by specs/portfolio_construction.md AMENDMENT 3 (2026-08-31): module
+      # pinned as backtest.weighting / WEIGHT_SCHEME_REGISTRY; imports below alias it.
+      # Obligation 2's tuple-return guess adjudicated to apply_weight_scheme (A3.4).
       # keys: "equal_weight", "inverse_vol", "z_weight", "z_over_vol", "rank_weight",
       #       "risk_parity", "covariance_aware"
       fn(signal, sigma, corr, mask, *, gross=1.0) -> np.ndarray
@@ -192,7 +195,7 @@ def _cov(sigma: np.ndarray) -> np.ndarray:
 def test_obligation_1_all_schemes_sum_to_declared_gross():
     # catches: a scheme whose weights do not sum (in absolute value) to the declared gross
     # -- e.g. a scheme that forgets to renormalize after masking or clipping.
-    from nifty_quant.backtest.schemes import SCHEME_REGISTRY
+    from nifty_quant.backtest.weighting import WEIGHT_SCHEME_REGISTRY as SCHEME_REGISTRY
 
     n = 8
     rng = np.random.default_rng(0)
@@ -224,7 +227,12 @@ def test_obligation_2_max_weight_clip_and_report_for_every_scheme():
     # catches: a scheme that (a) exceeds max_weight after clipping, or (b) silently clips
     # without reporting it -- both are real defects the spec calls out ("respects max_weight
     # AND reports when the clip binds" are two independent requirements).
-    from nifty_quant.backtest.schemes import SCHEME_REGISTRY
+    from nifty_quant.backtest.weighting import (
+        WEIGHT_SCHEME_REGISTRY as SCHEME_REGISTRY,
+    )  # noqa: I001 -- alias order mirrors the other obligation tests' single-alias import
+    from nifty_quant.backtest.weighting import (
+        apply_weight_scheme,
+    )
 
     n = 6
     rng = np.random.default_rng(1)
@@ -242,26 +250,40 @@ def test_obligation_2_max_weight_clip_and_report_for_every_scheme():
         # (rule 8): half the largest raw weight is guaranteed to force a clip.
         binding_max_weight = max_abs_raw / 2.0
 
-        result = fn(signal, sigma, corr, mask, gross=1.0, max_weight=binding_max_weight)
-        assert isinstance(result, tuple) and len(result) == 2, (
-            f"{name}: must return (weights, clip_bound) when max_weight is supplied"
+        # AMENDMENT 3 (A3.4/A3.7): the clip and its report live on apply_weight_scheme's
+        # SchemeResult, not a tuple return from the bare scheme. Assertion substance
+        # unchanged: clip respected, binding reported True iff it moved the book.
+        result = apply_weight_scheme(
+            name,
+            signal=signal,
+            sigma=sigma,
+            corr=corr,
+            tradable=mask,
+            gross=1.0,
+            max_weight=binding_max_weight,
         )
-        w, clip_bound = result
-        w = np.asarray(w, dtype=np.float64)
+        w = np.asarray(result.weights, dtype=np.float64)
         max_abs_w = float(np.max(np.abs(w)))
         assert max_abs_w <= binding_max_weight + 1e-9, (
             f"{name}: max_weight={binding_max_weight} violated post-clip, max(|w|)={max_abs_w}"
         )
-        assert clip_bound is True, (
+        assert result.clip_binding is True, (
             f"{name}: max raw weight {max_abs_raw} > max_weight {binding_max_weight}, so the "
-            "clip demonstrably moved the book, but clip_bound was not reported True"
+            "clip demonstrably moved the book, but clip_binding was not reported True"
         )
 
         # A max_weight that cannot possibly bind (looser than gross itself) must report False.
-        result_loose = fn(signal, sigma, corr, mask, gross=1.0, max_weight=1.0 + 1e-6)
-        _, clip_bound_loose = result_loose
-        assert clip_bound_loose is False, (
-            f"{name}: reported clip_bound=True even though max_weight=1.0+eps cannot bind "
+        result_loose = apply_weight_scheme(
+            name,
+            signal=signal,
+            sigma=sigma,
+            corr=corr,
+            tradable=mask,
+            gross=1.0,
+            max_weight=1.0 + 1e-6,
+        )
+        assert result_loose.clip_binding is False, (
+            f"{name}: reported clip_binding=True even though max_weight=1.0+eps cannot bind "
             "against a gross-1.0 book -- a report that is always True carries no information"
         )
 
@@ -269,7 +291,7 @@ def test_obligation_2_max_weight_clip_and_report_for_every_scheme():
 def test_obligation_3_no_weight_leaks_to_present_but_not_tradable():
     # catches: a scheme that assigns nonzero weight to a masked-out (present-but-not-tradable
     # or absent) name -- rule 7's present/tradable distinction leaking into a weight.
-    from nifty_quant.backtest.schemes import SCHEME_REGISTRY
+    from nifty_quant.backtest.weighting import WEIGHT_SCHEME_REGISTRY as SCHEME_REGISTRY
 
     n = 6
     rng = np.random.default_rng(2)
@@ -291,7 +313,7 @@ def test_obligation_3_no_weight_leaks_to_present_but_not_tradable():
 def test_obligation_4_inverse_vol_floor_prevents_inf_not_some_other_clamp():
     # catches: inverse_vol dividing by a raw zero sigma directly (producing inf), OR
     # "fixing" that with an ad hoc clamp other than sigma_risk's derived SIGMA_FLOOR.
-    from nifty_quant.backtest.schemes import SCHEME_REGISTRY
+    from nifty_quant.backtest.weighting import WEIGHT_SCHEME_REGISTRY as SCHEME_REGISTRY
 
     fn = SCHEME_REGISTRY["inverse_vol"]
     n = 4
@@ -324,7 +346,7 @@ def test_obligation_4_inverse_vol_floor_prevents_inf_not_some_other_clamp():
 def test_obligation_5_risk_parity_equal_vol_zero_corr_is_exactly_equal_weight():
     # catches: risk_parity not degenerating EXACTLY to equal weight on the one input where
     # "equal risk contribution" and "equal weight" are mathematically identical.
-    from nifty_quant.backtest.schemes import SCHEME_REGISTRY
+    from nifty_quant.backtest.weighting import WEIGHT_SCHEME_REGISTRY as SCHEME_REGISTRY
 
     n = 5
     signal = np.ones(n)  # signal is irrelevant to risk_parity by construction
@@ -342,7 +364,7 @@ def test_obligation_6_covariance_aware_diagonal_cov_is_exactly_inverse_vol():
     # catches: covariance_aware not degenerating EXACTLY to inverse_vol when the covariance
     # it was given carries no off-diagonal information (the one case where "using an
     # estimated covariance" and "using only the diagonal" must coincide).
-    from nifty_quant.backtest.schemes import SCHEME_REGISTRY
+    from nifty_quant.backtest.weighting import WEIGHT_SCHEME_REGISTRY as SCHEME_REGISTRY
 
     n = 5
     rng = np.random.default_rng(3)

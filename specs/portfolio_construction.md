@@ -154,3 +154,65 @@ This must be fixed BEFORE any Phase G comparison runs. A seven-scheme sweep woul
 understating the trial count that feeds `effective_n_trials` into the deflated Sharpe and PBO, and
 making the multiple-testing correction too PERMISSIVE — manufacturing exactly the spurious winner
 obligation 9 exists to prevent. Obligation 9 cannot be satisfied while this holds.
+
+---
+
+## AMENDMENT 3 (2026-08-31) — the interface, pinned. Adjudicates the dual suites' disagreement.
+
+Both suites were written from this spec alone; the spec never named the module, registry, or
+call signature (my omission), so each suite guessed and their guesses disagree — suite A:
+`backtest.weighting` / `WEIGHT_SCHEME_REGISTRY` / scalar `corr`; suite B: `backtest.schemes` /
+`SCHEME_REGISTRY` / covariance matrix / tuple-return clip report. Suite B explicitly flagged
+the `corr` inconsistency as "a spec defect worth resolving before implementation, not silently
+reconciled here". Correct on both counts. Adjudication, binding on the implementation:
+
+**A3.1 Module and names.** `src/nifty_quant/backtest/weighting.py`, exporting
+`WEIGHT_SCHEME_REGISTRY: dict[str, WeightScheme]` (the seven G1 keys, a declared dict literal),
+`apply_weight_scheme`, and `SchemeResult`. Suite A's guess; matches the G1 section title.
+
+**A3.2 Bare scheme signature (supersedes AMENDMENT 1 D2's fix wording).**
+
+    fn(signal, sigma, corr, tradable, *, gross: float = 1.0) -> np.ndarray
+
+Pure; float64 out; `sum(|weights|) == gross` within float tolerance; weight EXACTLY 0.0 where
+`~tradable`; a NaN-sigma name gets weight exactly 0.0; a zero sigma is floored by
+`sigma_risk(..., floor=SIGMA_FLOOR)` (obligation 4 pins that the floor, not an ad-hoc clamp,
+is the mechanism). Schemes receive ONLY `tradable` — both suites independently converged on
+this over D2's two-array signature, and it is stronger: a scheme cannot conflate masks it
+never sees. Rule-7 separation is enforced at the CALLER (engine/comparison), which must never
+fold `present` into the `tradable` it passes. No `max_weight` on bare schemes; no tuple returns.
+
+**A3.3 `corr: float | np.ndarray` (completes AMENDMENT 1 D4).** A scalar rho parameterises an
+equicorrelation CORRELATION matrix ((1-rho)I + rho*J), from which risk math derives covariance
+via the floored sigma — D4's one legitimate use of `median_pairwise_correlation`. A 2-D (n,n)
+array is a COVARIANCE matrix used verbatim (diagonal = per-name variance). The five
+structure-free schemes (equal_weight, inverse_vol, z_weight, z_over_vol, rank_weight) ignore
+`corr` entirely; `risk_parity` and `covariance_aware` consume it.
+
+**A3.4 Clipping lives ONLY in the wrapper (restates D1).**
+
+    apply_weight_scheme(name, *, signal, sigma, corr, tradable, gross, max_weight)
+        -> SchemeResult(weights, clip_binding, gross_before_clip)
+
+`clip_binding` is True iff the clip changed at least one weight. Post-clip weights are NOT
+re-normalised (re-normalising could re-violate `max_weight`); `gross_before_clip` records the
+pre-clip abs-sum (== declared gross).
+
+**A3.5 G3 module, pinned to suite B's guess.** `src/nifty_quant/research/portfolio_comparison.py`:
+`run_scheme_comparison(*, close, day_offsets, contract, registry)` returning a result with
+`.effective_n_trials`, writing ONE TrialRecord per scheme through the (now fixed) registry
+path; `evaluate_scheme_promotion(*, returns, day_offsets, recent_n_sessions)` returning
+`.promoted`, decided on the recent window only.
+
+**A3.6 Engine surface.** `BacktestResult` grows per-decision-row arrays
+`sigma_portfolio_ann`, `vol_target_achieved`, `clip_binding` (NaN/False on rows without a
+sizing call) — both suites assumed exactly this; the sizer's honest reporting must survive
+through `run_backtest`, not live only on the internal `SizingResult`.
+
+**A3.7 Suite reconciliation (lead-authored, recorded here).** Suite B's interface guesses are
+migrated to the pinned interface by the LEAD: the import line aliases
+(`WEIGHT_SCHEME_REGISTRY as SCHEME_REGISTRY`), and obligation 2's tuple-return calls become
+`apply_weight_scheme` calls. Every assertion's SUBSTANCE — what defect it catches, including
+obligation 2's derived-not-hand-picked binding threshold and its cannot-bind False case — is
+preserved verbatim. Suite A needs no changes. This is spec adjudication of documented guesses
+at an unpinned interface, not an implementer editing tests to pass.
