@@ -31,7 +31,12 @@ import pandas as pd
 import nifty_quant.guards as guards
 from nifty_quant.backtest.daily import DailyResult, build_daily
 from nifty_quant.backtest.orders import OrderIntent, PendingOrder
-from nifty_quant.backtest.portfolio import GrossNotionalSizer, Portfolio, SizingResult
+from nifty_quant.backtest.portfolio import (
+    GrossNotionalSizer,
+    Portfolio,
+    SizingResult,
+    VolTargetSizer,
+)
 from nifty_quant.data.panel import Panel
 from nifty_quant.execution.costs import (
     Charges,
@@ -42,6 +47,13 @@ from nifty_quant.execution.costs import (
     NSEIntradayEquityCosts,
 )
 from nifty_quant.execution.fills import FillModel, SqrtImpactSlippage
+from nifty_quant.features.core import (
+    SIGMA_FLOOR,
+    ewma_volatility_ann,
+    log_returns,
+    sigma_risk,
+)
+from nifty_quant.features.market import median_pairwise_correlation
 from nifty_quant.research.contract import ResearchContract
 from nifty_quant.strategy.base import ArrayMarketView, PortfolioState, Strategy
 
@@ -62,7 +74,15 @@ class BacktestConfig:
     fill_model: FillModel = field(
         default_factory=lambda: FillModel(slippage=SqrtImpactSlippage())
     )
-    sizer: GrossNotionalSizer = field(default_factory=GrossNotionalSizer)
+    sizer: GrossNotionalSizer | VolTargetSizer = field(default_factory=GrossNotionalSizer)
+    # G2 AMENDMENT 4: VolTargetSizer estimator parameters (used only on VolTargetSizer path).
+    # Cross-reference with sweep_features._DEFAULT_HALFLIFE_BARS — change one, change the other.
+    # These are estimator settings, not searchable parameters; G3 varies neither.
+    vol_sigma_halflife_bars: float = 20.0
+    # G2 AMENDMENT 4: VolTargetSizer estimator parameters (used only on VolTargetSizer path).
+    # Cross-reference with sweep_features._DEFAULT_WINDOW — change one, change the other.
+    # These are estimator settings, not searchable parameters; G3 varies neither.
+    vol_corr_window_bars: int = 30
 
 
 @dataclass(frozen=True)
@@ -132,6 +152,18 @@ class BacktestResult:
             turnover=np.empty(0, dtype=np.float64),
             n_days=0,
         )
+    )
+    # G2 amendment 3.6: per-decision-row arrays (NaN/False on rows without a sizing call)
+    # from VolTargetSizer's SizingResult. GrossNotionalSizer returns NaN for these fields,
+    # so they will be NaN on all rows when using GrossNotionalSizer.
+    sigma_portfolio_ann: np.ndarray = field(
+        default_factory=lambda: np.empty(0, dtype=np.float64)
+    )
+    vol_target_achieved: np.ndarray = field(
+        default_factory=lambda: np.empty(0, dtype=np.float64)
+    )
+    clip_binding: np.ndarray = field(
+        default_factory=lambda: np.empty(0, dtype=bool)
     )
 
     def to_dict(self) -> dict[str, float | int | bool]:
@@ -346,6 +378,15 @@ def run_backtest(
             else:
                 square_off_row_for_day[d] = end - 1
 
+        # G2: precompute sigma_ewma and log returns for VolTargetSizer if needed
+        sigma_ewma_precomputed: np.ndarray | None = None
+        log_returns_precomputed: np.ndarray | None = None
+        if isinstance(config.sizer, VolTargetSizer):
+            sigma_ewma_precomputed = ewma_volatility_ann(
+                close, panel.day_offsets, halflife=config.vol_sigma_halflife_bars
+            )
+            log_returns_precomputed = log_returns(close, day_offsets=panel.day_offsets)
+
         portfolio = Portfolio(
             shares=np.zeros(n_sym, dtype=np.float64),
             cash=float(config.capital),
@@ -376,6 +417,9 @@ def run_backtest(
         positions_list: list[np.ndarray] = []
         turnover_list: list[float] = []
         row_day_vals: list[int] = []
+        sigma_portfolio_ann_list: list[float] = []
+        vol_target_achieved_list: list[float] = []
+        clip_binding_list: list[bool] = []
         notional_since_snapshot = 0.0
 
         # order_id (spec `tca_record.md` AMENDMENT 1 item 2): monotonically
@@ -750,7 +794,9 @@ def run_backtest(
             _remove_zero_stops()
             return fill_notional
 
-        def _flush_snapshot(mark_prices: np.ndarray) -> None:
+        def _flush_snapshot(
+            mark_prices: np.ndarray, sizing_result: SizingResult | None = None
+        ) -> None:
             """Mark, append one (equity, gross, positions, turnover, day)
             snapshot row, and reset the fill-notional accumulator.
 
@@ -763,6 +809,8 @@ def run_backtest(
             the wrong session. Flushing at session end (see call site) means
             nothing can cross a session boundary; the pooled/total turnover is
             unchanged either way, only which day each piece is tagged with.
+
+            G2: sizing_result from the decision's sizer call is recorded if provided.
             """
             nonlocal notional_since_snapshot
             portfolio.mark(mark_prices)
@@ -779,6 +827,16 @@ def run_backtest(
             turnover_list.append(turnover_val)
             notional_since_snapshot = 0.0
             row_day_vals.append(day_idx)
+
+            # G2: record sizing result diagnostics
+            if sizing_result is not None:
+                sigma_portfolio_ann_list.append(float(sizing_result.sigma_portfolio_ann))
+                vol_target_achieved_list.append(float(sizing_result.vol_target_achieved))
+                clip_binding_list.append(bool(sizing_result.clip_binding))
+            else:
+                sigma_portfolio_ann_list.append(np.nan)
+                vol_target_achieved_list.append(np.nan)
+                clip_binding_list.append(False)
 
         for t in range(n_rows):
             day_idx = int(day_index[t])
@@ -897,7 +955,8 @@ def run_backtest(
                     )
 
             if is_decision_row[t]:
-                _flush_snapshot(close[t])
+                # G2: track sizing result to record diagnostics
+                current_sizing_result: SizingResult | None = None
 
                 cursor = t - 1
                 view = ArrayMarketView(
@@ -959,14 +1018,38 @@ def run_backtest(
                         else:
                             target_weights = masked_weights
                         bar_traded_value = close[cursor] * volume_safe[cursor]
-                        sizing_result = config.sizer.to_shares(
-                            target_weights,
-                            mark_prices,
-                            capital_now,
-                            bar_traded_value=bar_traded_value,
-                            max_participation=config.fill_model.max_participation,
-                        )
-                        assert isinstance(sizing_result, SizingResult)
+
+                        # G2: compute sigma and corr for VolTargetSizer
+                        if isinstance(config.sizer, VolTargetSizer):
+                            # Use precomputed sigma_ewma (causal, no lookahead)
+                            assert sigma_ewma_precomputed is not None
+                            sigma_vol = sigma_risk(
+                                sigma_ewma_precomputed[cursor], floor=SIGMA_FLOOR
+                            )
+                            # Compute median pairwise correlation at the decision point
+                            assert log_returns_precomputed is not None
+                            corr_vol = median_pairwise_correlation(
+                                log_returns_precomputed, window=config.vol_corr_window_bars,
+                                day_offsets=panel.day_offsets
+                            )[cursor]
+                            sizing_result = config.sizer.to_shares(
+                                target_weights,
+                                mark_prices,
+                                capital_now,
+                                bar_traded_value=bar_traded_value,
+                                max_participation=config.fill_model.max_participation,
+                                sigma=sigma_vol,
+                                corr=corr_vol,
+                            )
+                        else:
+                            sizing_result = config.sizer.to_shares(  # type: ignore[assignment]
+                                target_weights,
+                                mark_prices,
+                                capital_now,
+                                bar_traded_value=bar_traded_value,
+                                max_participation=config.fill_model.max_participation,
+                            )
+                        current_sizing_result = sizing_result
                         target_shares = sizing_result.shares
                         order = target_shares - portfolio.shares - in_flight
                         fill_row = t + 1 + int(config.decision_latency_bars)
@@ -976,6 +1059,9 @@ def run_backtest(
                             stop_key = f"stop:{symbol}"
                             if stop_key in target.meta:
                                 active_stops[sym_idx] = float(target.meta[stop_key])
+
+                # G2: flush snapshot with sizing result diagnostics
+                _flush_snapshot(close[t], sizing_result=current_sizing_result)
 
             is_last_row = t == panel.day_offsets[day_idx + 1] - 1
             # Square-off as STATE (spec section C), not a one-shot latch: re-arm
@@ -1114,6 +1200,11 @@ def run_backtest(
             notional_since_snapshot = 0.0
             row_day_vals.append(day_idx)
 
+            # G2: no sizing happens at terminal liquidation
+            sigma_portfolio_ann_list.append(np.nan)
+            vol_target_achieved_list.append(np.nan)
+            clip_binding_list.append(False)
+
         equity_curve_arr = np.asarray(equity_vals, dtype=np.float64)
         gross_curve_arr = np.asarray(gross_vals, dtype=np.float64)
         turnover_arr = np.asarray(turnover_list, dtype=np.float64)
@@ -1123,6 +1214,11 @@ def run_backtest(
             if positions_list
             else np.empty((0, n_sym), dtype=np.float64)
         )
+
+        # G2: convert sizing result diagnostic lists to arrays
+        sigma_portfolio_ann_arr = np.asarray(sigma_portfolio_ann_list, dtype=np.float64)
+        vol_target_achieved_arr = np.asarray(vol_target_achieved_list, dtype=np.float64)
+        clip_binding_arr = np.asarray(clip_binding_list, dtype=bool)
 
         returns_arr, net_ruin_idx = _compute_returns(equity_curve_arr, float(config.capital))
         gross_returns_arr, gross_ruin_idx = _compute_returns(
@@ -1230,4 +1326,7 @@ def run_backtest(
             n_rows_negative_cash=n_rows_negative_cash,
             ruined=ruined,
             ruin_index=ruin_index,
+            sigma_portfolio_ann=sigma_portfolio_ann_arr,
+            vol_target_achieved=vol_target_achieved_arr,
+            clip_binding=clip_binding_arr,
         )

@@ -82,7 +82,9 @@ class FeatureSpec:
 # ---------------------------------------------------------------------------
 
 _OPEN_MINUTE_IST = 555  # 09:15 IST in minutes-since-midnight -- NSE's real session open.
+# Cross-reference with BacktestConfig.vol_corr_window_bars — change one, change the other.
 _DEFAULT_WINDOW = 30  # bars; a lookback convention shared by every windowed wrapper here.
+# Cross-reference with BacktestConfig.vol_sigma_halflife_bars — change one, change the other.
 _DEFAULT_HALFLIFE_BARS = 20.0
 _DEFAULT_OPENING_RANGE_BARS = 15
 _DEFAULT_VARIANCE_RATIO_Q = 5

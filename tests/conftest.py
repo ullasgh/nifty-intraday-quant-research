@@ -117,9 +117,9 @@ _PENDING_SUITES: tuple[str, ...] = (
     # silently stops gating real code, which is the one failure this list exists to prevent.
     "test_execution_capacity_a.py",
     "test_execution_capacity_b.py",
-    "test_portfolio_construction_a.py",
-    "test_portfolio_construction_b.py",
 )
+# test_portfolio_construction_{a,b} REMOVED 2026-08-31: Phase G implementation landed
+# (weighting.py, engine wiring, portfolio_comparison.py) and both suites went green 45/45.
 # Entries go in ONLY while a suite is RED by design, and come out the moment it goes green.
 # Note this list is inert unless NQ_SKIP_PENDING=1 -- an unqualified `make gate` still runs
 # these suites and still fails on them, which is deliberate: the exemption has to be an
