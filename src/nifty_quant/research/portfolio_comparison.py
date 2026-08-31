@@ -44,8 +44,9 @@ class SchemeComparisonResult:
 class PromotionResult:
     """Result of evaluate_scheme_promotion.
 
-    promoted: bool, True iff the recent-window deflated Sharpe > 0.0
-              (zero is the deflated statistic's definitional null).
+    promoted: bool, True iff the recent-window deflated Sharpe exceeds
+              DEFLATED_SHARPE_THRESHOLD_DEFAULT (AMENDMENT 6 -- the repo's
+              one-sided-95% convention, imported from feature_sweep).
     """
 
     promoted: bool
