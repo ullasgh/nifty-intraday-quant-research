@@ -233,3 +233,26 @@ Two INDEPENDENT suites: `tests/test_lens_criteria_repair_a.py` and
 Never touch `data/`. Never assume 375 bars/session — include an irregular-session fixture.
 Bars are LEFT-labelled; NaN means "no bar"; float64 in motion. Reuse existing `Lens` fixtures
 and helpers where they exist rather than inventing parallel ones.
+
+---
+
+## AMENDMENT (2026-08-31) — var_trial_sharpes is now MEASURED. Wire it.
+
+The definitive Phase E sweep (2026-08-30, 19 of 22 features genuinely measured) produced the
+measurement this spec said was missing:
+
+    var_trial_sharpes (MEASURED) = 0.0389957
+    source: feature_sweep.measure_var_trial_sharpes over the 114 usable trials' own finite
+    observations; recorded in results/phase_e_sweep_report_2026-08-30.txt (committed).
+
+Required change: `lens.py`'s `var_trial_sharpes=1.0` placeholder becomes a named module
+constant `VAR_TRIAL_SHARPES_PHASE_E = 0.0389957` carrying the provenance above, passed to
+`expected_max_sharpe`. Rule 8 note: this is a measured value with its derivation recorded next
+to it, not a chosen constant; it supersedes both the 1.0 placeholder and the 0.0310657 figure
+from the partially-degenerate first sweep. When a future sweep re-measures it, the constant is
+updated WITH its new provenance line — never silently.
+
+Test obligations (extending the lens verdict-integrity suites): (i) the criterion-6 path calls
+`expected_max_sharpe` with the module constant, not 1.0; (ii) the constant equals the value
+recorded in the committed sweep report — parsed from `results/phase_e_sweep_report_2026-08-30
+.txt`, so the constant cannot drift from its recorded derivation.
