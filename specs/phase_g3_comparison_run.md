@@ -74,3 +74,27 @@ the AMENDMENT-4 estimator constants are reinterpreted in SESSION units, stated e
 
 7 tilt-length backtests plus statistics: minutes, not hours. The expensive budget is not
 CPU; it is the 7 registered trials and the framing above.
+
+---
+
+## AMENDMENT 1 (2026-08-31) — sigma units were incoherent in the frozen text; two runner defects
+
+Review of the round-2 dry-run found (a) the frozen text "EWMA of per-session entry->exit log
+returns, sigma_risk-floored" mixes units: the floor SIGMA_FLOOR = 0.1143218 is an ANNUALIZED
+p1, while a per-session EWMA lives near 0.01 — flooring makes sigma ~constant across names and
+silently degenerates inverse_vol / z_over_vol / risk_parity into near-copies (the exact
+artifact the first dry-run showed). My spec text, my defect. (b) A session past the corr
+warm-up can still yield rho = NaN (fewer than 2 fully-finite window rows) and flowed into the
+schemes, producing the covariance SVD failure.
+
+Corrections, binding:
+1. sigma_t per name = sqrt(EWMA of squared per-session returns; halflife 20 sessions) *
+   sqrt(252) — the standard annualized EWMA vol under the repo's 252 convention — THEN
+   sigma_risk-floored. Floor and estimate are now in the same units.
+2. Any post-warm-up session with non-finite rho is SKIPPED and counted in a separate
+   n_sessions_skipped_nan_rho (reported), never defaulted, never passed through.
+3. DEGENERACY REFUSAL: the runner reports the fraction of (name, session) sigma cells at the
+   floor; if it exceeds the floor's own definition (1% — SIGMA_FLOOR is the measured p1, so
+   materially more than ~1% of cells at the floor means the estimator is not measuring), by an
+   order of magnitude (>10% of cells floored), the runner REFUSES to write trials and says why.
+   Derivation: the 10x margin is against the floor's own p1 construction, not a tuned number.
