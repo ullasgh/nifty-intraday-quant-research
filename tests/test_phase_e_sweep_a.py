@@ -276,19 +276,25 @@ def test_obligation7_var_trial_sharpes_is_measured_not_the_1_0_placeholder():
     assert measured != 1.0
 
 
-def test_obligation7_lens_var_trial_sharpes_placeholder_is_still_the_known_1_0_todo():
-    """Regression anchor: `lens.py`'s existing deflated-Sharpe call is documented (spec E3.3)
-    as still carrying the unmeasured `var_trial_sharpes=1.0` placeholder that the sweep must
-    replace with `measure_var_trial_sharpes`, not merely duplicate elsewhere."""
+def test_obligation7_lens_var_trial_sharpes_placeholder_is_gone_and_measured_value_wired():
+    """Canary INVERTED by the lead 2026-08-31, exactly as its own failure message
+    prescribed: the 1.0 placeholder was replaced by the MEASURED value
+    (VAR_TRIAL_SHARPES_PHASE_E = 0.0389957, from the definitive sweep's
+    measure_var_trial_sharpes over 114 usable trials) wired through the criterion-6
+    path -- see tests/test_lens_var_trial_sharpes_wiring.py for the call-path and
+    report-provenance pins, each mutation-verified. This anchor now guards against the
+    placeholder ever coming BACK."""
     import inspect
 
     from nifty_quant.research import lens
 
     source = inspect.getsource(lens)
-    assert "var_trial_sharpes=1.0" in source, (
-        "if this literal is gone, confirm it was replaced by a MEASURED value wired through "
-        "the sweep, not simply deleted"
+    assert "var_trial_sharpes=1.0" not in source, (
+        "the unmeasured 1.0 placeholder has returned to lens.py; criterion 6 must use "
+        "the measured VAR_TRIAL_SHARPES_PHASE_E (see lens spec amendment 2026-08-31)"
     )
+    assert lens.VAR_TRIAL_SHARPES_PHASE_E != 1.0
+    assert "VAR_TRIAL_SHARPES_PHASE_E" in source
 
 
 # ---------------------------------------------------------------------------

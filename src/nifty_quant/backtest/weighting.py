@@ -325,40 +325,49 @@ def covariance_aware(
         return inverse_vol(signal, sigma, corr, tradable, gross=gross)
 
     # Off-diagonal structure: use w ∝ Σ⁻¹ 1 (minimum variance portfolio).
+    # The solve runs on the TRADABLE-and-finite-sigma submatrix only: a non-tradable
+    # name with NaN sigma would otherwise poison the full covariance and make the SVD
+    # fail outright (reproduced on the G3 runner, session 2018-02-28) -- the A3.2
+    # contract gives such names weight exactly 0.0, so they carry no information the
+    # solve needs. Results are scattered back to full length afterwards.
+    in_solve = tradable & np.isfinite(sigma)
+    n_solve = int(in_solve.sum())  # 0 is fine: a 0x0 pinv solve yields the all-zero book
+    sigma_solve = sigma[in_solve]
+
     # rho != 0.0 is guaranteed here for scalar corr -- rho == 0.0 took the diagonal
     # fast path above -- so the equicorrelation covariance is built unconditionally.
     if np.isscalar(corr):
         rho = float(corr)  # type: ignore[arg-type]
-        sigma_floored = sigma_risk(sigma, floor=SIGMA_FLOOR)
+        sigma_floored = sigma_risk(sigma_solve, floor=SIGMA_FLOOR)
         cov = np.diag(sigma_floored**2)
         off_diag = rho * np.outer(sigma_floored, sigma_floored)
         np.fill_diagonal(off_diag, 0.0)
         cov = cov + off_diag
     else:
-        cov = np.asarray(corr, dtype=np.float64)
+        cov = np.asarray(corr, dtype=np.float64)[np.ix_(in_solve, in_solve)]
 
-    ones_vec = np.ones(n, dtype=np.float64)
+    ones_vec = np.ones(n_solve, dtype=np.float64)
 
     # pinv, not inv: equal to the inverse for any nonsingular covariance, and gives the
     # deterministic minimum-norm solution on a singular one (e.g. two perfectly
     # correlated names) -- no condition-number cutoff, no shrinkage constant, no
     # exception path, so there is no hand-chosen numerical threshold here (rule 8).
-    raw_weights = np.linalg.pinv(cov) @ ones_vec
+    solved = np.linalg.pinv(cov) @ ones_vec
+    solved = np.where(np.isfinite(solved), solved, 0.0)
 
-    # Ensure finite
-    raw_weights = np.where(np.isfinite(raw_weights), raw_weights, 0.0)
-
-    # Mask out non-tradable names
-    raw_weights = np.where(tradable, raw_weights, 0.0)
+    # Scatter back to full length; everything outside the solve set is exactly 0.0
+    # (which also satisfies the tradable-mask contract, since in_solve ⊆ tradable).
+    raw_weights = np.zeros(n, dtype=np.float64)
+    raw_weights[in_solve] = solved
 
     # Normalize to gross
     sum_abs = np.sum(np.abs(raw_weights))
     if sum_abs > 0:
         weights = raw_weights / sum_abs * gross
     else:
-        # Reachable: an all-False `tradable` masks every weight to zero, so there is
-        # nothing to normalise -- return the all-zero book rather than dividing by zero.
-        weights = raw_weights  # pragma: no cover
+        # Reachable: an all-False tradable (or no finite-sigma name) gives an empty
+        # solve set and an all-zero book -- nothing to normalise, never divide by zero.
+        weights = raw_weights
 
     return weights
 

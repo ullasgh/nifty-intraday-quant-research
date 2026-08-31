@@ -488,3 +488,33 @@ def test_covariance_aware_singular_covariance_finite_deterministic():
     )
     assert np.all(np.isfinite(weights))
     assert np.sum(np.abs(weights)) == pytest.approx(1.0)
+
+
+def test_covariance_aware_nan_sigma_off_tradable_solves_on_submatrix():
+    """Defect found by the G3 runner (session 2018-02-28, reproduced minimally): a
+    NON-tradable name with NaN sigma poisoned the full-universe covariance and made
+    pinv's SVD fail outright. The solve now runs on the tradable-and-finite-sigma
+    submatrix; the NaN name carries no information the solve needs (its weight is
+    exactly 0.0 by contract). Weights must equal the same call with the name absent,
+    scattered back."""
+    sigma_with_nan = np.array([0.2, 0.3, np.nan, 0.25, 0.4], dtype=np.float64)
+    tradable = np.array([True, True, False, True, True])
+    signal = np.array([0.9, 0.1, 0.5, 0.7, 0.3], dtype=np.float64)
+
+    w_full = np.asarray(
+        WEIGHT_SCHEME_REGISTRY["covariance_aware"](
+            signal, sigma_with_nan, 0.3, tradable, gross=1.0
+        ),
+        dtype=np.float64,
+    )
+    assert np.all(np.isfinite(w_full))
+    assert w_full[2] == 0.0
+
+    keep = np.array([0, 1, 3, 4])
+    w_sub = np.asarray(
+        WEIGHT_SCHEME_REGISTRY["covariance_aware"](
+            signal[keep], sigma_with_nan[keep], 0.3, np.ones(4, dtype=bool), gross=1.0
+        ),
+        dtype=np.float64,
+    )
+    np.testing.assert_allclose(w_full[keep], w_sub, atol=1e-12)

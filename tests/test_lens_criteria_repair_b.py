@@ -360,8 +360,16 @@ def test_criterion6_same_signal_flips_pass_to_fail_as_trial_count_rises() -> Non
     n_trials raises expected_max_sharpe (the sr0 fed into deflated_sharpe), which
     lowers the resulting probability; this is the deflation actually working,
     not the units bug (defect 2), which the two tests above isolate
-    separately."""
-    strategy_returns = np.random.default_rng(42).normal(0.003, 0.001, size=300)
+    separately.
+
+    Fixture recalibrated by the lead 2026-08-31 (mean 0.003 -> 0.0005): with the
+    MEASURED var_trial_sharpes (0.0389957, superseding the 1.0 placeholder this
+    fixture was tuned against), expected_max_sharpe spans 0.10 (n=2) to 0.87
+    (n=100,000), so the old per-period SR of 3.0 could never flip. SR ~0.49 sits
+    inside the span with wide margins (measured DSR 1.0000 vs 0.0000). Same
+    assertion, same knob, same seed -- only the signal strength moved into the
+    measurable window."""
+    strategy_returns = np.random.default_rng(42).normal(0.0005, 0.001, size=300)
 
     pass_verdict = _call_verdict(
         _dense_all_pass_panel(), strategy_returns=strategy_returns, effective_n_trials=2
