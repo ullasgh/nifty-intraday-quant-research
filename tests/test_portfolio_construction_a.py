@@ -357,11 +357,18 @@ def test_o10_promotion_uses_recent_window_not_pooled():
     (`portfolio_sweep.evaluate_scheme_promotion(pooled, recent, threshold) -> bool`) lost
     the A3.5 adjudication to the returns-based interface, which is strictly stronger --
     a caller cannot hand it a pooled number relabelled as recent. Fixture, seed, and the
-    pooled-passes/recent-fails self-checks are unchanged."""
+    pooled-passes/recent-fails self-checks are unchanged.
+
+    AMENDMENT 6: the original self-checks (pooled > 0, recent <= 0) assumed signed-Sharpe
+    semantics; deflated_sharpe is a CDF in [0, 1], so they were impossible and had never
+    run (the import used to fail first). Early mean raised 0.004 -> 0.006 so the pooled
+    window CLEARS the repo's actual 0.95 DSR bar (measured 0.9893) while the recent window
+    fails it (0.0044); deterministic under the fixed seed."""
+    from nifty_quant.research.feature_sweep import DEFLATED_SHARPE_THRESHOLD_DEFAULT
     from nifty_quant.research.portfolio_comparison import evaluate_scheme_promotion
 
     rng = np.random.default_rng(1)
-    early_returns = rng.normal(0.004, 0.01, 48).astype(np.float64)
+    early_returns = rng.normal(0.006, 0.01, 48).astype(np.float64)
     recent_returns = rng.normal(-0.006, 0.01, 12).astype(np.float64)
     whole_series = np.concatenate((early_returns, recent_returns)).astype(np.float64)
 
@@ -370,8 +377,8 @@ def test_o10_promotion_uses_recent_window_not_pooled():
 
     # Intermediate facts asserted explicitly so this fails loudly, with a clear message, if
     # the fixture itself stops producing the intended pooled-passes/recent-fails contrast.
-    assert deflated_sharpe_pooled > 0.0
-    assert deflated_sharpe_recent <= 0.0
+    assert deflated_sharpe_pooled > DEFLATED_SHARPE_THRESHOLD_DEFAULT
+    assert deflated_sharpe_recent < DEFLATED_SHARPE_THRESHOLD_DEFAULT
 
     day_offsets = np.arange(0, whole_series.shape[0] + 1, 1, dtype=np.int64)
     result = evaluate_scheme_promotion(

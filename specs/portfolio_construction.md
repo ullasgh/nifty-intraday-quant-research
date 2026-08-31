@@ -271,3 +271,28 @@ Promotion bar, stated for rule 8: `promoted` iff the RECENT-window deflated Shar
 Zero is the deflated statistic's own null — DSR <= 0 means no evidence net of the trial
 count by construction — a definitional boundary like AMENDMENT 5's (phase_e) exact-0.0
 finite-fraction check, not a tuned cutoff. Any stricter bar would need a derivation.
+
+---
+
+## AMENDMENT 6 (2026-08-31) — the promotion bar, corrected. My AMENDMENT 5 bar was wrong.
+
+The G3 implementer flagged (correctly, again) that `deflated_sharpe` returns the DSR/PSR
+PROBABILITY, clipped to [0, 1] (`metrics.py:451-466`) — so AMENDMENT 5's "promoted iff recent
+DSR > 0.0" is vacuously true for any nonzero series. I stated a bar for a statistic whose
+semantics I had not verified. The implementer's own 0.5 replacement is likewise an invented
+constant.
+
+The bar this repo already uses for "DSR clears" is `feature_sweep.DEFLATED_SHARPE_THRESHOLD_
+DEFAULT = 0.95` — the one-sided-95% convention matching `spread_t > 1.96`, documented there per
+rule 8 as a convention, not a data-tuned value. Adjudication: `evaluate_scheme_promotion`
+promotes iff the RECENT-window deflated Sharpe exceeds THAT constant, IMPORTED from
+`feature_sweep` — one constant, one derivation note, never a second copy.
+
+Consequence for suite A's o10, measured: its fixture's self-checks (`pooled > 0.0`,
+`recent <= 0.0`) were written for signed-Sharpe semantics and are impossible for a CDF —
+never exercised before because the test previously failed at import. Measured on the real
+statistic: pooled DSR 0.8856 (fails the 0.95 bar too — the contrast collapses), recent 0.0044.
+Lead fix, recorded: early-window mean 0.004 -> 0.006 (pooled DSR 0.9893 clears, recent 0.0044
+fails — deterministic under the fixed seed, not a tuned statistical test), self-checks rewritten
+against the imported bar. The test's substance — promotion must key on the recent window, not
+pooled history — is unchanged.
