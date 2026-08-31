@@ -141,3 +141,58 @@ have the SMALLEST ADV, so `cap * ADV_i / w_i` is smallest precisely where the ed
 **Therefore capacity must be computed PER LIQUIDITY DECILE, not on a pooled average.** A pooled
 figure averages the binding constraint away and will overstate capacity for this strategy
 specifically. Add this as obligation 9; it is now the most important number in Phase H.
+
+---
+
+## AMENDMENT 2 (2026-08-31) — interface pinned; the pre-amendment ordering tests replaced
+
+Audited BOTH suites' interface guesses exhaustively before implementation (the G-phase lesson).
+Findings and adjudication, binding:
+
+**A2.1 Module.** `src/nifty_quant/execution/capacity.py` (suite B's guess — it orchestrates
+`costs.py`/`fills.py` and lives beside them). Suite A's `research.capacity` imports migrate via
+alias, call sites untouched.
+
+**A2.2 Ladder.** Canonical name `cost_participation_ladder` (suite B), aliased as `cost_ladder`
+in suite A's imports. Signature satisfying both call conventions:
+
+    cost_participation_ladder(gross_returns, turnover, orders=None, prices=None,
+        bar_traded_value=None, tradable=None, *, day_offsets=None,
+        capital_ref=1_000_000.0,
+        cost_bps_grid=(0.0, 2.0, 5.0, 8.0, 10.0, 15.0, 20.0),
+        participation_grid=(0.005, 0.01, 0.02, 0.05, 0.10)) -> list[LadderCell]
+
+Cell fields: cost_bps, participation, net_sharpe, net_bps_per_day, turnover,
+unfilled_fraction. Grid order cost-major (suite A pins it). Suite A also pins the arithmetic:
+net_bps_per_day = mean(gross - cost_bps/1e4 * turnover) * 1e4, cell.turnover = mean(turnover).
+Unfilled model: per-row desired order notional = |orders|*prices when orders are given, else
+turnover * capital_ref (the tilt's existing Rs 1,000,000 capital convention, not a new
+constant); fillable = participation * bar_traded_value; unfilled_fraction = pooled
+max(0, desired - fillable) / desired, in [0, 1], never dropped from any cell.
+
+**A2.3 Capacity functions.** In `execution.capacity`:
+
+    capacity_from_adv(median_adv, typical_weight=None, max_participation=0.02)
+        -> max_participation * median_adv, divided by typical_weight when given
+           (suite A's formula) and per-name when not (suite B's).
+    capacity_from_turnover(median_adv, typical_weight=None, max_participation=0.02,
+        daily_turnover_fraction=None)
+        -> capacity_from_adv(...) / daily_turnover_fraction   (AMENDMENT 1's formula)
+    combined_capacity(...) -> NamedTuple(value, binding) with value =
+        min(position, trade) and binding in {"position", "trade"} (AMENDMENT 1 point 2).
+
+**A2.4 Crossover.** Both guesses stand, no conflict: property
+`NSEIntradayEquityCosts.brokerage_crossover_notional` (suite A) is canonical, derived
+`brokerage_flat / brokerage_pct`; module function `costs.brokerage_crossover_notional(model)`
+(suite B) is a thin accessor delegating to it.
+
+**A2.5 The ordering tests, replaced per AMENDMENT 1's own mandate.** BOTH suites still carry
+the retracted `turnover_capacity < adv_capacity` assertion (suite B predates the amendment;
+suite A's author flagged the tension in a comment but asserted the retracted ordering anyway).
+AMENDMENT 1 explicitly lists what obligation 7 must assert instead; the lead replaces each
+suite's ordering test with those three assertions, in that suite's own style: (1) the ratio
+identity turnover_capacity/adv_capacity == 1/daily_turnover_fraction; (2) combined_capacity
+reports min() plus WHICH constraint bound; (3) the direction regression — turnover_fraction
+below 1 makes POSITION binding, above 1 makes TRADE binding. Suite B's
+scales-inversely-with-turnover test is CONSISTENT with the amendment formula and stands
+unchanged.
