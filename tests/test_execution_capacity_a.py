@@ -163,7 +163,9 @@ def test_stt_is_sell_side_and_stamp_is_buy_side():
 
 def test_cost_ladder_has_all_cells_and_first_class_metrics():
     # It catches missing ladder cells, transposed grid order, or cells that omit unfilled fraction.
-    from nifty_quant.research.capacity import cost_ladder
+    from nifty_quant.execution.capacity import (  # A2.1/A2.2: module+name pinned, aliased
+        cost_participation_ladder as cost_ladder,
+    )
 
     inputs = _ladder_inputs()
     gross_returns, turnover, orders, prices, bar_traded_value, tradable = inputs
@@ -204,7 +206,9 @@ def test_cost_ladder_has_all_cells_and_first_class_metrics():
 
 def test_zero_bps_column_has_higher_net_bps_than_costly_column():
     # It catches a ladder that ignores its cost axis or treats the zero-bps column as padding.
-    from nifty_quant.research.capacity import cost_ladder
+    from nifty_quant.execution.capacity import (  # A2.1/A2.2: module+name pinned, aliased
+        cost_participation_ladder as cost_ladder,
+    )
 
     gross_returns, turnover, orders, prices, bar_traded_value, tradable = (
         _ladder_inputs()
@@ -241,7 +245,9 @@ def test_zero_bps_column_has_higher_net_bps_than_costly_column():
 
 def test_ladder_exposes_fill_starvation_with_net_sharpe():
     # It catches unfilled orders being dropped from the metric calculation or hidden from the cell.
-    from nifty_quant.research.capacity import cost_ladder
+    from nifty_quant.execution.capacity import (  # A2.1/A2.2: module+name pinned, aliased
+        cost_participation_ladder as cost_ladder,
+    )
 
     gross_returns, turnover, orders, prices, bar_traded_value, tradable = (
         _ladder_inputs()
@@ -331,7 +337,7 @@ def test_fill_model_reports_capped_notional_without_requeue():
 
 def test_adv_capacity_uses_the_specified_formula():
     # It catches the ADV upper-bound helper drifting from the existing position-size estimate.
-    from nifty_quant.research.capacity import capacity_from_adv
+    from nifty_quant.execution.capacity import capacity_from_adv  # A2.1: pinned module
 
     weighted_median_adv = 1_234_567_890.0
     typical_weight = 0.0175
@@ -347,12 +353,16 @@ def test_adv_capacity_uses_the_specified_formula():
     assert np.isclose(actual, expected, rtol=1e-12, atol=0.001)
 
 
-def test_turnover_capacity_is_lower_than_adv_capacity():
-    # It catches an ADV-only or incorrectly ordered capacity result that is
-    # not constrained by turnover.
-    from nifty_quant.research.capacity import (
+def test_capacity_ratio_identity_and_binding_constraint():
+    """REPLACED by the lead per AMENDMENT 1 + A2.5: the original test asserted the
+    retracted ordering `turnover_capacity < adv_capacity`, which is backwards for a
+    turnover fraction below one -- the trade constraint is the position constraint
+    DIVIDED by turnover_frac, hence LOOSER. These are the amendment's own three
+    mandated assertions."""
+    from nifty_quant.execution.capacity import (  # A2.1: pinned module
         capacity_from_adv,
         capacity_from_turnover,
+        combined_capacity,
     )
 
     weighted_median_adv = 4_000_000_000.0
@@ -372,9 +382,30 @@ def test_turnover_capacity_is_lower_than_adv_capacity():
         daily_turnover_frac,
     )
 
-    # A naive daily-traded-value derivation would reverse this inequality because
-    # daily_turnover_frac is below one; the spec supplies no exact replacement formula.
-    assert turnover_capacity < adv_capacity
+    # (1) The directionless ratio identity -- holds for high- and low-turnover books alike.
+    assert np.isclose(
+        turnover_capacity / adv_capacity, 1.0 / daily_turnover_frac, rtol=1e-12, atol=0.0
+    )
+
+    # (2) Reported capacity is min(position, trade) and says WHICH constraint bound.
+    combined = combined_capacity(
+        weighted_median_adv,
+        typical_weight,
+        participation_cap,
+        daily_turnover_frac,
+    )
+    assert combined.value == pytest.approx(min(adv_capacity, turnover_capacity))
+
+    # (3) Direction regression: turnover_frac < 1 -> POSITION binds; > 1 -> TRADE binds.
+    assert combined.binding == "position"
+    high_turnover = combined_capacity(
+        weighted_median_adv,
+        typical_weight,
+        participation_cap,
+        1.6,
+    )
+    assert high_turnover.binding == "trade"
+    assert high_turnover.value == pytest.approx(adv_capacity / 1.6)
 
 
 def test_zero_fixed_bps_matches_zero_cost():

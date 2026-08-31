@@ -363,7 +363,28 @@ def test_turnover_based_capacity_is_lower_than_adv_based_capacity() -> None:
         daily_turnover_fraction=daily_turnover_fraction,
     )
 
-    assert turnover_capacity < adv_capacity
+    # REPLACED by the lead per AMENDMENT 1 + A2.5. The original `turnover_capacity <
+    # adv_capacity` assert contradicted this test's OWN docstring formula
+    # (capacity ~ ADV*participation / turnover: dividing by a fraction below one makes
+    # the trade constraint LOOSER, not tighter). The amendment's three assertions:
+    from nifty_quant.execution.capacity import combined_capacity  # noqa: PLC0415
+
+    assert turnover_capacity / adv_capacity == pytest.approx(1.0 / daily_turnover_fraction)
+
+    combined = combined_capacity(
+        median_adv=median_adv,
+        max_participation=max_participation,
+        daily_turnover_fraction=daily_turnover_fraction,
+    )
+    assert combined.value == pytest.approx(min(adv_capacity, turnover_capacity))
+    assert combined.binding == "position"  # turnover_fraction 0.11 < 1 -> position binds
+
+    tighter = combined_capacity(
+        median_adv=median_adv,
+        max_participation=max_participation,
+        daily_turnover_fraction=2.0,
+    )
+    assert tighter.binding == "trade"  # turnover_fraction 2.0 > 1 -> the daily trade binds
 
 
 def test_turnover_based_capacity_scales_inversely_with_turnover_fraction() -> None:
