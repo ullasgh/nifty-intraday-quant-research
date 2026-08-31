@@ -216,3 +216,35 @@ migrated to the pinned interface by the LEAD: the import line aliases
 obligation 2's derived-not-hand-picked binding threshold and its cannot-bind False case — is
 preserved verbatim. Suite A needs no changes. This is spec adjudication of documented guesses
 at an unpinned interface, not an implementer editing tests to pass.
+
+---
+
+## AMENDMENT 4 (2026-08-31) — the engine's sigma/corr estimator parameters, adjudicated
+
+G2 told the engine to supply `sigma` and `corr` but named neither the EWMA halflife nor the
+correlation window. The implementer hardcoded `halflife=10` and `window=20` inside the engine
+body — flagged in review: `specs/portfolio_vol_target.md` amendment 1 item 6 requires the vol
+path to RAISE without an explicit halflife (rule 8, "no silently-picked default"), yet BOTH
+G suites independently construct `BacktestConfig(sizer=VolTargetSizer(target_vol_ann=0.15))`
+bare and assert the run completes — the suites force a default to exist. A real conflict
+between two specs, adjudicated here:
+
+1. The RAISE rule continues to bind the ESTIMATOR (`core.ewma_volatility_ann` has no default
+   halflife — unchanged). The engine seam gets explicit `BacktestConfig` fields instead of
+   buried literals:
+
+       vol_sigma_halflife_bars: float = 20.0
+       vol_corr_window_bars: int = 30
+
+   Visible in the config (hence in any recorded params_json / provenance), overridable, and
+   used ONLY on the VolTargetSizer path.
+
+2. The default VALUES are the sweep conventions, not fresh choices: 20.0 is
+   `sweep_features._DEFAULT_HALFLIFE_BARS` and 30 is `sweep_features._DEFAULT_WINDOW` — the
+   settings under which Phase E characterized `ewma_volatility_ann` and
+   `median_pairwise_correlation` on the production panel. Using the characterized settings is
+   the provenance; a different value is a caller's explicit, recorded choice. Cross-reference
+   comments required at both definition sites (change one, change the other).
+
+3. G3's scheme comparison varies NEITHER field — they are estimator settings, not searchable
+   parameters. Sweeping them would be additional trials and must be registered as such.
