@@ -74,3 +74,35 @@ Dual independent suites per rule 1, from this spec alone.
    promotion.
 8. `make verify`'s volume_breakout 2024 regression result is unchanged — v2 is a NEW strategy, it
    does not overwrite v1's recorded numbers.
+
+
+# VERDICT — KILLED 2026-08-31, at the component gate. Criteria 1-5 never ran.
+
+Author: lead. This is the formal kill write-up this spec demanded of itself ("failing ANY of
+these kills it"), applied one gate earlier than the five numbered criteria: the section "What
+Phase E must supply first" forbids assembling v2 from components Phase E measured as dead, and
+the definitive sweep (2026-08-30, 19 of 22 features genuinely measured on real OHLCV —
+`results/PHASE_E_SWEEP.md`) returned a verdict on all four:
+
+    component              best raw Sharpe (any horizon)   verdict against this spec's gate
+    hurst_on_stitched      +0.0118                          no monotone conditional response ->
+                                                            H-threshold has nothing to rest on
+    beta_residual_return   -0.1066 (EOD); -0.8367 at h=1    measured NEGATIVE, worst in sweep
+    breakout_strength      -0.0526 (best); -0.1817 at h=1   NEGATIVE at every horizon
+    volume_zscore          +0.1080 at h=1, decaying          deflated Sharpe 0.0000 at the
+                           monotonically with horizon        measured n_eff=18.76 (sr0=0.3697)
+
+Every deflated Sharpe in the 114-trial matrix is 0.0000 (PBO 0.0002 — the sweep stably ranks
+nothing). `volume_zscore` deserves the explicit note: its raw +0.1080 at h=1 is the largest
+raw Sharpe in the sweep and is exactly the v1 shape — a short-horizon volume signal — whose
+economics v1 already measured as dead at one minute of latency (gross -0.048, net -0.233,
+73.7% unfilled). A component that (a) does not clear the multiple-testing bar and (b) repeats
+a measured execution failure does not go in.
+
+With zero of four components passing the gate, there is nothing to assemble; evaluating
+criteria 1-5 would require building a strategy from measured nulls, which the gate exists to
+prevent. Per the spec's own terms: **no re-tuning, no re-runs, no component swaps** — a new
+volume hypothesis would be a NEW spec with its trial count charged on top of Phase E's 132
+(n_eff 18.76), not a v2 revision.
+
+v1's reference regression (obligation 8) is untouched and still guards `make verify`.
