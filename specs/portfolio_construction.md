@@ -248,3 +248,26 @@ between two specs, adjudicated here:
 
 3. G3's scheme comparison varies NEITHER field — they are estimator settings, not searchable
    parameters. Sweeping them would be additional trials and must be registered as such.
+
+---
+
+## AMENDMENT 5 (2026-08-31) — A3.7's "Suite A needs no changes" was FALSE. o10 migrated.
+
+The G3 implementer stopped and reported (correctly, per rule 1) that suite A's `test_o10`
+imports `research.portfolio_sweep.evaluate_scheme_promotion(deflated_sharpe_pooled,
+deflated_sharpe_recent, threshold) -> bool` — a third interface guess AMENDMENT 3 failed to
+notice when it claimed suite A needed no changes. My review of suite A's G3 tests was
+superficial; the implementer's was not.
+
+Adjudication: A3.5's pin stands (suite B's shape — the decision is computed FROM the returns,
+which is strictly stronger: a caller cannot hand it a pooled number and call it recent).
+Suite A's o10 is migrated by the lead per the A3.7 mechanism: SAME fixture (48 good early
+sessions, 12 bad recent, seed 1), SAME intermediate self-checks (pooled DSR > 0, recent
+DSR <= 0), the call migrated to the pinned signature with one-session-per-return day_offsets
+and `recent_n_sessions=12`. The substance — promotion must refuse when only stale history
+carries the edge — is unchanged.
+
+Promotion bar, stated for rule 8: `promoted` iff the RECENT-window deflated Sharpe is > 0.0.
+Zero is the deflated statistic's own null — DSR <= 0 means no evidence net of the trial
+count by construction — a definitional boundary like AMENDMENT 5's (phase_e) exact-0.0
+finite-fraction check, not a tuned cutoff. Any stricter bar would need a derivation.

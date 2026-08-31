@@ -351,8 +351,14 @@ def test_o9_effective_n_trials_across_schemes_is_measured_below_seven():
 def test_o10_promotion_uses_recent_window_not_pooled():
     """RED at HEAD: this catches a promotion decision that reads the pooled deflated
     Sharpe instead of (or in addition to) the recent-window figure -- exactly the H2
-    pooled-vs-recent regression the spec cites."""
-    from nifty_quant.research.portfolio_sweep import evaluate_scheme_promotion
+    pooled-vs-recent regression the spec cites.
+
+    MIGRATED by the lead per AMENDMENT 5 (2026-08-31): this suite's original guess
+    (`portfolio_sweep.evaluate_scheme_promotion(pooled, recent, threshold) -> bool`) lost
+    the A3.5 adjudication to the returns-based interface, which is strictly stronger --
+    a caller cannot hand it a pooled number relabelled as recent. Fixture, seed, and the
+    pooled-passes/recent-fails self-checks are unchanged."""
+    from nifty_quant.research.portfolio_comparison import evaluate_scheme_promotion
 
     rng = np.random.default_rng(1)
     early_returns = rng.normal(0.004, 0.01, 48).astype(np.float64)
@@ -367,14 +373,11 @@ def test_o10_promotion_uses_recent_window_not_pooled():
     assert deflated_sharpe_pooled > 0.0
     assert deflated_sharpe_recent <= 0.0
 
-    assert (
-        evaluate_scheme_promotion(
-            deflated_sharpe_pooled=deflated_sharpe_pooled,
-            deflated_sharpe_recent=deflated_sharpe_recent,
-            threshold=0.0,
-        )
-        is False
+    day_offsets = np.arange(0, whole_series.shape[0] + 1, 1, dtype=np.int64)
+    result = evaluate_scheme_promotion(
+        returns=whole_series, day_offsets=day_offsets, recent_n_sessions=12
     )
+    assert result.promoted is False
 
 
 # =========================================================================
