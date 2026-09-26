@@ -1,0 +1,57 @@
+# Nifty 50 constituents as CURRENTLY listed -- NOT point-in-time membership.
+# Source: https://www.niftyindices.com/IndexConstituent/ind_nifty50list.csv
+# Fetched: 2026-09-26. The March-2026 review made no Nifty 50 changes.
+# Applying today's list to 2023-2025 carries survivorship bias (names that were
+# promoted into the index are included over periods before they joined it).
+name: nifty50
+symbols:
+- ADANIENT
+- ADANIPORTS
+- APOLLOHOSP
+- ASIANPAINT
+- AXISBANK
+- BAJAJ-AUTO
+- BAJFINANCE
+- BAJAJFINSV
+- BEL
+- BHARTIARTL
+- CIPLA
+- COALINDIA
+- DRREDDY
+- EICHERMOT
+- ETERNAL
+- GRASIM
+- HCLTECH
+- HDFCBANK
+- HDFCLIFE
+- HINDALCO
+- HINDUNILVR
+- ICICIBANK
+- ITC
+- INFY
+- INDIGO
+- JSWSTEEL
+- JIOFIN
+- KOTAKBANK
+- LT
+- M&M
+- MARUTI
+- MAXHEALTH
+- NTPC
+- NESTLEIND
+- ONGC
+- POWERGRID
+- RELIANCE
+- SBILIFE
+- SHRIRAMFIN
+- SBIN
+- SUNPHARMA
+- TCS
+- TATACONSUM
+- TMPV
+- TATASTEEL
+- TECHM
+- TITAN
+- TRENT
+- ULTRACEMCO
+- WIPRO
