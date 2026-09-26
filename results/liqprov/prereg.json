@@ -1,0 +1,424 @@
+{
+  "config_hash": "ee769366e6cea304",
+  "execution": {
+    "cost_model": "NSEIntradayEquityCosts()",
+    "long_only": true,
+    "notional": 1000000.0,
+    "notional_sensitivity": 100000.0,
+    "slippage_model": "SqrtImpactSlippage() (half_spread 1.5 bps, impact_coef 10; ASSUMED, not calibrated); passive entries pay no slippage",
+    "stop_loss": null,
+    "tick": 0.05,
+    "tradable": "tradable_mask(panel) on stock columns only (default min_adv_inr=5e7); unusable and out-of-window sessions untradable"
+  },
+  "features": {
+    "beta_lookback": 20,
+    "gate_qs": [
+      0.8,
+      0.9,
+      0.95
+    ],
+    "index_adr_n": 10,
+    "quantile_min_sessions": 120,
+    "quantile_window": 250,
+    "square_off_minute": 920,
+    "start_minute": 556,
+    "stock_adr_n": 10
+  },
+  "gates": {
+    "definition": "gate = stress_gate(vix_chg, idx_dev_adr, v_day, m_day); v_day = rolling_session_quantile(session_extreme(vix_chg,'max'), usable, q); m_day = rolling_session_quantile(session_extreme(idx_dev_adr,'min'), usable, 1-q); window=250, min_sessions=120; idx_dev_adr = idx_dev / index ADR(N=10). sessions_fired counts in-window usable sessions with the gate True on at least one row (any minute); sessions_fired_trade_window restricts to rows 09:16 <= t < 15:20.",
+    "idx_dev_adr_min_day_describe": {
+      "max": 0.007503803330871307,
+      "mean": -0.4265291905014339,
+      "median": -0.34403669640934953,
+      "min": -4.3645023812118815,
+      "n_finite": 1385
+    },
+    "n_sessions": 1385,
+    "per_q": {
+      "0.80": {
+        "fired_sessions_digest": "46aa76e0e7f698d4",
+        "first_session_with_finite_thresholds": "2018-01-25",
+        "frac_sessions_fired": 0.07942238267148015,
+        "gated_rows": 4494,
+        "m_day_describe": {
+          "max": -0.5309385439448868,
+          "mean": -0.6202279886870339,
+          "median": -0.6176349991677094,
+          "min": -0.7086939379764359,
+          "n_finite": 1367
+        },
+        "m_day_digest": "4330c46f4140483b",
+        "q": 0.8,
+        "sessions_fired": 110,
+        "sessions_fired_trade_window": 106,
+        "sessions_with_finite_thresholds": 1367,
+        "v_day_describe": {
+          "max": 0.07959741335790955,
+          "mean": 0.06343944313870159,
+          "median": 0.062490644946331116,
+          "min": 0.05477633255197466,
+          "n_finite": 1376
+        },
+        "v_day_digest": "1bffa062870757d1"
+      },
+      "0.90": {
+        "fired_sessions_digest": "4dcf25ebb5ae125c",
+        "first_session_with_finite_thresholds": "2018-01-25",
+        "frac_sessions_fired": 0.0296028880866426,
+        "gated_rows": 1539,
+        "m_day_describe": {
+          "max": -0.6839968672300728,
+          "mean": -0.8308002268140866,
+          "median": -0.8408726934365252,
+          "min": -1.0363662090596268,
+          "n_finite": 1367
+        },
+        "m_day_digest": "7978141ead671ecb",
+        "q": 0.9,
+        "sessions_fired": 41,
+        "sessions_fired_trade_window": 39,
+        "sessions_with_finite_thresholds": 1367,
+        "v_day_describe": {
+          "max": 0.12335533703867613,
+          "mean": 0.09215582794010593,
+          "median": 0.09054008998196472,
+          "min": 0.0722913858077999,
+          "n_finite": 1376
+        },
+        "v_day_digest": "780225ab849bc3b3"
+      },
+      "0.95": {
+        "fired_sessions_digest": "931d97a07a4976c5",
+        "first_session_with_finite_thresholds": "2018-01-25",
+        "frac_sessions_fired": 0.011552346570397111,
+        "gated_rows": 680,
+        "m_day_describe": {
+          "max": -0.8201352353561728,
+          "mean": -1.048633654819975,
+          "median": -1.054112129816106,
+          "min": -1.2059655980361108,
+          "n_finite": 1367
+        },
+        "m_day_digest": "b141eb241aae0ddf",
+        "q": 0.95,
+        "sessions_fired": 16,
+        "sessions_fired_trade_window": 15,
+        "sessions_with_finite_thresholds": 1367,
+        "v_day_describe": {
+          "max": 0.1531770275831779,
+          "mean": 0.12079539883273971,
+          "median": 0.11645810479330458,
+          "min": 0.09245016949266853,
+          "n_finite": 1376
+        },
+        "v_day_digest": "bf13e706a8011192"
+      }
+    },
+    "vix_max_day_describe": {
+      "max": 0.45678230895075966,
+      "mean": 0.036252168799877284,
+      "median": 0.026770749250783155,
+      "min": -0.15206105472477338,
+      "n_finite": 1383
+    }
+  },
+  "holdout": {
+    "end": "2026-08-14",
+    "read_count_after": 0,
+    "read_count_before": 0,
+    "record_read_called": false,
+    "start": "2025-08-14"
+  },
+  "k_grid": {
+    "definition": "minz = session_extreme(z, 'min') per (symbol, session) over 09:16 <= t < 15:20, restricted to usable in-window sessions and finite values; k90 = -quantile(minz, 0.10), k95 = -quantile(minz, 0.05) (numpy 'linear'), rounded to 3 dp",
+    "grid": [
+      0.549,
+      0.669
+    ],
+    "k": {
+      "k90": 0.549,
+      "k95": 0.669
+    },
+    "minz_describe": {
+      "max": 0.10649683540841373,
+      "mean": -0.31384650851309404,
+      "median": -0.2744744384037497,
+      "min": -6.012787829750803,
+      "n_finite": 66301
+    },
+    "n_sessions": 1385,
+    "n_symbols": 50,
+    "quantiles": {
+      "k90": {
+        "minz_quantile": -0.5488761272396101,
+        "q": 0.1
+      },
+      "k95": {
+        "minz_quantile": -0.6693705698663202,
+        "q": 0.05
+      }
+    },
+    "sample_size": 66301,
+    "total_pairs": 69250
+  },
+  "kill_criteria": {
+    "dsr_bar": 0.95,
+    "pbo_splits": 16,
+    "text": [
+      "All criteria are evaluated per trial on net_bps / net_pnl at notional Rs 10L (Rs 1L is a reported sensitivity only), with NSEIntradayEquityCosts() + SqrtImpactSlippage(), over usable sessions in [2018-01-01, 2023-08-13].",
+      "c1_mean_net_positive: mean net_bps over all trades > 0.",
+      "c2_day_t_gt_2: day-clustered t of net_bps (trades collapsed to one mean per session, mean / (std(ddof=1) / sqrt(n_days))) > 2.",
+      "c3_positive_years_ge_4: at least 4 of the 6 calendar years 2018-2023 have summed net_pnl > 0 (a year with no trades is not positive).",
+      "c4_ex_top5_positive: mean net_bps after dropping all trades on the 5 best days by total net_pnl > 0.",
+      "A trial passes only if c1-c4 all hold (any NaN fails).",
+      "Multiple-testing bar: the deflated Sharpe (per-period, sr0 = expected_max_sharpe(effective_n_trials, var of per-period trial Sharpes)) of the best trial at Rs 10L must be >= 0.95. PBO (CSCV, 16 splits) is reported alongside.",
+      "The hypothesis is supported only if at least one trial passes c1-c4 AND the DSR bar is met. Otherwise the family is killed; no re-parameterisation on this window."
+    ],
+    "years": [
+      2018,
+      2019,
+      2020,
+      2021,
+      2022,
+      2023
+    ]
+  },
+  "n_trials": 12,
+  "provenance": {
+    "generated_at_utc": "2026-09-26T09:31:39+00:00",
+    "git_dirty": false,
+    "git_sha": "c121fae2abe3c01728addaaf72ea0f2b459bc809",
+    "script": "scripts/prereg_liqprov.py"
+  },
+  "schema": "liqprov_prereg_v1",
+  "spec": "specs/liqprov_fade.md",
+  "strategy": "liqprov_fade (stress-gated residual liquidity-provision, long only)",
+  "trials": [
+    {
+      "id": "q0.80_k0.549_passive",
+      "k": 0.549,
+      "k_name": "k90",
+      "mode": "passive",
+      "q": 0.8
+    },
+    {
+      "id": "q0.80_k0.549_market",
+      "k": 0.549,
+      "k_name": "k90",
+      "mode": "market",
+      "q": 0.8
+    },
+    {
+      "id": "q0.80_k0.669_passive",
+      "k": 0.669,
+      "k_name": "k95",
+      "mode": "passive",
+      "q": 0.8
+    },
+    {
+      "id": "q0.80_k0.669_market",
+      "k": 0.669,
+      "k_name": "k95",
+      "mode": "market",
+      "q": 0.8
+    },
+    {
+      "id": "q0.90_k0.549_passive",
+      "k": 0.549,
+      "k_name": "k90",
+      "mode": "passive",
+      "q": 0.9
+    },
+    {
+      "id": "q0.90_k0.549_market",
+      "k": 0.549,
+      "k_name": "k90",
+      "mode": "market",
+      "q": 0.9
+    },
+    {
+      "id": "q0.90_k0.669_passive",
+      "k": 0.669,
+      "k_name": "k95",
+      "mode": "passive",
+      "q": 0.9
+    },
+    {
+      "id": "q0.90_k0.669_market",
+      "k": 0.669,
+      "k_name": "k95",
+      "mode": "market",
+      "q": 0.9
+    },
+    {
+      "id": "q0.95_k0.549_passive",
+      "k": 0.549,
+      "k_name": "k90",
+      "mode": "passive",
+      "q": 0.95
+    },
+    {
+      "id": "q0.95_k0.549_market",
+      "k": 0.549,
+      "k_name": "k90",
+      "mode": "market",
+      "q": 0.95
+    },
+    {
+      "id": "q0.95_k0.669_passive",
+      "k": 0.669,
+      "k_name": "k95",
+      "mode": "passive",
+      "q": 0.95
+    },
+    {
+      "id": "q0.95_k0.669_market",
+      "k": 0.669,
+      "k_name": "k95",
+      "mode": "market",
+      "q": 0.95
+    }
+  ],
+  "universe": {
+    "index_symbol": "NIFTY50",
+    "n_symbols": 50,
+    "name": "nifty50",
+    "source": "static",
+    "survivorship": {
+      "as_of_date": null,
+      "missing_by_year": {
+        "2018": [
+          "ETERNAL",
+          "JIOFIN",
+          "MAXHEALTH"
+        ],
+        "2019": [
+          "ETERNAL",
+          "JIOFIN",
+          "MAXHEALTH"
+        ],
+        "2020": [
+          "ETERNAL",
+          "JIOFIN"
+        ],
+        "2021": [
+          "JIOFIN"
+        ],
+        "2022": [
+          "JIOFIN"
+        ],
+        "2023": []
+      },
+      "n_symbols": 50,
+      "per_year": {
+        "2018": {
+          "active": 47,
+          "missing": 3,
+          "pct_active": 0.94
+        },
+        "2019": {
+          "active": 47,
+          "missing": 3,
+          "pct_active": 0.94
+        },
+        "2020": {
+          "active": 48,
+          "missing": 2,
+          "pct_active": 0.96
+        },
+        "2021": {
+          "active": 49,
+          "missing": 1,
+          "pct_active": 0.98
+        },
+        "2022": {
+          "active": 49,
+          "missing": 1,
+          "pct_active": 0.98
+        },
+        "2023": {
+          "active": 50,
+          "missing": 0,
+          "pct_active": 1.0
+        }
+      },
+      "source": "static",
+      "universe_name": "nifty50"
+    },
+    "survivorship_warning": "UNIVERSE nifty50 WITH NO AS-OF DATE; 50 names; 3 of 50 names had no data in 2018. Missing names are later listings; this dataset has no delistings.",
+    "symbols": [
+      "ADANIENT",
+      "ADANIPORTS",
+      "APOLLOHOSP",
+      "ASIANPAINT",
+      "AXISBANK",
+      "BAJAJ-AUTO",
+      "BAJAJFINSV",
+      "BAJFINANCE",
+      "BEL",
+      "BHARTIARTL",
+      "CIPLA",
+      "COALINDIA",
+      "DRREDDY",
+      "EICHERMOT",
+      "ETERNAL",
+      "GRASIM",
+      "HCLTECH",
+      "HDFCBANK",
+      "HDFCLIFE",
+      "HINDALCO",
+      "HINDUNILVR",
+      "ICICIBANK",
+      "INDIGO",
+      "INFY",
+      "ITC",
+      "JIOFIN",
+      "JSWSTEEL",
+      "KOTAKBANK",
+      "LT",
+      "M&M",
+      "MARUTI",
+      "MAXHEALTH",
+      "NESTLEIND",
+      "NTPC",
+      "ONGC",
+      "POWERGRID",
+      "RELIANCE",
+      "SBILIFE",
+      "SBIN",
+      "SHRIRAMFIN",
+      "SUNPHARMA",
+      "TATACONSUM",
+      "TATASTEEL",
+      "TCS",
+      "TECHM",
+      "TITAN",
+      "TMPV",
+      "TRENT",
+      "ULTRACEMCO",
+      "WIPRO"
+    ],
+    "vix_symbol": "INDIAVIX"
+  },
+  "window": {
+    "excluded_in_window_unusable": [
+      "2018-11-07",
+      "2019-10-25",
+      "2019-10-27",
+      "2020-11-14",
+      "2021-11-04",
+      "2022-10-24"
+    ],
+    "in_window_sessions": 1391,
+    "in_window_usable_sessions": 1385,
+    "load_start": "2017-07-17",
+    "panel_first_date": "2017-07-17",
+    "panel_last_date": "2023-08-11",
+    "panel_rows": 563259,
+    "panel_sessions": 1505,
+    "test_end": "2023-08-13",
+    "test_start": "2018-01-01",
+    "unknown_to_calendar": [],
+    "usable_definition": "TradingCalendar.from_index_bars('NIFTY50').is_usable"
+  }
+}
